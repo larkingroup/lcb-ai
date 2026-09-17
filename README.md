@@ -1,6 +1,6 @@
 # lti-ai
 
-Local AI processor and interface by LTI — Larkin Technical Systems.
+Local AI processor and interface by Larkin Technical Systems.
 
 Build on Windows with CMake 3.20+ and a C17 compiler, from its developer terminal:
 
