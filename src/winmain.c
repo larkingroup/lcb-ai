@@ -1104,7 +1104,7 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 			break;
 		case IdExit: SendMessageW(window,WM_CLOSE,0,0); break;
 		case IdAbout:
-			MessageBoxW(window,L"lti-ai\nVersion 0.2.0\n\nAI processor and interface built by LTI.\n\n"
+			MessageBoxW(window,L"lti-ai\nVersion 0.3.0\n\nAI processor and interface built by LTI.\n\n"
 			    L"LTI - Larkin Technical Systems\nA subsidiary of LGH.",L"About lti-ai",MB_OK);
 			break;
 		}

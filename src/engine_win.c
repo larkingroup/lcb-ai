@@ -15,7 +15,7 @@ engine_probe(unsigned short port)
 	cJSON *json = NULL, *value;
 	int result = EngineOffline;
 	ULONGLONG start = GetTickCount64();
-	s = WinHttpOpen(L"lti-ai/0.2.0", WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0);
+	s = WinHttpOpen(L"lti-ai/0.3.0", WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0);
 	if(!s) goto done;
 	WinHttpSetTimeouts(s, 500, 500, 500, 800);
 	c = WinHttpConnect(s, L"127.0.0.1", port, 0);
