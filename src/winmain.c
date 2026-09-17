@@ -17,11 +17,12 @@
 #include "editor_win.h"
 #include "library_win.h"
 #include "layout.h"
+#include "classic_win.h"
 
 enum { IdModules = 100, IdPrompt, IdSend, IdNew, IdPort, IdExit, IdAbout,
 	IdLoad, IdUnload, IdBrowse, IdEngine, IdClear, IdCopy,
 	IdWorkspace, IdNewWorkspace, IdEditWorkspace, IdLibrary, IdScan, IdFolder,
-	IdRecursive, IdModels, IdChatTabs, IdLibraryTabs,
+	IdRecursive, IdModels, IdChatTabs, IdLibraryTabs, IdDetails,
 	ReplyReady = WM_APP + 1, HealthReady, LibraryReady };
 
 #define Paper RGB(255,255,255)
@@ -55,6 +56,9 @@ static struct {
 	volatile LONG scancancel;
 	HFONT normal, fixed, heading;
 	HBRUSH face, paper;
+	HIMAGELIST icons;
+	HWND hotbutton;
+	int activepane;
 	HMODULE rich;
 	Store store;
 	Chat chat;
@@ -78,6 +82,64 @@ static int savechat(void);
 static void listchats(void);
 static void listworkspaces(void);
 static void showchat(void);
+static const wchar_t *basenamew(const wchar_t *path);
+static LRESULT CALLBACK classiccontrol(HWND,UINT,WPARAM,LPARAM,UINT_PTR,DWORD_PTR);
+
+static void
+propertyrow(int row, const wchar_t *name, const wchar_t *value)
+{
+	LVITEMW item={0};
+	item.mask=LVIF_TEXT; item.iItem=row; item.pszText=(wchar_t *)name;
+	ListView_InsertItem(app.details,&item);
+	ListView_SetItemText(app.details,row,1,(wchar_t *)value);
+}
+
+static void
+modelproperties(const ModelInfo *model)
+{
+	wchar_t size[40];
+	SendMessageW(app.details,WM_SETREDRAW,FALSE,0);
+	ListView_DeleteAllItems(app.details);
+	if(model) {
+		swprintf(size,40,L"%.2f GB",(double)model->bytes/1000000000.0);
+		propertyrow(0,L"Name",model->name);
+		propertyrow(1,L"Architecture",model->architecture[0]?model->architecture:L"Unspecified");
+		propertyrow(2,L"Parameters",model->size[0]?model->size:L"Unspecified");
+		propertyrow(3,L"File size",size);
+		propertyrow(4,L"Quantization",model_quant(model->filetype));
+		propertyrow(5,L"Type",model->projector?L"Projector companion":L"GGUF model");
+		propertyrow(6,L"File",basenamew(model->path));
+		propertyrow(7,L"Location",model->path);
+	} else {
+		propertyrow(0,L"Selection",L"No model selected");
+		propertyrow(1,L"Inspect",L"Click a model above");
+		propertyrow(2,L"Use model",L"Double-click or Enter");
+		propertyrow(3,L"Library",L"Choose folder in Settings");
+	}
+	SendMessageW(app.details,WM_SETREDRAW,TRUE,0);
+	InvalidateRect(app.details,NULL,TRUE);
+}
+
+static void
+copyselection(void)
+{
+	if(GetFocus()==app.details) {
+		wchar_t value[512],*destination;
+		int row=ListView_GetNextItem(app.details,-1,LVNI_SELECTED);
+		SIZE_T bytes;
+		HGLOBAL memory;
+		if(row<0) return;
+		ListView_GetItemText(app.details,row,1,value,512);
+		bytes=(wcslen(value)+1)*sizeof(wchar_t);
+		memory=GlobalAlloc(GMEM_MOVEABLE,bytes); if(!memory) return;
+		destination=GlobalLock(memory);
+		if(!destination) { GlobalFree(memory); return; }
+		memcpy(destination,value,bytes); GlobalUnlock(memory);
+		if(!OpenClipboard(app.window)) { GlobalFree(memory); return; }
+		if(!EmptyClipboard() || !SetClipboardData(CF_UNICODETEXT,memory)) GlobalFree(memory);
+		CloseClipboard();
+	} else SendMessageW(GetFocus(),WM_COPY,0,0);
+}
 
 static const wchar_t *
 basenamew(const wchar_t *path)
@@ -304,10 +366,12 @@ modellist(ScanJob *job)
 	*lib=job->library; free(job);
 	SendMessageW(app.models,WM_SETREDRAW,FALSE,0);
 	ListView_DeleteAllItems(app.models); free(app.library); app.library=lib;
+	modelproperties(NULL);
 	for(i=0;i<lib->count;i++) {
 		ModelInfo *m=&lib->models[i];
 		swprintf(name,288,L"%ls%ls",m->projector?L"[Projector] ":L"",m->name);
-		item.mask=LVIF_TEXT|LVIF_PARAM; item.iItem=(int)i; item.iSubItem=0; item.pszText=name; item.lParam=(LPARAM)i;
+		item.mask=LVIF_TEXT|LVIF_PARAM|LVIF_IMAGE; item.iItem=(int)i; item.iSubItem=0; item.pszText=name; item.lParam=(LPARAM)i;
+		item.iImage=m->projector?ClassicEngine:ClassicModel;
 		ListView_InsertItem(app.models,&item);
 		swprintf(size,40,L"%.2f GB",(double)m->bytes/1000000000.0);
 		ListView_SetItemText(app.models,(int)i,1,size);
@@ -321,14 +385,10 @@ static void
 selectmodel(int use)
 {
 	int row=ListView_GetNextItem(app.models,-1,LVNI_SELECTED);
-	wchar_t text[1024];
 	ModelInfo *m;
-	if(row<0 || !app.library || (unsigned)row>=app.library->count) return;
+	if(row<0 || !app.library || (unsigned)row>=app.library->count) { modelproperties(NULL); return; }
 	m=&app.library->models[row];
-	swprintf(text,1024,L"%ls\r\n\r\nArchitecture: %ls\r\nSize label: %ls\r\nFile: %.2f GB\r\nQuantization: %ls\r\nType: %ls\r\n\r\n%ls",
-	    m->name,m->architecture[0]?m->architecture:L"Unspecified",m->size[0]?m->size:L"Unspecified",
-	    (double)m->bytes/1000000000.0,model_quant(m->filetype),m->projector?L"Projector (companion file)":L"GGUF",m->path);
-	SetWindowTextW(app.details,text);
+	modelproperties(m);
 	if(!use) return;
 	if(m->projector) { note(L"This is a projector companion. Select a language model."); return; }
 	if(app.busy || app.process.process || app.health==EngineReady) { note(L"Unload the current model before selecting another."); return; }
@@ -521,10 +581,12 @@ received(Work *w)
 static HWND
 control(const wchar_t *kind, const wchar_t *text, DWORD style, int id)
 {
-	HWND w = CreateWindowEx(0, kind, text, WS_CHILD | WS_VISIBLE | style,
+	DWORD ex=(!wcscmp(kind,L"EDIT") || !wcscmp(kind,L"LISTBOX") || !wcscmp(kind,WC_LISTVIEWW))?WS_EX_CLIENTEDGE:0;
+	HWND w = CreateWindowEx(ex, kind, text, WS_CHILD | WS_VISIBLE | (style&~WS_BORDER),
 	    0, 0, 1, 1, app.window, (HMENU)(INT_PTR)id, GetModuleHandle(NULL), NULL);
 	SendMessage(w, WM_SETFONT, (WPARAM)app.normal, TRUE);
 	SetWindowTheme(w, L"", L"");
+	SetWindowSubclass(w,classiccontrol,1,0);
 	return w;
 }
 
@@ -544,16 +606,17 @@ rect(int x, int y, int w, int h)
 static void
 fill(HDC dc, RECT r, COLORREF color)
 {
-	HBRUSH b = CreateSolidBrush(color);
-	FillRect(dc, &r, b); DeleteObject(b);
+	COLORREF old=SetDCBrushColor(dc,color);
+	FillRect(dc,&r,(HBRUSH)GetStockObject(DC_BRUSH)); SetDCBrushColor(dc,old);
 }
 
 static void
 line(HDC dc, int x, int y, int x2, int y2, COLORREF color)
 {
-	HPEN p = CreatePen(PS_SOLID, 1, color), old = SelectObject(dc, p);
+	HPEN old = SelectObject(dc,GetStockObject(DC_PEN));
+	COLORREF before=SetDCPenColor(dc,color);
 	MoveToEx(dc, px(x), px(y), NULL); LineTo(dc, px(x2), px(y2));
-	SelectObject(dc, old); DeleteObject(p);
+	SelectObject(dc,old); SetDCPenColor(dc,before);
 }
 
 static void
@@ -566,14 +629,16 @@ label(HDC dc, RECT r, const wchar_t *s, COLORREF color, HFONT font, UINT flags)
 }
 
 static void
-panel(HDC dc, int x, int y, int w, int h, const wchar_t *name, int selected)
+panel(HDC dc, int x, int y, int w, int h, const wchar_t *name, int selected, int icon)
 {
-	RECT r = rect(x,y,w,h), title = rect(x+1,y+1,w-2,18);
-	fill(dc, r, Paper);
-	FrameRect(dc, &r, (HBRUSH)GetStockObject(GRAY_BRUSH));
-	fill(dc, title, selected ? RGB(73,115,165) : Face);
-	label(dc, rect(x+5,y+1,w-10,18), name, selected ? RGB(255,255,255) : Ink, app.normal, DT_LEFT);
-	line(dc,x+1,y+19,x+w-1,y+19,Shadow);
+	RECT r=rect(x,y,w,h),title=rect(x+2,y+2,w-4,18),well=rect(x+2,y+21,w-4,h-23);
+	fill(dc,r,Face); classic_edge(dc,r,1);
+	fill(dc,title,selected?RGB(76,112,157):RGB(218,216,201));
+	line(dc,x+2,y+2,x+w-2,y+2,selected?RGB(145,175,205):Light);
+	line(dc,x+2,y+20,x+w-2,y+20,Shadow);
+	if(app.icons) ImageList_Draw(app.icons,icon,dc,px(x+5),px(y+3),ILD_TRANSPARENT);
+	label(dc,rect(x+25,y+2,w-30,18),name,selected?Paper:Ink,app.heading,DT_LEFT);
+	fill(dc,well,Paper); classic_edge(dc,well,0);
 }
 
 static void
@@ -585,27 +650,33 @@ paint(HDC dc)
 	wchar_t s[256];
 	COLORREF statecolor;
 	fill(dc,rect(0,0,w,h),Face);
-	line(dc,0,0,w,0,Light); line(dc,0,31,w,31,Shadow);
-	line(dc,88,5,88,26,Shadow); line(dc,271,5,271,26,Shadow);
+	classic_edge(dc,rect(2,1,w-4,31),1);
+	line(dc,88,5,88,26,Shadow); line(dc,89,5,89,26,Light);
+	line(dc,271,5,271,26,Shadow); line(dc,272,5,272,26,Light);
 	label(dc,rect(w-96,3,82,23),L"lti-ai",BlueInk,app.heading,DT_RIGHT);
-	panel(dc,4,36,p.left-4,rack-41,L"Workspace",0);
+	panel(dc,4,36,p.left-4,rack-41,L"Workspace",app.activepane==0,ClassicFolder);
 	label(dc,rect(12,123,p.left-20,18),L"Saved chats",Muted,app.normal,DT_LEFT);
 	label(dc,rect(12,rack-27,p.left-20,18),app.dirty?L"Unsaved changes":L"Saved locally",Muted,app.normal,DT_LEFT);
-	panel(dc,x,36,cw,rack-41,L"Conversation",1);
+	panel(dc,x,36,cw,rack-41,L"Conversation",app.activepane==1,ClassicDocument);
 	if(TabCtrl_GetCurSel(app.chattabs)==0) {
 		fill(dc,rect(x+1,p.composer,cw-2,21),Face);
 		line(dc,x+1,p.composer,x+cw-1,p.composer,Shadow);
+		line(dc,x+2,p.composer+1,x+cw-2,p.composer+1,Light);
 		label(dc,rect(x+7,p.composer+1,100,19),L"Message",Ink,app.normal,DT_LEFT);
 		label(dc,rect(x+cw-181,p.composer+1,174,19),L"Ctrl+Enter to send",Muted,app.normal,DT_RIGHT);
 	}
-	panel(dc,p.rightx,36,p.right,rack-41,L"Model library",0);
+	panel(dc,p.rightx,36,p.right,rack-41,L"Model library",app.activepane==2,ClassicModel);
 	if(TabCtrl_GetCurSel(app.librarytabs)==1) fill(dc,rect(p.rightx+1,82,p.right-2,rack-88),Face);
 	if(TabCtrl_GetCurSel(app.librarytabs)==0) {
-		fill(dc,rect(p.rightx+1,rack-207,p.right-2,19),Face);
-		line(dc,p.rightx+1,rack-208,w-5,rack-208,Shadow);
-		label(dc,rect(p.rightx+6,rack-207,p.right-12,19),L"Properties",Ink,app.normal,DT_LEFT);
+		RECT header=rect(p.rightx+3,rack-207,p.right-6,21);
+		fill(dc,header,Face); classic_edge(dc,header,1);
+		if(app.icons) ImageList_Draw(app.icons,ClassicSettings,dc,px(p.rightx+7),px(rack-205),ILD_TRANSPARENT);
+		label(dc,rect(p.rightx+27,rack-206,p.right-33,19),L"Model properties",Ink,app.heading,DT_LEFT);
 	}
-	panel(dc,4,rack,w-8,99,L"Output",0);
+	panel(dc,4,rack,w-8,99,L"Output",app.activepane==3,ClassicOutput);
+	classic_edge(dc,rect(5,h-22,205,20),0);
+	classic_edge(dc,rect(214,h-22,190,20),0);
+	classic_edge(dc,rect(408,h-22,w-412,20),0);
 	line(dc,0,h-24,w,h-24,Shadow); line(dc,0,h-23,w,h-23,Light);
 	statecolor=app.busy?RGB(185,141,65):app.health==EngineReady?RGB(102,135,89):
 	    app.process.process?RGB(185,141,65):RGB(145,149,143);
@@ -631,33 +702,83 @@ drawbutton(DRAWITEMSTRUCT *d)
 {
 	wchar_t text[96];
 	RECT r = d->rcItem, t = r;
-	size_t i,j;
+	int icon=-1,hot=app.hotbutton==d->hwndItem;
 	int pressed = (d->itemState & ODS_SELECTED) != 0;
 	int disabled = (d->itemState & ODS_DISABLED) != 0;
-	fill(d->hDC,r,d->CtlID == IdSend ? Blue : Face);
-	if(d->CtlID==IdNew || d->CtlID==IdLoad || d->CtlID==IdUnload || d->CtlID==IdEngine || d->CtlID==IdBrowse) {
-		if(pressed || (d->itemState&ODS_FOCUS)) DrawEdge(d->hDC,&r,pressed?BDR_SUNKENOUTER:BDR_RAISEDINNER,BF_RECT);
-	} else DrawEdge(d->hDC,&r,pressed ? BDR_SUNKENOUTER : BDR_RAISEDINNER,BF_RECT);
+	fill(d->hDC,r,disabled?Face:pressed?Blue:hot?Light:d->CtlID==IdSend?Blue:Face);
+	classic_edge(d->hDC,r,!pressed);
 	GetWindowTextW(d->hwndItem,text,96);
-	for(i=0,j=0;text[i];i++) if(text[i]!=L'&') text[j++]=text[i];
-	text[j]=0;
-	if(d->CtlID==IdLoad || d->CtlID==IdUnload || d->CtlID==IdNew) {
-		RECT icon={r.left+px(6),r.top+px(6),r.left+px(17),r.top+px(17)};
-		COLORREF color=disabled?RGB(169,170,159):d->CtlID==IdLoad?RGB(101,137,95):BlueInk;
-		if(d->CtlID==IdLoad) {
-			POINT points[3]={{icon.left,icon.top},{icon.right,icon.top+px(5)},{icon.left,icon.bottom}};
-			HBRUSH b=CreateSolidBrush(color),old=SelectObject(d->hDC,b);
-			HPEN p=CreatePen(PS_SOLID,1,color),oldpen=SelectObject(d->hDC,p);
-			Polygon(d->hDC,points,3); SelectObject(d->hDC,old); SelectObject(d->hDC,oldpen); DeleteObject(b); DeleteObject(p);
-		} else {
-			fill(d->hDC,icon,d->CtlID==IdNew?Paper:color);
-			FrameRect(d->hDC,&icon,(HBRUSH)GetStockObject(GRAY_BRUSH));
-		}
-		t.left+=px(18);
+	switch(d->CtlID) {
+	case IdNew: icon=ClassicDocument; break;
+	case IdLoad: case IdSend: icon=ClassicRun; break;
+	case IdUnload: icon=ClassicStop; break;
+	case IdEngine: icon=ClassicEngine; break;
+	case IdBrowse: icon=ClassicFolder; break;
+	}
+	if(icon>=0 && app.icons) {
+		ImageList_DrawEx(app.icons,icon,d->hDC,r.left+px(5)+(pressed?1:0),
+		    r.top+(r.bottom-r.top-px(16))/2+(pressed?1:0),0,0,CLR_NONE,Face,
+		    disabled?ILD_BLEND50:ILD_TRANSPARENT);
+		t.left+=px(23); t.right-=px(4);
 	}
 	if(pressed) OffsetRect(&t,1,1);
-	label(d->hDC,t,text,disabled ? RGB(149,149,140) : d->CtlID == IdSend ? BlueInk : Ink,app.normal,DT_CENTER);
+	{
+		HFONT old=SelectObject(d->hDC,app.normal);
+		SetBkMode(d->hDC,TRANSPARENT); SetTextColor(d->hDC,disabled?Muted:Ink);
+		DrawTextW(d->hDC,text,-1,&t,DT_SINGLELINE|DT_VCENTER|DT_CENTER|
+		    ((d->itemState&ODS_NOACCEL)?DT_HIDEPREFIX:0));
+		SelectObject(d->hDC,old);
+	}
 	if(d->itemState & ODS_FOCUS) { InflateRect(&t,-4,-4); DrawFocusRect(d->hDC,&t); }
+}
+
+static void
+drawtab(DRAWITEMSTRUCT *d)
+{
+	wchar_t text[80];
+	TCITEMW item={0};
+	RECT r=d->rcItem,t=r;
+	int selected=(d->itemState&ODS_SELECTED)!=0;
+	item.mask=TCIF_TEXT; item.pszText=text; item.cchTextMax=80;
+	if(!TabCtrl_GetItem(d->hwndItem,(int)d->itemID,&item)) return;
+	fill(d->hDC,r,selected?Light:Face);
+	if(selected) {
+		RECT stripe=r; stripe.bottom=stripe.top+px(2); fill(d->hDC,stripe,RGB(76,112,157));
+	}
+	InflateRect(&t,-px(5),0);
+	label(d->hDC,t,text,selected?BlueInk:Ink,selected?app.heading:app.normal,DT_CENTER);
+	if(d->itemState&ODS_FOCUS) { InflateRect(&t,-2,-2); DrawFocusRect(d->hDC,&t); }
+}
+
+static LRESULT CALLBACK
+classiccontrol(HWND window,UINT message,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR data)
+{
+	(void)data;
+	if(message==WM_MOUSEMOVE && (GetWindowLongPtrW(window,GWL_STYLE)&BS_TYPEMASK)==BS_OWNERDRAW &&
+	    (window==app.fresh || window==app.load || window==app.unload || window==app.engine ||
+	    window==app.browse || window==app.send || window==app.scan ||
+	    window==app.newworkspace || window==app.editworkspace)) {
+		if(app.hotbutton!=window) {
+			TRACKMOUSEEVENT track={sizeof(track),TME_LEAVE,window,0};
+			HWND previous=app.hotbutton;
+			app.hotbutton=window; TrackMouseEvent(&track);
+			if(previous) InvalidateRect(previous,NULL,FALSE);
+			InvalidateRect(window,NULL,FALSE);
+		}
+	} else if(message==WM_MOUSELEAVE && app.hotbutton==window) {
+		app.hotbutton=NULL; InvalidateRect(window,NULL,FALSE);
+	} else if(message==WM_SETFOCUS) {
+		int pane=app.activepane;
+		if(window==app.workspace || window==app.modules || window==app.newworkspace || window==app.editworkspace) pane=0;
+		else if(window==app.transcript || window==app.prompt || window==app.master || window==app.chattabs || window==app.send) pane=1;
+		else if(window==app.models || window==app.details || window==app.librarytabs || window==app.folder || window==app.recursive || window==app.scan) pane=2;
+		else if(window==app.activity) pane=3;
+		if(pane!=app.activepane) { app.activepane=pane; InvalidateRect(app.window,NULL,FALSE); }
+	} else if(message==WM_NCDESTROY) {
+		if(app.hotbutton==window) app.hotbutton=NULL;
+		RemoveWindowSubclass(window,classiccontrol,id);
+	}
+	return DefSubclassProc(window,message,wp,lp);
 }
 
 static void
@@ -666,7 +787,7 @@ drawmodule(DRAWITEMSTRUCT *d)
 	wchar_t *name;
 	ChatInfo *chat;
 	wchar_t count[16];
-	RECT r=d->rcItem,t=r,icon;
+	RECT r=d->rcItem,t=r;
 	int selected = (d->itemState & ODS_SELECTED) != 0;
 	if(d->itemID==(UINT)-1 || d->itemData>=app.store.nchats) return;
 	chat=&app.store.chats[d->itemData];
@@ -674,10 +795,7 @@ drawmodule(DRAWITEMSTRUCT *d)
 	t.left += px(30); t.right -= px(26);
 	name=wide(chat->title);
 	if(name) { label(d->hDC,t,name,selected?BlueInk:Ink,app.normal,DT_LEFT); free(name); }
-	icon=r; icon.left+=px(8); icon.right=icon.left+px(11); icon.top+=px(4); icon.bottom=icon.top+px(13);
-	fill(d->hDC,icon,RGB(239,235,215)); FrameRect(d->hDC,&icon,(HBRUSH)GetStockObject(GRAY_BRUSH));
-	icon.left+=px(3); icon.right-=px(3); icon.top+=px(4); icon.bottom=icon.top+1;
-	fill(d->hDC,icon,Muted); OffsetRect(&icon,0,px(3)); fill(d->hDC,icon,Muted);
+	if(app.icons) ImageList_Draw(app.icons,ClassicDocument,d->hDC,r.left+px(6),r.top+px(3),ILD_TRANSPARENT);
 	t=r; t.left=r.right-px(27); t.right-=px(8);
 	swprintf(count,16,L"%zu",chat->turns);
 	label(d->hDC,t,count,Muted,app.normal,DT_RIGHT);
@@ -710,9 +828,10 @@ layout(void)
 	ShowWindow(app.transcript,chat?SW_SHOW:SW_HIDE); ShowWindow(app.prompt,chat?SW_SHOW:SW_HIDE);
 	ShowWindow(app.send,chat?SW_SHOW:SW_HIDE); ShowWindow(app.master,chat?SW_HIDE:SW_SHOW);
 	place(app.librarytabs,p.rightx+2,57,p.right-4,25);
-	place(app.models,p.rightx+4,84,p.right-8,p.bottom-294);
+	place(app.models,p.rightx+5,84,p.right-10,p.bottom-294);
 	ListView_SetColumnWidth(app.models,0,px(p.right-82)); ListView_SetColumnWidth(app.models,1,px(68));
-	place(app.details,p.rightx+8,p.bottom-181,p.right-16,165);
+	place(app.details,p.rightx+5,p.bottom-183,p.right-10,172);
+	ListView_SetColumnWidth(app.details,0,px(88)); ListView_SetColumnWidth(app.details,1,px(p.right-119));
 	place(app.folderlabel,p.rightx+9,97,p.right-18,20);
 	place(app.folder,p.rightx+9,120,p.right-18,23);
 	place(app.recursive,p.rightx+9,153,p.right-18,22);
@@ -899,6 +1018,7 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 		DRAWITEMSTRUCT *d=(DRAWITEMSTRUCT *)lp;
 		if(d->CtlType==ODT_BUTTON) { drawbutton(d); return TRUE; }
 		if(d->CtlType==ODT_LISTBOX) { drawmodule(d); return TRUE; }
+		if(d->CtlType==ODT_TAB) { drawtab(d); return TRUE; }
 		break;
 	}
 	case WM_MEASUREITEM:
@@ -934,10 +1054,21 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 	case WM_NOTIFY: {
 		NMHDR *n=(NMHDR *)lp;
 		if(n->idFrom==IdChatTabs || n->idFrom==IdLibraryTabs) {
-			if(n->code==TCN_SELCHANGE) layout();
+			if(n->code==TCN_SELCHANGE) { layout(); SetFocus(n->hwndFrom); }
 		} else if(n->idFrom==IdModels) {
-			if(n->code==LVN_ITEMCHANGED) selectmodel(0);
+			if(n->code==LVN_ITEMCHANGED) {
+				NMLISTVIEW *change=(NMLISTVIEW *)lp;
+				if((change->uChanged&LVIF_STATE) && ((change->uOldState^change->uNewState)&LVIS_SELECTED)) selectmodel(0);
+			}
 			else if(n->code==NM_DBLCLK || n->code==NM_RETURN) selectmodel(1);
+		} else if(n->idFrom==IdDetails && n->code==NM_CUSTOMDRAW) {
+			NMLVCUSTOMDRAW *draw=(NMLVCUSTOMDRAW *)lp;
+			if(draw->nmcd.dwDrawStage==CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+			if(draw->nmcd.dwDrawStage==CDDS_ITEMPREPAINT) return CDRF_NOTIFYSUBITEMDRAW;
+			if(draw->nmcd.dwDrawStage==(CDDS_ITEMPREPAINT|CDDS_SUBITEM)) {
+				draw->clrText=Ink; draw->clrTextBk=draw->iSubItem==0?RGB(243,241,230):Paper;
+				return CDRF_NEWFONT;
+			}
 		}
 		return 0;
 	}
@@ -950,7 +1081,7 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 			break;
 		case IdBrowse: if(!app.busy && !app.process.process) choosefile(0); break;
 		case IdEngine: if(!app.busy && !app.process.process) choosefile(1); break;
-		case IdCopy: SendMessageW(GetFocus(),WM_COPY,0,0); break;
+		case IdCopy: copyselection(); break;
 		case IdNew:
 			if(!app.busy && savechat()) {
 				if(store_new(&app.store,app.store.workspaces[app.selected].id,&app.chat)) { showchat(); note(L"New chat saved."); }
@@ -1024,6 +1155,7 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	    OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,FIXED_PITCH,L"Consolas");
 	app.heading=CreateFontW(-px(12),0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,
 	    OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,DEFAULT_PITCH,L"Tahoma");
+	app.icons=classic_icons(app.dpi); app.activepane=1;
 	menu=CreateMenu(); file=CreatePopupMenu(); edit=CreatePopupMenu(); engine=CreatePopupMenu(); settings=CreatePopupMenu(); help=CreatePopupMenu();
 	AppendMenuW(file,MF_STRING,IdNew,L"&New conversation\tCtrl+N");
 	AppendMenuW(file,MF_STRING,IdNewWorkspace,L"New &workspace...");
@@ -1072,19 +1204,27 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	SendMessageW(app.port,EM_SETLIMITTEXT,5,0);
 	app.activity=control(L"EDIT",L"",WS_TABSTOP|WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL,0);
 	SendMessageW(app.activity,WM_SETFONT,(WPARAM)app.fixed,TRUE);
-	app.chattabs=control(WC_TABCONTROLW,L"Conversation views",WS_TABSTOP|TCS_FOCUSNEVER,IdChatTabs);
+	app.chattabs=control(WC_TABCONTROLW,L"Conversation views",WS_TABSTOP|TCS_OWNERDRAWFIXED,IdChatTabs);
+	TabCtrl_SetPadding(app.chattabs,px(12),px(3));
 	tab.mask=TCIF_TEXT; tab.pszText=L"Conversation"; TabCtrl_InsertItem(app.chattabs,0,&tab);
 	tab.pszText=L"Master prompt"; TabCtrl_InsertItem(app.chattabs,1,&tab);
 	app.master=control(L"EDIT",L"",WS_TABSTOP|ES_MULTILINE|ES_READONLY|WS_VSCROLL,0);
-	app.librarytabs=control(WC_TABCONTROLW,L"Library views",WS_TABSTOP|TCS_FOCUSNEVER,IdLibraryTabs);
+	app.librarytabs=control(WC_TABCONTROLW,L"Library views",WS_TABSTOP|TCS_OWNERDRAWFIXED,IdLibraryTabs);
+	TabCtrl_SetPadding(app.librarytabs,px(12),px(3));
 	tab.pszText=L"Models"; TabCtrl_InsertItem(app.librarytabs,0,&tab);
 	tab.pszText=L"Settings"; TabCtrl_InsertItem(app.librarytabs,1,&tab);
-	app.models=control(WC_LISTVIEWW,L"Local models",WS_TABSTOP|LVS_REPORT|LVS_SINGLESEL|LVS_SHOWSELALWAYS,IdModels);
+	app.models=control(WC_LISTVIEWW,L"Local models",WS_TABSTOP|LVS_REPORT|LVS_SINGLESEL|LVS_SHOWSELALWAYS|LVS_SHAREIMAGELISTS,IdModels);
+	if(app.icons) ListView_SetImageList(app.models,app.icons,LVSIL_SMALL);
 	ListView_SetExtendedListViewStyle(app.models,LVS_EX_FULLROWSELECT|LVS_EX_LABELTIP);
 	ListView_SetBkColor(app.models,Paper); ListView_SetTextBkColor(app.models,Paper); ListView_SetTextColor(app.models,Ink);
 	column.mask=LVCF_TEXT|LVCF_WIDTH; column.pszText=L"Name"; column.cx=px(174); ListView_InsertColumn(app.models,0,&column);
 	column.pszText=L"Size"; column.cx=px(68); ListView_InsertColumn(app.models,1,&column);
-	app.details=control(L"EDIT",L"Double-click a model to select it.\r\n\r\nSet your model folder in Settings.",WS_TABSTOP|ES_MULTILINE|ES_READONLY|WS_VSCROLL,0);
+	app.details=control(WC_LISTVIEWW,L"Model properties",WS_TABSTOP|LVS_REPORT|LVS_SINGLESEL|LVS_NOCOLUMNHEADER,IdDetails);
+	ListView_SetExtendedListViewStyle(app.details,LVS_EX_FULLROWSELECT|LVS_EX_GRIDLINES|LVS_EX_LABELTIP);
+	ListView_SetBkColor(app.details,Paper); ListView_SetTextBkColor(app.details,Paper); ListView_SetTextColor(app.details,Ink);
+	column.pszText=L"Property"; column.cx=px(88); ListView_InsertColumn(app.details,0,&column);
+	column.pszText=L"Value"; column.cx=px(130); ListView_InsertColumn(app.details,1,&column);
+	modelproperties(NULL);
 	app.folderlabel=control(L"STATIC",L"Model folder",0,0);
 	app.folder=control(L"EDIT",app.libraryfolder,WS_TABSTOP|WS_BORDER|ES_AUTOHSCROLL,IdFolder);
 	SendMessageW(app.folder,EM_SETLIMITTEXT,MAX_PATH-1,0);
@@ -1103,6 +1243,7 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	pollengine();
 	while(GetMessageW(&msg,NULL,0,0)>0) {
 		if(msg.message==WM_KEYDOWN && (GetKeyState(VK_CONTROL)&0x8000)) {
+			if(msg.wParam=='C' && GetFocus()==app.details) { copyselection(); continue; }
 			if(msg.wParam==VK_RETURN) { submit(); continue; }
 			if(msg.wParam=='N') { SendMessageW(app.window,WM_COMMAND,IdNew,0); continue; }
 		}
@@ -1111,6 +1252,7 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	engine_stop(&app.process);
 	chat_clear(&app.chat); store_close(&app.store);
 	free(app.library);
+	if(app.icons) ImageList_Destroy(app.icons);
 	DeleteObject(app.normal); DeleteObject(app.fixed); DeleteObject(app.heading);
 	DeleteObject(app.face); DeleteObject(app.paper); FreeLibrary(app.rich);
 	return 0;
