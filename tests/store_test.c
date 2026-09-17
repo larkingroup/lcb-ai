@@ -37,7 +37,7 @@ main(void)
 	HANDLE held;
 	DWORD written;
 	assert(GetTempPathW(MAX_PATH,temp)>0);
-	assert(GetTempFileNameW(temp,L"lti",0,root));
+	assert(GetTempFileNameW(temp,L"lts",0,root));
 	assert(DeleteFileW(root));
 	assert(store_open(&s,root));
 	assert(!store_open(&second,root)); store_close(&second);

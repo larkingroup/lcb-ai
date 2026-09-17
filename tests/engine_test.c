@@ -20,7 +20,7 @@ main(int argc, char **argv)
 	}
 	GetModuleFileNameW(NULL,exe,MAX_PATH);
 	GetTempPathW(MAX_PATH,temp);
-	swprintf(model,MAX_PATH,L"%lsLTI test model %lu.gguf",temp,(unsigned long)GetCurrentProcessId());
+	swprintf(model,MAX_PATH,L"%lsLTS test model %lu.gguf",temp,(unsigned long)GetCurrentProcessId());
 	file=CreateFileW(model,GENERIC_WRITE,0,NULL,CREATE_NEW,FILE_ATTRIBUTE_TEMPORARY,NULL);
 	assert(file!=INVALID_HANDLE_VALUE); CloseHandle(file);
 	if(argc==3 && strcmp(argv[1],"occupied")==0) {

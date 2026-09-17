@@ -5,16 +5,16 @@
 #endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include "lti.h"
+#include "lts.h"
 
 enum { StoreName = 241, StoreWorkspaces = 64, StoreChats = 1024 };
 typedef struct Workspace Workspace;
 typedef struct Chat Chat;
 typedef struct ChatInfo ChatInfo;
 typedef struct Store Store;
-struct Workspace { char id[33], name[StoreName], prompt[LtiMaxPrompt+1]; };
+struct Workspace { char id[33], name[StoreName], prompt[LtsMaxPrompt+1]; };
 struct ChatInfo { char id[33], workspace[33], title[StoreName]; size_t turns; };
-struct Chat { ChatInfo info; Conversation conversation; char draft[LtiMaxPrompt+1]; };
+struct Chat { ChatInfo info; Conversation conversation; char draft[LtsMaxPrompt+1]; };
 struct Store {
 	wchar_t root[MAX_PATH], error[512];
 	HANDLE lock;

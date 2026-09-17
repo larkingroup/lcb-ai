@@ -31,7 +31,7 @@ int main(int argc,char **argv)
 		free(lib); return 0;
 	}
 	assert(GetTempPathW(MAX_PATH,temp));
-	swprintf(root,MAX_PATH,L"%lsLTI-library-%lu-%llu",temp,GetCurrentProcessId(),(unsigned long long)GetTickCount64());
+	swprintf(root,MAX_PATH,L"%lsLTS-library-%lu-%llu",temp,GetCurrentProcessId(),(unsigned long long)GetTickCount64());
 	swprintf(sub,MAX_PATH,L"%ls\\nested",root);
 	assert(CreateDirectoryW(root,NULL)); assert(CreateDirectoryW(sub,NULL));
 	swprintf(a,MAX_PATH,L"%ls\\fallback_name.gguf",root);
@@ -57,6 +57,14 @@ int main(int argc,char **argv)
 		assert(p.left+5+p.center<p.rightx && p.composer>100);
 		assert(p.bottom-294>0 && p.bottom+99<=height-24);
 	}
+    for(width=984;width<=2560;width+=137) for(height=621;height<=1200;height+=101) {
+        int mask;
+        for(mask=0;mask<8;mask++) {
+            PaneLayout p=workbench_layout(width,height,mask&1?0:9999,mask&2?0:9999,mask&4?0:9999);
+            assert(p.center>=320 && p.composer>=312 && p.bottom<=height-24);
+            assert(p.left>=0 && p.right>=0 && p.rightx+p.right==width-4);
+        }
+    }
 	assert(DeleteFileW(a)); assert(DeleteFileW(b)); assert(DeleteFileW(bad));
 	assert(RemoveDirectoryW(sub)); assert(RemoveDirectoryW(root));
 	free(lib); puts("Library and layout tests passed."); return 0;

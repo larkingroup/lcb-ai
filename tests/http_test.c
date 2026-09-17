@@ -5,16 +5,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "lti.h"
+#include "lts.h"
 #include "engine_win.h"
 #include "cJSON.h"
+#include "stream_win.h"
 
 typedef struct Server Server;
 struct Server {
 	SOCKET socket;
 	HANDLE thread, stop;
 	unsigned short port;
-	int status, requests;
+	int status, requests, delay;
 	const char *body;
 	char request[8192];
 };
@@ -69,20 +70,29 @@ serve(void *arg)
 		    s->status, strlen(s->body), s->status == 302 ? "Location: /forbidden\r\n" : "");
 		assert(n > 0 && (size_t)n < sizeof(header));
 		sendall(client, header, (size_t)n);
-		sendall(client, s->body, strlen(s->body));
+        if(s->delay==1) {
+            const char *split=strstr(s->body,"\n\n");
+            size_t first=split?(size_t)(split+2-s->body):0;
+            sendall(client,s->body,first);
+            WaitForSingleObject(s->stop,2000);
+            sendall(client,s->body+first,strlen(s->body)-first);
+        } else {
+            if(s->delay==2) WaitForSingleObject(s->stop,2000);
+            sendall(client,s->body,strlen(s->body));
+        }
 		closesocket(client);
 	}
 	return 0;
 }
 
 static void
-start(Server *s, int status, const char *body)
+start_delayed(Server *s, int status, const char *body, int delay)
 {
 	struct sockaddr_in address = {0};
 	int size = sizeof(address);
 	BOOL exclusive = TRUE;
 	memset(s, 0, sizeof(*s));
-	s->status = status; s->body = body;
+	s->status = status; s->body = body; s->delay=delay;
 	s->socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	assert(s->socket != INVALID_SOCKET);
 	assert(setsockopt(s->socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&exclusive, sizeof(exclusive)) == 0);
@@ -97,6 +107,8 @@ start(Server *s, int status, const char *body)
 	s->thread = CreateThread(NULL, 0, serve, s, 0, NULL);
 	assert(s->thread != NULL);
 }
+
+static void start(Server *s,int status,const char *body) { start_delayed(s,status,body,0); }
 
 static void
 stop(Server *s, int requests)
@@ -118,7 +130,7 @@ transport(void)
 	cJSON *root, *messages, *value;
 	struct { int status; const char *body, *error; } cases[4];
 	size_t i;
-	request = conversation_request(&c, &lti_modules[0], prompt);
+	request = conversation_request(&c, &lts_modules[0], prompt);
 	assert(request != NULL);
 	start(&s, 200, reply);
 	assert(local_complete(s.port, request, &answer, error, sizeof(error)));
@@ -131,8 +143,8 @@ transport(void)
 	value = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(messages, cJSON_GetArraySize(messages)-1), "content");
 	assert(cJSON_IsString(value) && strcmp(value->valuestring, prompt) == 0);
 	cJSON_Delete(root);
-	huge = malloc(LtiMaxWire+2); assert(huge != NULL);
-	memset(huge, 'x', LtiMaxWire+1); huge[LtiMaxWire+1] = 0;
+	huge = malloc(LtsMaxWire+2); assert(huge != NULL);
+	memset(huge, 'x', LtsMaxWire+1); huge[LtsMaxWire+1] = 0;
 	cases[0].status=503; cases[0].body=reply; cases[0].error="503";
 	cases[1].status=200; cases[1].body="{\"choices\":"; cases[1].error="invalid";
 	cases[2].status=200; cases[2].body=huge; cases[2].error="1 MiB";
@@ -144,6 +156,49 @@ transport(void)
 		assert(answer == NULL && strstr(error, cases[i].error) != NULL);
 	}
 	free(huge); free(request);
+}
+
+typedef struct Updates { int count; HANDLE cancel; } Updates;
+static void updated(const char *text,void *context)
+{
+    Updates *u=context;
+    assert(strstr(text,"Hello")!=NULL); u->count++;
+    if(u->cancel) SetEvent(u->cancel);
+}
+static DWORD WINAPI cancelsoon(void *context) { Sleep(100); SetEvent((HANDLE)context); return 0; }
+static void streamtransport(void)
+{
+    const char *wire="data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n"
+        "data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    Server s;
+    Conversation c={0}; Generation g={128,0.5,0.9};
+    HANDLE cancel=CreateEventW(NULL,TRUE,FALSE,NULL),thread;
+    Updates u={0};
+    char *request=conversation_generate(&c,&lts_modules[0],"hello",&g),*answer,error[256];
+    ULONGLONG begin;
+    assert(cancel && request);
+    start(&s,200,wire);
+    assert(local_stream(s.port,request,cancel,updated,&u,&answer,error,sizeof(error))==1);
+    assert(u.count>0 && !strcmp(answer,"Hello world")); free(answer); stop(&s,1);
+    start_delayed(&s,200,wire,1); u.cancel=cancel;
+    begin=GetTickCount64();
+    assert(local_stream(s.port,request,cancel,updated,&u,&answer,error,sizeof(error))==2);
+    assert(GetTickCount64()-begin<1500 && answer && !strcmp(answer,"Hello")); free(answer); stop(&s,1);
+    ResetEvent(cancel); u.cancel=NULL;
+    start_delayed(&s,200,wire,2);
+    thread=CreateThread(NULL,0,cancelsoon,cancel,0,NULL); assert(thread);
+    begin=GetTickCount64();
+    assert(local_stream(s.port,request,cancel,updated,&u,&answer,error,sizeof(error))==2);
+    assert(GetTickCount64()-begin<1500 && !answer); stop(&s,1);
+    assert(WaitForSingleObject(thread,1000)==WAIT_OBJECT_0); CloseHandle(thread); ResetEvent(cancel);
+    start(&s,200,"data: invalid\n\n");
+    assert(!local_stream(s.port,request,cancel,NULL,NULL,&answer,error,sizeof(error))); assert(!answer); stop(&s,1);
+    start(&s,503,"{}");
+    assert(!local_stream(s.port,request,cancel,NULL,NULL,&answer,error,sizeof(error))); assert(strstr(error,"503")); stop(&s,1);
+    start(&s,200,"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n");
+    assert(!local_stream(s.port,request,cancel,NULL,NULL,&answer,error,sizeof(error))); assert(!answer); stop(&s,1);
+    CloseHandle(cancel); free(request);
 }
 
 static void
@@ -201,7 +256,7 @@ main(int argc, char **argv)
 	WSADATA data;
 	assert(argc == 2);
 	assert(WSAStartup(MAKEWORD(2,2), &data) == 0);
-	transport(); health(); ports(argv[1]);
+	transport(); streamtransport(); health(); ports(argv[1]);
 	WSACleanup();
 	puts("HTTP tests passed.");
 	return 0;
