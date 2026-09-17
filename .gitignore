@@ -1,0 +1,15 @@
+/build/
+/build-msvc/
+/local/
+/docs/
+/research/
+*.md
+!/README.md
+!**/LICENSE.md
+!**/NOTICE.md
+*.user
+*.pdb
+__pycache__/
+
+/tests/
+/test/
