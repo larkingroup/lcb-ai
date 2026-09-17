@@ -10,6 +10,13 @@
 *.user
 *.pdb
 __pycache__/
+*.py
+*.pyc
+*.ps1
+*.psm1
+*.bat
+*.cmd
+*.sh
 
 /tests/
 /test/
