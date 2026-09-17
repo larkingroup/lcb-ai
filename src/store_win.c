@@ -73,7 +73,7 @@ readjson(const wchar_t *name)
 	cJSON *json = NULL;
 	f=CreateFileW(name, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if(f==INVALID_HANDLE_VALUE) return NULL;
-	if(!GetFileSizeEx(f,&size) || size.QuadPart<=0 || size.QuadPart>LtiMaxWire) { CloseHandle(f); return NULL; }
+	if(!GetFileSizeEx(f,&size) || size.QuadPart<=0 || size.QuadPart>LtsMaxWire) { CloseHandle(f); return NULL; }
 	data=malloc((size_t)size.QuadPart+1);
 	if(data && ReadFile(f,data,(DWORD)size.QuadPart,&got,NULL) && got==(DWORD)size.QuadPart && !memchr(data,0,got)) {
 		data[got]=0;
@@ -92,7 +92,7 @@ writejson(Store *s, const wchar_t *name, cJSON *json, int existing)
 	HANDLE f;
 	DWORD n, error;
 	int ok=0;
-	if(!data || strlen(data)>LtiMaxWire || !newid(id)) { free(data); return fail(s,L"Cannot prepare save"); }
+	if(!data || strlen(data)>LtsMaxWire || !newid(id)) { free(data); return fail(s,L"Cannot prepare save"); }
 	swprintf(temp,MAX_PATH,L"%ls\\%hs.tmp",s->root,id);
 	f=CreateFileW(temp,GENERIC_WRITE,0,NULL,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,NULL);
 	if(f!=INVALID_HANDLE_VALUE) {
@@ -137,10 +137,10 @@ chat_parse(cJSON *json, Chat *chat)
 	    !field(json,"title",chat->info.title,sizeof(chat->info.title),0) ||
 	    !field(json,"draft",chat->draft,sizeof(chat->draft),1)) return 0;
 	messages=cJSON_GetObjectItemCaseSensitive(json,"messages");
-	if(!cJSON_IsArray(messages) || cJSON_GetArraySize(messages)>LtiMaxMessages || cJSON_GetArraySize(messages)%2) return 0;
+	if(!cJSON_IsArray(messages) || cJSON_GetArraySize(messages)>LtsMaxMessages || cJSON_GetArraySize(messages)%2) return 0;
 	cJSON_ArrayForEach(m,messages) {
 		role=cJSON_GetObjectItemCaseSensitive(m,"role"); text=cJSON_GetObjectItemCaseSensitive(m,"content");
-		if(!cJSON_IsString(role) || !cJSON_IsString(text) || !validtext(text->valuestring,LtiMaxReply,0) ||
+		if(!cJSON_IsString(role) || !cJSON_IsString(text) || !validtext(text->valuestring,LtsMaxReply,0) ||
 		    strcmp(role->valuestring,i%2?"assistant":"user")!=0 ||
 		    !conversation_add(&chat->conversation,i%2?"assistant":"user",text->valuestring)) return 0;
 		i++;
@@ -179,7 +179,7 @@ store_workspace(Store *s, Workspace *w)
 	Workspace *old;
 	cJSON *json;
 	int ok;
-	if(!validtext(w->name,StoreName-1,0) || !validtext(w->prompt,LtiMaxPrompt,1)) return fail(s,L"Invalid workspace text");
+	if(!validtext(w->name,StoreName-1,0) || !validtext(w->prompt,LtsMaxPrompt,1)) return fail(s,L"Invalid workspace text");
 	if(!w->id[0] && !newid(w->id)) return fail(s,L"Cannot create workspace identifier");
 	if(!validid(w->id)) return fail(s,L"Invalid workspace identifier");
 	old=store_find_workspace(s,w->id);
@@ -203,7 +203,7 @@ store_save(Store *s, Chat *chat)
 	size_t i, index;
 	int ok;
 	if(!validid(chat->info.id) || !store_find_workspace(s,chat->info.workspace) ||
-	    !validtext(chat->info.title,StoreName-1,0) || !validtext(chat->draft,LtiMaxPrompt,1)) return fail(s,L"Invalid chat");
+	    !validtext(chat->info.title,StoreName-1,0) || !validtext(chat->draft,LtsMaxPrompt,1)) return fail(s,L"Invalid chat");
 	for(index=0;index<s->nchats;index++) if(strcmp(s->chats[index].id,chat->info.id)==0) break;
 	if(index==s->nchats && s->nchats==StoreChats) return fail(s,L"Chat limit reached (1024)");
 	if(chat->conversation.count%2) return fail(s,L"Incomplete conversation");
@@ -215,7 +215,7 @@ store_save(Store *s, Chat *chat)
 	for(i=0;ok && i<chat->conversation.count;i++) {
 		Message *message=&chat->conversation.messages[i];
 		m=cJSON_CreateObject();
-		ok=validtext(message->text,LtiMaxReply,0) && strcmp(message->role,i%2?"assistant":"user")==0 && m &&
+		ok=validtext(message->text,LtsMaxReply,0) && strcmp(message->role,i%2?"assistant":"user")==0 && m &&
 		    cJSON_AddStringToObject(m,"role",message->role) && cJSON_AddStringToObject(m,"content",message->text);
 		if(ok) ok=cJSON_AddItemToArray(messages,m);
 		if(!ok) cJSON_Delete(m);
@@ -287,10 +287,10 @@ store_open(Store *s, const wchar_t *root)
 	memset(s,0,sizeof(*s));
 	if(wcslen(root)>MAX_PATH-80) return fail(s,L"Storage path is too long");
 	wcscpy(s->root,root);
-	if(!directory(root)) return fail(s,L"Cannot open lti-ai storage folder");
+	if(!directory(root)) return fail(s,L"Cannot open lts-ai storage folder");
 	swprintf(name,MAX_PATH,L"%ls\\session.lock",root);
 	s->lock=CreateFileW(name,GENERIC_READ|GENERIC_WRITE,0,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
-	if(s->lock==INVALID_HANDLE_VALUE) { s->lock=NULL; return fail(s,L"Storage is in use or unavailable; close the other lti-ai window"); }
+	if(s->lock==INVALID_HANDLE_VALUE) { s->lock=NULL; return fail(s,L"Storage is in use or unavailable; close the other lts-ai window"); }
 	s->workspaces=calloc(StoreWorkspaces,sizeof(*s->workspaces)); s->chats=calloc(StoreChats,sizeof(*s->chats));
 	if(!s->workspaces || !s->chats) goto failed;
 	swprintf(name,MAX_PATH,L"%ls\\workspaces",root); if(!directory(name)) goto failed;

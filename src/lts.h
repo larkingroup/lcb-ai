@@ -1,14 +1,14 @@
-#ifndef LTI_H
-#define LTI_H
+#ifndef LTS_H
+#define LTS_H
 
 #include <stddef.h>
 
 enum {
-	LtiMaxMessages = 32,
-	LtiMaxPrompt = 16384,
-	LtiMaxReply = 65536,
-	LtiMaxWire = 1048576,
-	LtiMaxHistory = 131072
+	LtsMaxMessages = 32,
+	LtsMaxPrompt = 16384,
+	LtsMaxReply = 65536,
+	LtsMaxWire = 1048576,
+	LtsMaxHistory = 131072
 };
 
 typedef struct Message Message;
@@ -22,7 +22,7 @@ struct Message {
 };
 
 struct Conversation {
-	Message messages[LtiMaxMessages];
+	Message messages[LtsMaxMessages];
 	size_t count;
 	size_t bytes;
 };
@@ -39,9 +39,20 @@ struct Engine {
 	    char **answer, char *error, size_t capacity);
 };
 
-extern const Module lti_modules[];
-extern const size_t lti_module_count;
-extern const Engine lti_local_engine;
+extern const Module lts_modules[];
+extern const size_t lts_module_count;
+extern const Engine lts_local_engine;
+
+typedef struct Generation { int max_tokens; double temperature, top_p; } Generation;
+typedef struct StreamReply {
+	char line[LtsMaxReply + 1024], text[LtsMaxReply + 1];
+	size_t line_used, used, wire;
+	int done, failed, tokens;
+} StreamReply;
+/* Feed arbitrary network fragments; UTF-8 and JSON may span multiple fragments. */
+int stream_feed(StreamReply *s, const char *data, size_t size);
+char *conversation_generate(const Conversation *c, const Module *module,
+    const char *prompt, const Generation *settings);
 
 void conversation_clear(Conversation *c);
 int conversation_add(Conversation *c, const char *role, const char *text);

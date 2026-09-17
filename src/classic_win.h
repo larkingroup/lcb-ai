@@ -1,5 +1,5 @@
-#ifndef LTI_CLASSIC_WIN_H
-#define LTI_CLASSIC_WIN_H
+#ifndef LTS_CLASSIC_WIN_H
+#define LTS_CLASSIC_WIN_H
 #include <windows.h>
 #include <commctrl.h>
 
