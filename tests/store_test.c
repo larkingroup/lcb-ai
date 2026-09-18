@@ -37,7 +37,7 @@ main(void)
 	HANDLE held;
 	DWORD written;
 	assert(GetTempPathW(MAX_PATH,temp)>0);
-	assert(GetTempFileNameW(temp,L"lts",0,root));
+	assert(GetTempFileNameW(temp,L"lcb",0,root));
 	assert(DeleteFileW(root));
 	assert(store_open(&s,root));
 	assert(!store_open(&second,root)); store_close(&second);
@@ -92,6 +92,27 @@ main(void)
 	assert(store_find_workspace(&s,firstworkspace)->prompt[0]==0);
 	assert(GetFileAttributesW(malformed)!=INVALID_FILE_ATTRIBUTES);
 	assert(store_load(&s,chatid,&fresh) && fresh.conversation.count==2);
+	/* A long chat exceeds both former limits: 32 messages and 1 MiB JSON.
+	   Reopen the whole store too, since its index scan also parses chat files. */
+	{
+		char text[4097];
+		size_t i;
+		memset(text,'x',4096); text[4096]=0;
+		for(i=0;i<160;i++) {
+			assert(conversation_add(&fresh.conversation,"user",text));
+			assert(conversation_add(&fresh.conversation,"assistant","Unicode reply: caf\xc3\xa9 \xe2\x98\xba"));
+			assert(conversation_add(&fresh.conversation,"user","Another question"));
+			assert(conversation_add(&fresh.conversation,"assistant",text));
+		}
+		assert(fresh.conversation.bytes>1048576 && fresh.conversation.count==642);
+		assert(store_save(&s,&fresh));
+		store_close(&s); chat_clear(&fresh);
+		assert(store_open(&s,root) && s.nchats==3 && s.skipped==1);
+		assert(store_load(&s,chatid,&fresh));
+		assert(fresh.info.turns==321 && fresh.conversation.count==642);
+		assert(!strcmp(fresh.conversation.messages[0].text,"Hello\n\xe2\x98\xba"));
+		assert(!strcmp(fresh.conversation.messages[641].text,text));
+	}
 	store_close(&s); chat_clear(&chat); chat_clear(&loaded); chat_clear(&fresh);
 	cleanup(root,L"chats"); cleanup(root,L"workspaces");
 	swprintf(file,MAX_PATH,L"%ls\\session.lock",root); assert(DeleteFileW(file));

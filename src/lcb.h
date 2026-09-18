@@ -1,14 +1,12 @@
-#ifndef LTS_H
-#define LTS_H
+#ifndef LCB_H
+#define LCB_H
 
 #include <stddef.h>
 
 enum {
-	LtsMaxMessages = 32,
-	LtsMaxPrompt = 16384,
-	LtsMaxReply = 65536,
-	LtsMaxWire = 1048576,
-	LtsMaxHistory = 131072
+	LcbMaxPrompt = 16384,
+	LcbMaxReply = 65536,
+	LcbMaxWire = 1048576
 };
 
 typedef struct Message Message;
@@ -22,8 +20,9 @@ struct Message {
 };
 
 struct Conversation {
-	Message messages[LtsMaxMessages];
+	Message *messages;
 	size_t count;
+	size_t capacity;
 	size_t bytes;
 };
 
@@ -39,16 +38,28 @@ struct Engine {
 	    char **answer, char *error, size_t capacity);
 };
 
-extern const Module lts_modules[];
-extern const size_t lts_module_count;
-extern const Engine lts_local_engine;
+extern const Module lcb_modules[];
+extern const size_t lcb_module_count;
+extern const Engine lcb_local_engine;
 
-typedef struct Generation { int max_tokens; double temperature, top_p; } Generation;
+enum { ThinkingAuto, ThinkingOff, ThinkingOn };
+typedef struct Generation {
+	int max_tokens;
+	double temperature, top_p;
+	int context_tokens, thinking;
+	double repeat_penalty, dry_multiplier;
+} Generation;
+Generation generation_defaults(void);
+int generation_valid(const Generation *g);
+/* A borrowed suffix of a saved conversation; never free it. */
+Conversation conversation_suffix(const Conversation *c, size_t first);
 typedef struct StreamReply {
-	char line[LtsMaxReply + 1024], text[LtsMaxReply + 1];
+	char line[LcbMaxReply + 1024], text[LcbMaxReply + 1];
 	size_t line_used, used, wire;
-	int done, failed, tokens;
+	int done, failed, tokens, prompt_tokens, finish, saw_reasoning;
 } StreamReply;
+enum { FinishUnknown, FinishStop, FinishLength, FinishOther };
+typedef struct ReplyReport { int prompt_tokens, tokens, finish, saw_reasoning; } ReplyReport;
 /* Feed arbitrary network fragments; UTF-8 and JSON may span multiple fragments. */
 int stream_feed(StreamReply *s, const char *data, size_t size);
 char *conversation_generate(const Conversation *c, const Module *module,

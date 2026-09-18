@@ -31,7 +31,7 @@ int main(int argc,char **argv)
 		free(lib); return 0;
 	}
 	assert(GetTempPathW(MAX_PATH,temp));
-	swprintf(root,MAX_PATH,L"%lsLTS-library-%lu-%llu",temp,GetCurrentProcessId(),(unsigned long long)GetTickCount64());
+	swprintf(root,MAX_PATH,L"%lsLCB-library-%lu-%llu",temp,GetCurrentProcessId(),(unsigned long long)GetTickCount64());
 	swprintf(sub,MAX_PATH,L"%ls\\nested",root);
 	assert(CreateDirectoryW(root,NULL)); assert(CreateDirectoryW(sub,NULL));
 	swprintf(a,MAX_PATH,L"%ls\\fallback_name.gguf",root);
