@@ -1,5 +1,5 @@
-#ifndef LTS_SETUP_WIN_H
-#define LTS_SETUP_WIN_H
+#ifndef LCB_SETUP_WIN_H
+#define LCB_SETUP_WIN_H
 #ifndef UNICODE
 #define UNICODE
 #endif

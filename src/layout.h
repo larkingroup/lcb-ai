@@ -1,5 +1,5 @@
-#ifndef LTS_LAYOUT_H
-#define LTS_LAYOUT_H
+#ifndef LCB_LAYOUT_H
+#define LCB_LAYOUT_H
 typedef struct PaneLayout { int left, center, right, rightx, bottom, composer; } PaneLayout;
 static inline PaneLayout pane_layout(int width,int height)
 {

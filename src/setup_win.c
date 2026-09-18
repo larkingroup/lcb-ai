@@ -55,7 +55,7 @@ static void browse(HWND window, Setup *s, int engine)
 static void openlink(HWND window, const wchar_t *url)
 {
 	if((INT_PTR)ShellExecuteW(window,L"open",url,NULL,NULL,SW_SHOWNORMAL)<=32)
-		MessageBoxW(window,L"Windows could not open your browser. Check the default browser and try again.",L"LTS AI Setup",MB_OK|MB_ICONINFORMATION);
+		MessageBoxW(window,L"Windows could not open your browser. Check the default browser and try again.",L"lcb-ai Setup",MB_OK|MB_ICONINFORMATION);
 }
 
 static LRESULT CALLBACK setupproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
@@ -113,17 +113,17 @@ int setup_dialog(HWND owner, HFONT font, wchar_t engine[MAX_PATH], wchar_t model
 	wcscpy(s.engine,engine); wcscpy(s.model,model);
 	s.face=CreateSolidBrush(RGB(236,233,216));
 	wc.lpfnWndProc=setupproc; wc.hInstance=GetModuleHandleW(NULL);
-	wc.hCursor=LoadCursorW(NULL,IDC_ARROW); wc.hbrBackground=s.face; wc.lpszClassName=L"LTSSetup";
+	wc.hCursor=LoadCursorW(NULL,IDC_ARROW); wc.hbrBackground=s.face; wc.lpszClassName=L"LCBSetup";
 	if(!RegisterClassW(&wc)) { DeleteObject(s.face); return 0; }
 	bounds.right=MulDiv(bounds.right,dpi,96); bounds.bottom=MulDiv(bounds.bottom,dpi,96);
 	AdjustWindowRect(&bounds,WS_CAPTION|WS_SYSMENU|WS_DLGFRAME,FALSE);
 	GetWindowRect(owner,&r);
-	window=CreateWindowExW(WS_EX_DLGMODALFRAME,wc.lpszClassName,L"LTS AI Setup",WS_CAPTION|WS_SYSMENU|WS_DLGFRAME,
+	window=CreateWindowExW(WS_EX_DLGMODALFRAME,wc.lpszClassName,L"lcb-ai Setup",WS_CAPTION|WS_SYSMENU|WS_DLGFRAME,
 	    r.left+(r.right-r.left-(bounds.right-bounds.left))/2,r.top+(r.bottom-r.top-(bounds.bottom-bounds.top))/2,
 	    bounds.right-bounds.left,bounds.bottom-bounds.top,owner,NULL,wc.hInstance,&s);
 	if(!window) { UnregisterClassW(wc.lpszClassName,wc.hInstance); DeleteObject(s.face); return 0; }
 	DwmSetWindowAttribute(window,33,&corner,sizeof(corner));
-	child(window,font,dpi,L"STATIC",L"Welcome to LTS AI",0,0,18,16,564,20);
+	child(window,font,dpi,L"STATIC",L"Welcome to lcb-ai",0,0,18,16,564,20);
 	child(window,font,dpi,L"STATIC",L"Choose an engine and a model already on this computer, or get them below.",0,0,18,43,564,22);
 	child(window,font,dpi,L"BUTTON",L"1. Local engine",BS_GROUPBOX,0,16,76,568,146);
 	child(window,font,dpi,L"STATIC",L"Recommended: llama.cpp for Windows x64 (CPU). Download: about 19 MB.",0,0,30,99,540,20);

@@ -11,7 +11,8 @@
 #include <richedit.h>
 #include <uxtheme.h>
 #include <dwmapi.h>
-#include "lts.h"
+#include "lcb.h"
+#include "app_paths.h"
 #include "engine_win.h"
 #include "store_win.h"
 #include "editor_win.h"
@@ -20,6 +21,8 @@
 #include "classic_win.h"
 #include "stream_win.h"
 #include "setup_win.h"
+#include "model_settings_win.h"
+#include "context_win.h"
 #include <windowsx.h>
 
 enum { IdModules = 100, IdPrompt, IdSend, IdNew, IdPort, IdExit, IdAbout,
@@ -27,7 +30,7 @@ enum { IdModules = 100, IdPrompt, IdSend, IdNew, IdPort, IdExit, IdAbout,
 	IdWorkspace, IdNewWorkspace, IdEditWorkspace, IdLibrary, IdScan, IdFolder,
 	IdRecursive, IdModels, IdChatTabs, IdLibraryTabs, IdDetails,
 	IdStop, IdCloseTab, IdGeneration, IdValue, IdViewLeft, IdViewRight, IdViewOutput, IdResetLayout, IdSetup,
-	ReplyReady = WM_APP + 1, HealthReady, LibraryReady, StreamReady };
+	ReplyReady = WM_APP + 1, HealthReady, LibraryReady, StreamReady, BudgetReady };
 
 #define Paper RGB(255,255,255)
 #define Face RGB(236,233,216)
@@ -48,6 +51,12 @@ struct Work {
 	unsigned short port;
 	int ok;
 	HANDLE cancel;
+	const Conversation *conversation;
+	char *instruction;
+	Generation settings;
+	ContextBudget budget;
+	ReplyReport report;
+	wchar_t modelpath[MAX_PATH];
 };
 
 static struct {
@@ -57,6 +66,7 @@ static struct {
 	HWND chattabs, librarytabs, models, folder, recursive, scan, details, master, folderlabel;
 	HWND stop, closetab, generation, value, genhelp;
     Generation settings;
+    ContextBudget budget;
     HANDLE cancel;
     Work *work;
     int property, treebusy, dragging, leftsize, rightsize, outputsize;
@@ -83,7 +93,7 @@ static struct {
 	unsigned epoch;
 	unsigned short probeport;
 	EngineProcess process;
-	wchar_t enginepath[MAX_PATH], modelpath[MAX_PATH], config[MAX_PATH];
+	wchar_t enginepath[MAX_PATH], modelpath[MAX_PATH], config[MAX_PATH], dataroot[MAX_PATH];
 	wchar_t activitytext[8192];
 	ULONGLONG started, loadstarted;
 	double lastseconds;
@@ -100,6 +110,7 @@ static void showchat(void);
 static void synctabs(void);
 static void opentab(void);
 static void generationrows(void);
+static void loadsettings(void);
 static void commitproperty(void);
 static void stopreply(void);
 static void closetab(void);
@@ -209,9 +220,9 @@ readconfig(void)
 	wchar_t base[MAX_PATH], fallback[MAX_PATH], legacy[MAX_PATH];
 	DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
 	if(n == 0 || n > MAX_PATH-60) return;
-	swprintf(app.config, MAX_PATH, L"%ls\\lts-ai", base);
-	CreateDirectoryW(app.config, NULL);
-	swprintf(app.config, MAX_PATH, L"%ls\\lts-ai\\settings.ini", base);
+	if(!app_data_root(base,app.dataroot)) return;
+	CreateDirectoryW(app.dataroot, NULL);
+	swprintf(app.config, MAX_PATH, L"%ls\\settings.ini", app.dataroot);
 	/* Keep the historical path for importing settings from the original app. */
 	swprintf(legacy, MAX_PATH, L"%ls\\LTI\\communicator.ini", base);
 	if(GetFileAttributesW(app.config)==INVALID_FILE_ATTRIBUTES) CopyFileW(legacy,app.config,TRUE);
@@ -226,9 +237,7 @@ readconfig(void)
     app.hideleft=GetPrivateProfileIntW(L"layout",L"hide_left",0,app.config)!=0;
     app.hideright=GetPrivateProfileIntW(L"layout",L"hide_right",0,app.config)!=0;
     app.hideoutput=GetPrivateProfileIntW(L"layout",L"hide_output",0,app.config)!=0;
-    app.settings.max_tokens=layout_clamp((int)GetPrivateProfileIntW(L"generation",L"max_tokens",1024,app.config),1,16384);
-    app.settings.temperature=layout_clamp((int)GetPrivateProfileIntW(L"generation",L"temperature100",70,app.config),0,200)/100.0;
-    app.settings.top_p=layout_clamp((int)GetPrivateProfileIntW(L"generation",L"top_p100",95,app.config),1,100)/100.0;
+    model_settings_load(app.config,app.modelpath,&app.settings);
 }
 
 static int
@@ -243,8 +252,9 @@ choosefile(int engine)
 	of.lpstrFilter = engine ? L"Local engine (*.exe)\0*.exe\0\0" : L"Model files (*.gguf)\0*.gguf\0\0";
 	of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_DONTADDTORECENT;
 	if(!GetOpenFileNameW(&of)) return 0;
+	commitproperty();
 	wcscpy(engine ? app.enginepath : app.modelpath, path);
-	if(!engine) SetWindowTextW(app.model, basenamew(path));
+	if(!engine) { SetWindowTextW(app.model, basenamew(path)); loadsettings(); }
 	saveconfig(); InvalidateRect(app.window, NULL, FALSE);
 	return 1;
 }
@@ -257,7 +267,8 @@ loadmodel(void)
 	if(app.busy || app.process.process) return;
 	if(!port) { note(L"Enter a port from 1 to 65535."); return; }
 	if(!setup_paths_ready(app.enginepath,app.modelpath) && !runsetup()) return;
-	if(!engine_start(&app.process, app.enginepath, app.modelpath, port, error, 256)) { note(error); return; }
+	commitproperty();
+	if(!engine_start_context(&app.process, app.enginepath, app.modelpath, port, app.settings.context_tokens, error, 256)) { note(error); return; }
 	app.epoch++; app.health = EngineLoading; app.loadstarted = GetTickCount64();
 	note(L"Loading model..."); refreshcontrols();
 }
@@ -418,7 +429,9 @@ runsetup(void)
 {
 	wchar_t *separator;
 	if(app.busy || app.process.process) { note(L"Unload the current model before changing setup."); return 0; }
+	commitproperty();
 	if(!setup_dialog(app.window,app.normal,app.enginepath,app.modelpath)) return 0;
+	loadsettings();
 	saveconfig(); SetWindowTextW(app.model,basenamew(app.modelpath));
 	if(!app.libraryfolder[0]) {
 		wcscpy(app.libraryfolder,app.modelpath);
@@ -445,7 +458,8 @@ selectmodel(int use)
 	if(!use) return;
 	if(m->projector) { note(L"This is a projector companion. Select a language model."); return; }
 	if(app.busy || app.process.process || app.health==EngineReady) { note(L"Unload the current model before selecting another."); return; }
-	wcscpy(app.modelpath,m->path); SetWindowTextW(app.model,m->name); saveconfig(); note(L"Model selected. Choose Load to start it.");
+	commitproperty();
+	wcscpy(app.modelpath,m->path); SetWindowTextW(app.model,m->name); loadsettings(); saveconfig(); note(L"Model selected. Choose Load to start it.");
 }
 
 static void
@@ -455,6 +469,11 @@ render(void)
 	wchar_t *text;
 	size_t i;
 	SetWindowText(app.transcript, L"");
+	if(app.budget.omitted_messages) {
+		wchar_t summary[192];
+		swprintf(summary,192,L"Last request: %zu older exchanges were outside the model's context. All remain saved below.\r\n\r\n",app.budget.omitted_messages/2);
+		appendstyle(summary,Muted,0,9);
+	}
 	if(c->count == 0) {
 		appendstyle(L"New conversation\r\n\r\n", BlueInk, 1, 10);
 		appendstyle(app.health==EngineReady?L"Ready. Enter a message below.\r\n\r\n":L"Select a local model, then choose Load.\r\n\r\n", Muted, 0, 9);
@@ -485,9 +504,9 @@ refreshtitle(void)
 			wcscpy(name,app.library->models[i].name); break;
 		}
 	}
-	if(!app.process.process) wcscpy(title,app.busy?L"lts-ai: Working":
-	    app.health==EngineReady?L"lts-ai: Connected":L"lts-ai: Idle");
-	else swprintf(title,320,L"lts-ai: %ls %ls",app.busy?L"Working":
+	if(!app.process.process) wcscpy(title,app.busy?L"lcb-ai: Working":
+	    app.health==EngineReady?L"lcb-ai: Connected":L"lcb-ai: Idle");
+	else swprintf(title,320,L"lcb-ai: %ls %ls",app.busy?L"Working":
 	    app.health==EngineReady?L"Loaded":L"Loading",name);
 	GetWindowTextW(app.window,previous,320);
 	if(wcscmp(previous,title)) SetWindowTextW(app.window,title);
@@ -529,6 +548,7 @@ workfree(Work *w)
 	free(w->request);
 	free(w->prompt);
 	free(w->answer);
+	free(w->instruction);
 	free(w);
 }
 
@@ -544,7 +564,13 @@ static DWORD WINAPI
 complete(void *arg)
 {
     Work *w=arg;
-    w->ok=local_stream(w->port,w->request,w->cancel,streamupdate,w,&w->answer,w->error,sizeof(w->error));
+    Module module={"Workspace",w->instruction};
+    if(local_prepare(w->port,w->modelpath,w->conversation,&module,w->prompt,&w->settings,
+        w->cancel,&w->request,&w->budget,w->error,sizeof(w->error))) {
+        PostMessageW(w->target,BudgetReady,0,(LPARAM)w);
+        w->ok=local_stream_report(w->port,w->request,w->cancel,streamupdate,w,&w->answer,&w->report,w->error,sizeof(w->error));
+    }
+    if(WaitForSingleObject(w->cancel,0)==WAIT_OBJECT_0) w->ok=2;
     if(!PostMessageW(w->target,ReplyReady,0,(LPARAM)w)) workfree(w);
     return 0;
 }
@@ -583,21 +609,23 @@ submit(void)
 	GetWindowText(app.prompt, input, n + 1);
 	w->prompt = utf8(input);
 	free(input);
-	if(w->prompt != NULL)
-		w->request = conversation_generate(&app.chat.conversation, &module, w->prompt, &app.settings);
-	if(w->request == NULL) {
-		SetWindowText(app.status, L"Message or conversation limit reached. Shorten the message or choose New.");
+	w->instruction=malloc(strlen(module.instruction)+1);
+	if(w->instruction) strcpy(w->instruction,module.instruction);
+	if(!w->prompt || !w->instruction || strlen(w->prompt)>LcbMaxPrompt) {
+		SetWindowText(app.status, L"Cannot prepare message. Maximum prompt size is 16 KiB; saved history has no exchange limit.");
 		workfree(w);
 		return;
 	}
 	w->port = (unsigned short)port;
 	w->target = app.window;
+	w->conversation=&app.chat.conversation; w->settings=app.settings;
+	wcscpy(w->modelpath,app.modelpath);
 	w->cancel=CreateEventW(NULL,TRUE,FALSE,NULL);
     if(!w->cancel) { workfree(w); note(L"Cannot create request."); return; }
     app.cancel=w->cancel; app.work=w; app.firstseconds=0;
     app.started = GetTickCount64();
 	busy(1);
-	note(L"Waiting for reply...");
+	note(L"Checking the model and counting conversation tokens...");
 	render();
 	if(app.chat.conversation.count == 0) SetWindowTextW(app.transcript,L"");
 	appendstyle(L"You\r\n",Muted,1,9);
@@ -629,7 +657,7 @@ received(Work *w)
 	    conversation_add(c, "assistant", w->answer)) {
 		wchar_t summary[128];
 		app.lastseconds = (double)(GetTickCount64()-app.started)/1000.0;
-		swprintf(summary, 128, L"%ls in %.2f s. First text: %.2f s.", w->ok==2?L"Stopped; partial reply saved":L"Reply received", app.lastseconds, app.firstseconds);
+		swprintf(summary, 128, L"%ls in %.2f s. %d tokens. First text: %.2f s.", w->ok==2?L"Stopped; partial reply saved":w->report.finish==FinishLength?L"Response limit reached":L"Reply received", app.lastseconds, w->report.tokens, app.firstseconds);
 		note(summary);
 		SetWindowText(app.prompt, L"");
 		if(before==0) {
@@ -743,7 +771,7 @@ paint(HDC dc)
     fill(dc,rect(0,0,w,h),Face);
     classic_edge(dc,rect(2,1,w-4,31),1);
     line(dc,88,5,88,26,Shadow); line(dc,271,5,271,26,Shadow);
-    label(dc,rect(w-96,3,82,23),L"LTS AI",BlueInk,app.heading,DT_RIGHT);
+    label(dc,rect(w-96,3,82,23),L"lcb-ai",BlueInk,app.heading,DT_RIGHT);
     if(!app.hideleft) {
         panel(dc,4,36,p.left-4,p.bottom-41,L"Workspace Explorer",app.activepane==0,ClassicFolder);
         label(dc,rect(12,p.bottom-27,p.left-20,18),app.dirty?L"Unsaved changes":L"Saved locally",Muted,app.normal,DT_LEFT);
@@ -768,7 +796,11 @@ paint(HDC dc)
     if(app.busy) swprintf(text,256,L"Elapsed: %.1f s",(double)(GetTickCount64()-app.started)/1000.0);
     else swprintf(text,256,L"Last reply: %.2f s",app.lastseconds);
     label(dc,rect(221,h-22,244,20),text,Muted,app.normal,DT_LEFT);
-    swprintf(text,256,L"127.0.0.1:%u   |   %zu / 16 turns   |   Local session",getport(),app.chat.conversation.count/2);
+    if(app.budget.context_tokens)
+        swprintf(text,256,L"%zu saved exchanges | Context: %d + %d reply / %d | %zu older excluded",
+            app.chat.conversation.count/2,app.budget.prompt_tokens,app.budget.response_tokens,
+            app.budget.context_tokens,app.budget.omitted_messages/2);
+    else swprintf(text,256,L"127.0.0.1:%u   |   %zu saved exchanges   |   Context counted before sending",getport(),app.chat.conversation.count/2);
     label(dc,rect(485,h-22,w-498,20),text,Muted,app.normal,DT_LEFT);
 }
 
@@ -890,9 +922,9 @@ layout(void)
     place(app.folderlabel,p.rightx+9,97,p.right-18,20);
     place(app.folder,p.rightx+9,120,p.right-18,23);
     place(app.recursive,p.rightx+9,153,p.right-18,22); place(app.scan,p.rightx+9,188,119,25);
-    place(app.generation,p.rightx+6,91,p.right-12,111);
+    place(app.generation,p.rightx+6,91,p.right-12,190);
     ListView_SetColumnWidth(app.generation,0,px(124)); ListView_SetColumnWidth(app.generation,1,px(p.right-141));
-    place(app.genhelp,p.rightx+10,217,p.right-20,135);
+    place(app.genhelp,p.rightx+10,292,p.right-20,p.bottom-302);
     ShowWindow(app.librarytabs,right?SW_SHOW:SW_HIDE);
     ShowWindow(app.models,right && tab==0?SW_SHOW:SW_HIDE); ShowWindow(app.details,right && tab==0?SW_SHOW:SW_HIDE);
     ShowWindow(app.generation,right && tab==1?SW_SHOW:SW_HIDE); ShowWindow(app.genhelp,right && tab==1?SW_SHOW:SW_HIDE);
@@ -915,7 +947,7 @@ savechat(void)
 	input=calloc((size_t)n+1,sizeof(*input));
 	if(!input) { note(L"Cannot save draft: out of memory."); return 0; }
 	GetWindowTextW(app.prompt,input,n+1); text=utf8(input); free(input);
-	if(!text || strlen(text)>LtsMaxPrompt) { free(text); note(L"Cannot save draft: invalid or oversized text."); return 0; }
+	if(!text || strlen(text)>LcbMaxPrompt) { free(text); note(L"Cannot save draft: invalid or oversized text."); return 0; }
 	strcpy(app.chat.draft,text); free(text);
 	if(!store_save(&app.store,&app.chat)) { note(app.store.error); return 0; }
 	app.dirty=0; KillTimer(app.window,3); InvalidateRect(app.window,NULL,FALSE); return 1;
@@ -968,6 +1000,7 @@ listchats(void)
 static void
 showchat(void)
 {
+    memset(&app.budget,0,sizeof(app.budget));
 	wchar_t *draft=wide(app.chat.draft), id[33];
 	wchar_t *master=wide(app.store.workspaces[app.selected].prompt);
 	SetWindowTextW(app.master,master?master:L""); free(master);
@@ -1006,7 +1039,7 @@ static void
 workspaceedit(int fresh)
 {
 	Workspace *next;
-	wchar_t name[StoreName*2], prompt[LtsMaxPrompt*2+1], *text;
+	wchar_t name[StoreName*2], prompt[LcbMaxPrompt*2+1], *text;
 	char *narrowname, *narrowprompt;
 	int ok;
 	if(app.busy || !savechat()) return;
@@ -1014,9 +1047,9 @@ workspaceedit(int fresh)
 	if(!fresh) *next=app.store.workspaces[app.selected];
 	text=wide(next->name); wcscpy(name,text?text:L""); free(text);
 	text=wide(next->prompt); wcscpy(prompt,text?text:L""); free(text);
-	while(edit_workspace(app.window,app.normal,fresh?L"New workspace":L"Workspace settings",name,StoreName*2,prompt,LtsMaxPrompt*2+1)) {
+	while(edit_workspace(app.window,app.normal,fresh?L"New workspace":L"Workspace settings",name,StoreName*2,prompt,LcbMaxPrompt*2+1)) {
 		narrowname=utf8(name); narrowprompt=utf8(prompt);
-		ok=narrowname && narrowprompt && strlen(narrowname)<StoreName && strlen(narrowprompt)<=LtsMaxPrompt;
+		ok=narrowname && narrowprompt && strlen(narrowname)<StoreName && strlen(narrowprompt)<=LcbMaxPrompt;
 		if(ok) { strcpy(next->name,narrowname); strcpy(next->prompt,narrowprompt); }
 		free(narrowname); free(narrowprompt);
 		if(ok && store_workspace(&app.store,next)) {
@@ -1026,7 +1059,7 @@ workspaceedit(int fresh)
 			}
 			listworkspaces(); showchat(); note(L"Workspace saved."); break;
 		}
-		MessageBoxW(app.window,ok?app.store.error:L"Workspace text is too long or invalid.",L"lts-ai",MB_OK|MB_ICONERROR);
+		MessageBoxW(app.window,ok?app.store.error:L"Workspace text is too long or invalid.",L"lcb-ai",MB_OK|MB_ICONERROR);
 	}
 	free(next);
 }
@@ -1034,17 +1067,14 @@ workspaceedit(int fresh)
 static int
 openstore(void)
 {
-	wchar_t root[MAX_PATH], last[33];
+	wchar_t last[33];
 	char id[33]={0};
 	size_t i;
 	Workspace *w;
-	DWORD n=GetEnvironmentVariableW(L"LOCALAPPDATA",root,MAX_PATH);
-	if(!n || n>MAX_PATH-80) return 0;
-	wcscat(root,L"\\lts-ai");
-	if(!store_open(&app.store,root)) return 0;
+	if(!app.dataroot[0] || !store_open(&app.store,app.dataroot)) return 0;
 	if(!app.store.nworkspaces) {
 		w=calloc(1,sizeof(*w)); if(!w) return 0;
-		strcpy(w->name,"General"); strcpy(w->prompt,lts_modules[0].instruction);
+		strcpy(w->name,"General"); strcpy(w->prompt,lcb_modules[0].instruction);
 		if(!store_workspace(&app.store,w)) { free(w); return 0; } free(w);
 	}
 	GetPrivateProfileStringW(L"session",L"chat",L"",last,33,app.config);
@@ -1118,42 +1148,73 @@ static void closetab(void)
     app.ntabs--;
     activatechat(app.tabs[index<app.ntabs?index:app.ntabs-1]);
 }
+static void loadsettings(void)
+{
+    model_settings_load(app.config,app.modelpath,&app.settings);
+    memset(&app.budget,0,sizeof(app.budget));
+    if(app.generation) generationrows();
+}
 static void generationrows(void)
 {
-    const wchar_t *names[]={L"Response tokens",L"Temperature",L"Top P"};
-    wchar_t value[40];
+    const wchar_t *names[]={L"Response tokens",L"Temperature",L"Top P",L"Context (reload)",
+        L"Thinking",L"Repeat penalty",L"DRY strength"};
+    wchar_t value[64];
     LVITEMW item={0};
     int i;
     ListView_DeleteAllItems(app.generation);
-    for(i=0;i<3;i++) {
+    for(i=0;i<7;i++) {
         item.mask=LVIF_TEXT; item.iItem=i; item.pszText=(wchar_t *)names[i];
         ListView_InsertItem(app.generation,&item);
-        if(i==0) swprintf(value,40,L"%d",app.settings.max_tokens);
-        else swprintf(value,40,L"%.2f",i==1?app.settings.temperature:app.settings.top_p);
+        switch(i) {
+        case 0: swprintf(value,64,L"%d",app.settings.max_tokens); break;
+        case 1: swprintf(value,64,L"%.2f",app.settings.temperature); break;
+        case 2: swprintf(value,64,L"%.2f",app.settings.top_p); break;
+        case 3: swprintf(value,64,L"%d",app.settings.context_tokens); break;
+        case 4: wcscpy(value,app.settings.thinking==ThinkingAuto?L"Auto":app.settings.thinking==ThinkingOff?L"Off":L"On"); break;
+        case 5: swprintf(value,64,L"%.2f",app.settings.repeat_penalty); break;
+        default: swprintf(value,64,L"%.2f",app.settings.dry_multiplier); break;
+        }
         ListView_SetItemText(app.generation,i,1,value);
     }
+    SetWindowTextW(app.genhelp,L"Double-click a value or press Enter. Enter saves; Escape cancels.\r\n\r\nSaved per model. Context changes require unloading and loading again.\r\n\r\nThinking: Auto, Off, or On. Auto uses the template default; overrides require a supported template.\r\n\r\nRepeat: 1 = off. DRY: 0 = off.\r\n\r\nSaved chats have no exchange limit. Each request includes only the recent exchanges that fit.");
 }
 static void commitproperty(void)
 {
     wchar_t value[64],*end;
+    Generation next=app.settings;
     double number;
-    int row=app.property,valid;
+    int row=app.property,valid=0;
     if(row<0) return;
     app.property=-1;
     GetWindowTextW(app.value,value,64);
     number=wcstod(value,&end);
-    valid=end!=value && !*end && (row==0?(number>=1 && number<=16384 && number==(int)number):
-        row==1?(number>=0 && number<=2):(number>=0.01 && number<=1));
+    if(row==4) {
+        valid=1;
+        if(!_wcsicmp(value,L"Auto")) next.thinking=ThinkingAuto;
+        else if(!_wcsicmp(value,L"Off")) next.thinking=ThinkingOff;
+        else if(!_wcsicmp(value,L"On")) next.thinking=ThinkingOn;
+        else valid=0;
+    } else if(end!=value && !*end && number>=0 && number<=1048576) {
+        valid=1;
+        switch(row) {
+        case 0: next.max_tokens=(int)number; valid=number==next.max_tokens; break;
+        case 1: next.temperature=(int)(number*100+0.5)/100.0; break;
+        case 2: next.top_p=(int)(number*100+0.5)/100.0; break;
+        case 3: next.context_tokens=(int)number; valid=number==next.context_tokens; break;
+        case 5: next.repeat_penalty=(int)(number*100+0.5)/100.0; break;
+        case 6: next.dry_multiplier=(int)(number*100+0.5)/100.0; break;
+        default: valid=0;
+        }
+    }
     ShowWindow(app.value,SW_HIDE);
-    if(valid) {
-        if(row==0) app.settings.max_tokens=(int)number;
-        else if(row==1) app.settings.temperature=(int)(number*100+0.5)/100.0;
-        else app.settings.top_p=(int)(number*100+0.5)/100.0;
-        saveint(L"generation",L"max_tokens",app.settings.max_tokens);
-        saveint(L"generation",L"temperature100",(int)(app.settings.temperature*100+0.5));
-        saveint(L"generation",L"top_p100",(int)(app.settings.top_p*100+0.5));
-        note(L"Generation settings saved. They apply to the next message.");
-    } else note(L"Invalid value. Tokens: 1-16384; temperature: 0-2; Top P: 0.01-1. Previous value retained.");
+    if(!valid || !generation_valid(&next))
+        note(L"Invalid setting. Response: 1-16384; context: 512-1048576; temperature: 0-2; Top P: 0.01-1; thinking: Auto/Off/On; repeat: 1-2; DRY: 0-4.");
+    else if(!model_settings_save(app.config,app.modelpath,&next))
+        note(L"Cannot save model settings. Select a local model and check the settings folder. Previous values retained.");
+    else {
+        app.settings=next;
+        note(row==3?L"Context saved for this model. Unload and load again to apply it.":L"Settings saved for this model. They apply to the next message.");
+    }
     generationrows();
 }
 static void editproperty(void)
@@ -1161,7 +1222,7 @@ static void editproperty(void)
     RECT r;
     wchar_t value[64];
     int row=ListView_GetNextItem(app.generation,-1,LVNI_SELECTED);
-    if(app.busy || row<0 || row>2) return;
+    if(app.busy || row<0 || row>6) return;
     commitproperty();
     ListView_GetSubItemRect(app.generation,row,1,LVIR_BOUNDS,&r);
     MapWindowPoints(app.generation,app.window,(POINT *)&r,2);
@@ -1339,8 +1400,8 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 			break;
 		case IdExit: SendMessageW(window,WM_CLOSE,0,0); break;
 		case IdAbout:
-			MessageBoxW(window,L"lts-ai\nVersion 0.4.0\n\nAI processor and interface built by LTS.\n\n"
-			    L"LTS - Larkin Technical Systems\nA subsidiary of LGH.",L"About lts-ai",MB_OK);
+			MessageBoxW(window,L"lcb-ai\nVersion 0.5.0-pre.1\n\nLocal AI processor and interface.\n\n"
+			    L"Larkin Computing Bureau",L"About lcb-ai",MB_OK);
 			break;
 		}
 		return 0;
@@ -1363,11 +1424,21 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
         }
         free(part); return 0;
     }
+    case BudgetReady: {
+        Work *w=(Work *)lp;
+        wchar_t summary[320];
+        app.budget=w->budget;
+        swprintf(summary,320,L"Context: %d prompt + %d reserved reply + 32 safety / %d tokens. %zu older exchanges excluded; all remain saved. Thinking switch: %ls.",
+            w->budget.prompt_tokens,w->budget.response_tokens,w->budget.context_tokens,w->budget.omitted_messages/2,
+            w->budget.thinking_supported?L"supported":L"not advertised");
+        note(summary);
+        return 0;
+    }
     case ReplyReady: received((Work *)lp); return 0;
 	case WM_CLOSE:
         if(app.busy) { stopreply(); note(L"Stopping. Close the window again after the partial reply is saved."); return 0; }
         commitproperty(); savelayout();
-		if(!savechat()) { MessageBoxW(window,L"The current chat could not be saved. The window will stay open.",L"lts-ai",MB_OK|MB_ICONERROR); return 0; }
+		if(!savechat()) { MessageBoxW(window,L"The current chat could not be saved. The window will stay open.",L"lcb-ai",MB_OK|MB_ICONERROR); return 0; }
 		InterlockedExchange(&app.scancancel,1);
 		engine_stop(&app.process); DestroyWindow(window); return 0;
 	case WM_DESTROY: KillTimer(window,1); KillTimer(window,2); PostQuitMessage(0); return 0;
@@ -1398,7 +1469,7 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	if(!app.rich) return 1;
 	readconfig();
 	if(!openstore()) {
-		MessageBoxW(NULL,app.store.error[0]?app.store.error:L"Cannot open local storage.",L"lts-ai",MB_OK|MB_ICONERROR);
+		MessageBoxW(NULL,app.store.error[0]?app.store.error:L"Cannot open local storage.",L"lcb-ai",MB_OK|MB_ICONERROR);
 		store_close(&app.store); return 1;
 	}
     {
@@ -1414,8 +1485,8 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
         }
     }
     wc.lpfnWndProc=windowproc; wc.hInstance=instance;
-	wc.hCursor=LoadCursor(NULL,IDC_ARROW); wc.hIcon=LoadIcon(NULL,IDI_APPLICATION);
-	wc.hbrBackground=app.face; wc.lpszClassName=L"LTSCommunicator";
+	wc.hCursor=LoadCursor(NULL,IDC_ARROW); wc.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(101));
+	wc.hbrBackground=app.face; wc.lpszClassName=L"LCBCommunicator";
 	if(!RegisterClassW(&wc)) return 1;
 	app.normal=CreateFontW(-px(12),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,
 	    OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,DEFAULT_PITCH,L"Tahoma");
@@ -1446,14 +1517,14 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	AppendMenuW(engine,MF_STRING,IdUnload,L"&Unload model");
 	AppendMenuW(settings,MF_STRING,IdLibrary,L"Model &library...");
 	AppendMenuW(settings,MF_STRING,IdEditWorkspace,L"&Workspace...");
-	AppendMenuW(help,MF_STRING,IdAbout,L"&About lts-ai");
+	AppendMenuW(help,MF_STRING,IdAbout,L"&About lcb-ai");
 	AppendMenuW(menu,MF_POPUP,(UINT_PTR)file,L"&File");
 	AppendMenuW(menu,MF_POPUP,(UINT_PTR)edit,L"&Edit");
 	AppendMenuW(menu,MF_POPUP,(UINT_PTR)view,L"&View");
 	AppendMenuW(menu,MF_POPUP,(UINT_PTR)engine,L"&Engine");
 	AppendMenuW(menu,MF_POPUP,(UINT_PTR)settings,L"&Settings");
 	AppendMenuW(menu,MF_POPUP,(UINT_PTR)help,L"&Help");
-	app.window=CreateWindowW(wc.lpszClassName,L"lts-ai",WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,
+	app.window=CreateWindowW(wc.lpszClassName,L"lcb-ai",WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,
 	    CW_USEDEFAULT,CW_USEDEFAULT,px(1240),px(820),NULL,menu,instance,NULL);
 	if(!app.window) return 1;
 	DwmSetWindowAttribute(app.window,33,&corner,sizeof(corner));
@@ -1473,10 +1544,10 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
     TreeView_SetItemHeight(app.modules,px(21));
 	app.transcript=control(MSFTEDIT_CLASS,L"",WS_TABSTOP|WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL,0);
 	SendMessageW(app.transcript,EM_SETBKGNDCOLOR,0,Paper);
-	SendMessageW(app.transcript,EM_EXLIMITTEXT,0,400000);
+	SendMessageW(app.transcript,EM_EXLIMITTEXT,0,0x7ffffffe);
 	SendMessageW(app.transcript,EM_AUTOURLDETECT,0,0);
 	app.prompt=control(L"EDIT",L"",WS_TABSTOP|WS_BORDER|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_WANTRETURN,IdPrompt);
-	SendMessageW(app.prompt,EM_SETLIMITTEXT,LtsMaxPrompt/3,0);
+	SendMessageW(app.prompt,EM_SETLIMITTEXT,LcbMaxPrompt/3,0);
 	SendMessageW(app.prompt,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,MAKELPARAM(px(7),px(7)));
 	app.stop=control(L"BUTTON",L"Stop",WS_TABSTOP|BS_OWNERDRAW,IdStop);
     app.closetab=control(L"BUTTON",L"x",WS_TABSTOP|BS_OWNERDRAW,IdCloseTab);
@@ -1516,7 +1587,7 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
     column.pszText=L"Value"; column.cx=px(120); ListView_InsertColumn(app.generation,1,&column);
     app.value=control(L"EDIT",L"",WS_TABSTOP|ES_AUTOHSCROLL,IdValue);
     SendMessageW(app.value,EM_SETLIMITTEXT,32,0); ShowWindow(app.value,SW_HIDE);
-    app.genhelp=control(L"STATIC",L"Double-click a value or press Enter to edit.\r\nEnter saves; Escape cancels.\r\n\r\nApplies to the next message. Settings are saved on this computer.\r\n\r\nContext: 4,096 tokens. Thinking: off.",0,0);
+    app.genhelp=control(L"STATIC",L"",0,0);
     generationrows();
     app.folderlabel=control(L"STATIC",L"Model folder",0,0);
 	app.folder=control(L"EDIT",app.libraryfolder,WS_TABSTOP|WS_BORDER|ES_AUTOHSCROLL,IdFolder);
@@ -1526,7 +1597,7 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	app.scan=control(L"BUTTON",L"Save and scan",WS_TABSTOP|BS_OWNERDRAW,IdScan);
 	if(!app.modules||!app.transcript||!app.prompt||!app.send||!app.port||!app.activity) return 1;
 	tooltips(); layout(); listworkspaces(); showchat(); refreshcontrols(); note(L"Workspace ready. Select a model, then Load.");
-	if(app.store.skipped) note(L"Some saved files could not be loaded. They were left unchanged in the lts-ai folder.");
+	if(app.store.skipped) note(L"Some saved files could not be loaded. They were left unchanged in the application data folder.");
 	SetTimer(app.window,1,2000,NULL); SetTimer(app.window,2,250,NULL);
 	ShowWindow(app.window,show); UpdateWindow(app.window); SetFocus(app.prompt);
 	QueryPerformanceCounter(&finish);

@@ -32,6 +32,11 @@ static int ready(Transfer *t,HANDLE cancel,BOOL started)
 int local_stream(unsigned short port,const char *body,HANDLE cancel,StreamUpdate update,
     void *context,char **answer,char *error,size_t capacity)
 {
+    return local_stream_report(port,body,cancel,update,context,answer,NULL,error,capacity);
+}
+int local_stream_report(unsigned short port,const char *body,HANDLE cancel,StreamUpdate update,
+    void *context,char **answer,ReplyReport *report,char *error,size_t capacity)
+{
     HINTERNET session=NULL,connection=NULL,request=NULL;
     Transfer t={0};
     StreamReply *reply=calloc(1,sizeof(*reply));
@@ -41,12 +46,13 @@ int local_stream(unsigned short port,const char *body,HANDLE cancel,StreamUpdate
     int ok=0,callback=0;
     ULONGLONG lastupdate=0;
     *answer=NULL;
+    if(report) memset(report,0,sizeof(*report));
     if(!capacity) { free(reply); return 0; }
     error[0]=0;
-    if(!port || !cancel || !reply || strlen(body)>LtsMaxWire) goto done;
+    if(!port || !cancel || !reply || strlen(body)>LcbMaxWire) goto done;
     t.event=CreateEventW(NULL,FALSE,FALSE,NULL); t.closed=CreateEventW(NULL,TRUE,FALSE,NULL);
     if(!t.event || !t.closed) goto done;
-    session=WinHttpOpen(L"lts-ai/0.4.0",WINHTTP_ACCESS_TYPE_NO_PROXY,NULL,NULL,WINHTTP_FLAG_ASYNC);
+    session=WinHttpOpen(L"lcb-ai/0.5.0-pre.1",WINHTTP_ACCESS_TYPE_NO_PROXY,NULL,NULL,WINHTTP_FLAG_ASYNC);
     if(!session) goto done;
     WinHttpSetTimeouts(session,3000,3000,10000,90000);
     connection=WinHttpConnect(session,L"127.0.0.1",port,0);
@@ -81,6 +87,10 @@ int local_stream(unsigned short port,const char *body,HANDLE cancel,StreamUpdate
         }
     }
     if(reply->done && reply->used) ok=1;
+    else if(reply->done && reply->finish==FinishLength && reply->saw_reasoning)
+        snprintf(error,capacity,"Response limit reached during thinking. Increase Response tokens or set Thinking to Off. Your draft was retained.");
+    else if(reply->done && !reply->used)
+        snprintf(error,capacity,"The model returned no answer text. Try a larger response limit or different thinking setting.");
     else snprintf(error,capacity,"The engine ended the stream before a complete answer arrived.");
 done:
     if(cancel && WaitForSingleObject(cancel,0)==WAIT_OBJECT_0) ok=2;
@@ -95,5 +105,71 @@ done:
         if(*answer) memcpy(*answer,reply->text,reply->used+1); else ok=0;
     }
     if(!ok && !error[0]) snprintf(error,capacity,"The local streaming request failed or timed out.");
+    if(report && reply) {
+        report->prompt_tokens=reply->prompt_tokens; report->tokens=reply->tokens;
+        report->finish=reply->finish; report->saw_reasoning=reply->saw_reasoning;
+    }
     free(reply); return ok;
+}
+
+int local_json(unsigned short port, const wchar_t *path, const char *body,
+    HANDLE cancel, char **answer, char *error, size_t capacity)
+{
+    HINTERNET session=NULL,connection=NULL,request=NULL;
+    Transfer t={0};
+    DWORD_PTR ctx=(DWORD_PTR)&t;
+    DWORD flags,status=0,n=sizeof(status);
+    size_t used=0,length=body?strlen(body):0;
+    char *wire=NULL;
+    int callback=0,ok=0;
+    ULONGLONG started=GetTickCount64();
+    *answer=NULL;
+    if(!capacity) return 0;
+    error[0]=0;
+    if(length>LcbMaxWire) { ok=LocalJsonTooLarge; snprintf(error,capacity,"Local JSON request exceeds 1 MiB."); goto done; }
+    if(!port || !cancel) goto done;
+    wire=malloc(LcbMaxWire+1);
+    t.event=CreateEventW(NULL,FALSE,FALSE,NULL); t.closed=CreateEventW(NULL,TRUE,FALSE,NULL);
+    if(!wire || !t.event || !t.closed) goto done;
+    session=WinHttpOpen(L"lcb-ai/0.5.0-pre.1",WINHTTP_ACCESS_TYPE_NO_PROXY,NULL,NULL,WINHTTP_FLAG_ASYNC);
+    if(!session) goto done;
+    WinHttpSetTimeouts(session,3000,3000,10000,30000);
+    connection=WinHttpConnect(session,L"127.0.0.1",port,0);
+    if(!connection) goto done;
+    request=WinHttpOpenRequest(connection,body?L"POST":L"GET",path,NULL,NULL,NULL,0);
+    if(!request || !WinHttpSetOption(request,WINHTTP_OPTION_CONTEXT_VALUE,&ctx,sizeof(ctx))) goto done;
+    if(WinHttpSetStatusCallback(request,completed,WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS|
+        WINHTTP_CALLBACK_FLAG_HANDLES,0)==WINHTTP_INVALID_STATUS_CALLBACK) goto done;
+    callback=1;
+    flags=WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+    if(!WinHttpSetOption(request,WINHTTP_OPTION_REDIRECT_POLICY,&flags,sizeof(flags))) goto done;
+    flags=WINHTTP_DISABLE_COOKIES|WINHTTP_DISABLE_AUTHENTICATION;
+    if(!WinHttpSetOption(request,WINHTTP_OPTION_DISABLE_FEATURE,&flags,sizeof(flags))) goto done;
+    if(!ready(&t,cancel,WinHttpSendRequest(request,L"Content-Type: application/json\r\n",(DWORD)-1,
+        (void *)body,(DWORD)length,(DWORD)length,ctx)) ||
+        !ready(&t,cancel,WinHttpReceiveResponse(request,NULL))) goto done;
+    if(!WinHttpQueryHeaders(request,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,NULL,&status,&n,NULL)) goto done;
+    if(status!=200) { snprintf(error,capacity,"Engine metadata/token endpoint returned HTTP %lu. Check engine compatibility and template.",(unsigned long)status); goto done; }
+    for(;;) {
+        DWORD available;
+        if(GetTickCount64()-started>60000) goto done;
+        if(!ready(&t,cancel,WinHttpQueryDataAvailable(request,NULL))) goto done;
+        available=t.bytes;
+        if(!available) break;
+        if(available>LcbMaxWire-used) { ok=LocalJsonTooLarge; snprintf(error,capacity,"Engine metadata/token response exceeds 1 MiB."); goto done; }
+        if(!ready(&t,cancel,WinHttpReadData(request,wire+used,available,NULL))) goto done;
+        if(!t.bytes) break;
+        used+=t.bytes;
+    }
+    if(!used || memchr(wire,0,used)) goto done;
+    wire[used]=0; *answer=wire; wire=NULL; ok=1;
+done:
+    if(request) { WinHttpCloseHandle(request); if(callback) WaitForSingleObject(t.closed,INFINITE); }
+    if(connection) WinHttpCloseHandle(connection);
+    if(session) WinHttpCloseHandle(session);
+    if(t.event) CloseHandle(t.event);
+    if(t.closed) CloseHandle(t.closed);
+    free(wire);
+    if(!ok && !error[0]) snprintf(error,capacity,"Cannot inspect the local model or count tokens; request stopped, unavailable, or timed out.");
+    return ok;
 }

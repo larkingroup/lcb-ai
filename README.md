@@ -1,4 +1,4 @@
-# lts-ai
+# lcb-ai
 
 A local AI desktop for Windows.
 Select a llama.cpp server and a GGUF model to start chatting.
@@ -12,4 +12,4 @@ cmake -S . -B build
 cmake --build build --config Release
 ```
 
-Run `lts-ai.exe` from `build/Release` or `build`.
+Run `lcb-ai.exe` from `build/Release` or `build`.

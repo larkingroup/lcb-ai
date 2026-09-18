@@ -15,7 +15,7 @@ engine_probe(unsigned short port)
 	cJSON *json = NULL, *value;
 	int result = EngineOffline;
 	ULONGLONG start = GetTickCount64();
-	s = WinHttpOpen(L"lts-ai/0.4.0", WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0);
+	s = WinHttpOpen(L"lcb-ai/0.5.0-pre.1", WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0);
 	if(!s) goto done;
 	WinHttpSetTimeouts(s, 500, 500, 500, 800);
 	c = WinHttpConnect(s, L"127.0.0.1", port, 0);
@@ -90,12 +90,20 @@ int
 engine_start(EngineProcess *p, const wchar_t *exe, const wchar_t *model,
     unsigned short port, wchar_t *error, size_t capacity)
 {
+    return engine_start_context(p,exe,model,port,4096,error,capacity);
+}
+
+int
+engine_start_context(EngineProcess *p, const wchar_t *exe, const wchar_t *model,
+    unsigned short port, int context, wchar_t *error, size_t capacity)
+{
 	wchar_t command[4096], directory[MAX_PATH], *slash;
 	STARTUPINFOW startup = {0};
 	PROCESS_INFORMATION info = {0};
 	JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
 	int n;
 	DWORD attributes;
+	if(context<512 || context>1048576) { swprintf(error,capacity,L"Context must be between 512 and 1048576 tokens."); return 0; }
 	if(p->process) { swprintf(error, capacity, L"Unload the current model first."); return 0; }
 	attributes = GetFileAttributesW(exe);
 	if(attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
@@ -118,9 +126,9 @@ engine_start(EngineProcess *p, const wchar_t *exe, const wchar_t *model,
 	if(!slash) { swprintf(error, capacity, L"Use a full engine path."); return 0; }
 	*slash = 0;
 	n = swprintf(command, 4096, L"\"%ls\" --model \"%ls\" --alias local --host 127.0.0.1 --port %u "
-	    L"--ctx-size 4096 --parallel 1 --fit on --gpu-layers auto --cache-type-k q8_0 "
+	    L"--ctx-size %d --parallel 1 --fit on --gpu-layers auto --cache-type-k q8_0 --jinja "
 	    L"--cache-type-v q8_0 --no-webui --no-agent --no-ui-mcp-proxy --cors-origins localhost --no-cors-credentials",
-	    exe, model, port);
+	    exe, model, port, context);
 	if(n < 0 || n >= 4096) { swprintf(error, capacity, L"Engine command is too long."); return 0; }
 	p->job = CreateJobObjectW(NULL, NULL);
 	limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;

@@ -4,9 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "lts.h"
+#include "lcb.h"
 
-const Engine lts_local_engine = {"Local HTTP", local_complete};
+const Engine lcb_local_engine = {"Local HTTP", local_complete};
 
 int
 local_complete(unsigned short port, const char *body, char **answer,
@@ -23,12 +23,12 @@ local_complete(unsigned short port, const char *body, char **answer,
 	if(capacity == 0)
 		return 0;
 	error[0] = 0;
-	if(port == 0 || bodylen > LtsMaxWire) {
+	if(port == 0 || bodylen > LcbMaxWire) {
 		snprintf(error, capacity, "Invalid local request.");
 		return 0;
 	}
 	/* Literal loopback, no proxy, no redirects, no cookies or credentials. */
-	session = WinHttpOpen(L"lts-ai/0.4.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
+	session = WinHttpOpen(L"lcb-ai/0.5.0-pre.1", WINHTTP_ACCESS_TYPE_NO_PROXY,
 	    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 	if(session == NULL)
 		goto done;
@@ -55,7 +55,7 @@ local_complete(unsigned short port, const char *body, char **answer,
 		snprintf(error, capacity, "Local engine returned HTTP %lu. Check that the model is ready.", (unsigned long)status);
 		goto done;
 	}
-	wire = malloc(LtsMaxWire + 1);
+	wire = malloc(LcbMaxWire + 1);
 	if(wire == NULL) {
 		snprintf(error, capacity, "Out of memory.");
 		goto done;
@@ -66,10 +66,10 @@ local_complete(unsigned short port, const char *body, char **answer,
 			goto done;
 		}
 		if(!WinHttpReadData(request, wire + used,
-		    (DWORD)((LtsMaxWire + 1 - used) > 8192 ? 8192 : (LtsMaxWire + 1 - used)), &got))
+		    (DWORD)((LcbMaxWire + 1 - used) > 8192 ? 8192 : (LcbMaxWire + 1 - used)), &got))
 			goto done;
 		used += got;
-		if(used > LtsMaxWire) {
+		if(used > LcbMaxWire) {
 			snprintf(error, capacity, "Local engine response exceeds 1 MiB.");
 			goto done;
 		}

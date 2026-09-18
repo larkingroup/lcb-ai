@@ -29,7 +29,7 @@ editorproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 		wchar_t name[481], *p;
 		GetWindowTextW(e->name,name,481);
 		for(p=name;*p==L' ' || *p==L'\t';p++) {}
-		if(!*p) { MessageBoxW(window,L"Enter a workspace name.",L"lts-ai",MB_OK); return 0; }
+		if(!*p) { MessageBoxW(window,L"Enter a workspace name.",L"lcb-ai",MB_OK); return 0; }
 		GetWindowTextW(e->name,e->outname,(int)e->namecap);
 		GetWindowTextW(e->prompt,e->outprompt,(int)e->promptcap);
 		e->ok=1; e->done=1; return 0;
@@ -62,7 +62,7 @@ edit_workspace(HWND owner, HFONT font, const wchar_t *title,
 	DWORD corner=1, caption=RGB(223,220,207);
 	ReleaseDC(owner,dc);
 	wc.lpfnWndProc=editorproc; wc.hInstance=GetModuleHandleW(NULL);
-	wc.hCursor=LoadCursorW(NULL,IDC_ARROW); wc.hbrBackground=brush; wc.lpszClassName=L"LTSWorkspaceEditor";
+	wc.hCursor=LoadCursorW(NULL,IDC_ARROW); wc.hbrBackground=brush; wc.lpszClassName=L"LCBWorkspaceEditor";
 	if(!RegisterClassW(&wc)) { DeleteObject(brush); return 0; }
 	e.outname=name; e.namecap=namecap; e.outprompt=prompt; e.promptcap=promptcap; e.face=brush;
 	bounds.right=MulDiv(bounds.right,dpi,96); bounds.bottom=MulDiv(bounds.bottom,dpi,96);
