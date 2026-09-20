@@ -146,6 +146,20 @@ chat_parse(cJSON *json, Chat *chat)
 		if(!cJSON_IsString(role) || !cJSON_IsString(text) || !validtext(text->valuestring,LcbMaxReply,0) ||
 		    strcmp(role->valuestring,i%2?"assistant":"user")!=0 ||
 		    !conversation_add(&chat->conversation,i%2?"assistant":"user",text->valuestring)) return 0;
+		if(i%2) {
+			cJSON *status=cJSON_GetObjectItemCaseSensitive(m,"status");
+			cJSON *error=cJSON_GetObjectItemCaseSensitive(m,"error");
+			Message *message=&chat->conversation.messages[i];
+			if(status) {
+				int code;
+				if(!cJSON_IsString(status)) return 0;
+				for(code=AnswerUnknown;code<=AnswerOther;code++)
+					if(!strcmp(status->valuestring,answer_status_name(code))) break;
+				if(code>AnswerOther) return 0;
+				message->status=code;
+			}
+			if(error && !field(m,"error",message->error,sizeof(message->error),1)) return 0;
+		}
 		i++;
 	}
 	if(i%2) return 0;
@@ -174,6 +188,21 @@ store_load(Store *s, const char *id, Chat *chat)
 	if(ok) { chat_clear(chat); *chat=*next; free(next); return 1; }
 	if(next) { chat_clear(next); free(next); }
 	return fail(s,L"Cannot read chat; file left unchanged");
+}
+
+int
+store_delete(Store *s, const char *id)
+{
+	wchar_t name[MAX_PATH];
+	size_t index;
+	if(!validid(id)) { SetLastError(ERROR_INVALID_NAME); return fail(s,L"Invalid chat identifier"); }
+	for(index=0;index<s->nchats;index++) if(!strcmp(s->chats[index].id,id)) break;
+	if(index==s->nchats) { SetLastError(ERROR_NOT_FOUND); return fail(s,L"Chat not found"); }
+	path(s,name,L"chats",id);
+	if(!DeleteFileW(name)) return fail(s,L"Cannot delete chat; conversation retained");
+	memmove(s->chats+index,s->chats+index+1,(s->nchats-index-1)*sizeof(*s->chats));
+	memset(&s->chats[--s->nchats],0,sizeof(*s->chats));
+	s->error[0]=0; return 1;
 }
 
 int
@@ -221,6 +250,11 @@ store_save(Store *s, Chat *chat)
 		m=cJSON_CreateObject();
 		ok=validtext(message->text,LcbMaxReply,0) && strcmp(message->role,i%2?"assistant":"user")==0 && m &&
 		    cJSON_AddStringToObject(m,"role",message->role) && cJSON_AddStringToObject(m,"content",message->text);
+		if(ok && i%2) {
+			const char *status=answer_status_name(message->status);
+			ok=status && validtext(message->error,sizeof(message->error)-1,1) &&
+			    cJSON_AddStringToObject(m,"status",status) && cJSON_AddStringToObject(m,"error",message->error);
+		}
 		if(ok) ok=cJSON_AddItemToArray(messages,m);
 		if(!ok) cJSON_Delete(m);
 	}
@@ -243,6 +277,37 @@ store_new(Store *s, const char *workspace, Chat *chat)
 		if(ok) { chat_clear(chat); *chat=*next; }
 	} else fail(s,L"Cannot prepare new chat");
 	free(next); return ok;
+}
+
+int
+store_branch(Store *s, const Chat *source, size_t turn, const char *prompt,
+    const char *action, Chat *destination)
+{
+	Chat *next;
+	size_t i, n;
+	int ok=0;
+	if(source->conversation.count%2 || turn>=source->conversation.count/2 ||
+	    !validtext(prompt,LcbMaxPrompt,0) || !validtext(action,16,0))
+		return fail(s,L"Invalid exchange or message");
+	next=calloc(1,sizeof(*next));
+	if(!next || !newid(next->info.id)) { free(next); return fail(s,L"Cannot prepare conversation"); }
+	strcpy(next->info.workspace,source->info.workspace);
+	snprintf(next->info.title,StoreName,"%s %zu: %s",action,turn+1,source->info.title);
+	/* snprintf may cut a UTF-8 title between code units. */
+	n=strlen(next->info.title);
+	while(n && !validtext(next->info.title,StoreName-1,0)) next->info.title[--n]=0;
+	strcpy(next->draft,prompt);
+	for(i=0;i<turn*2;i++) {
+		const Message *m=&source->conversation.messages[i];
+		if(!conversation_add(&next->conversation,m->role,m->text)) goto done;
+		next->conversation.messages[i].status=m->status;
+		memcpy(next->conversation.messages[i].error,m->error,sizeof(m->error));
+	}
+	ok=store_save(s,next);
+	if(ok) { chat_clear(destination); *destination=*next; memset(next,0,sizeof(*next)); }
+done:
+	if(!ok && !s->error[0]) fail(s,L"Cannot prepare conversation");
+	chat_clear(next); free(next); return ok;
 }
 
 static int

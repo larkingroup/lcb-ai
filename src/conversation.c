@@ -6,8 +6,23 @@
 
 Generation generation_defaults(void)
 {
-    Generation g={1024,0.7,0.95,4096,ThinkingAuto,1.0,0.0};
+    Generation g={1024,0.7,0.95,4096,ThinkingAuto,1.0,0.0,40,0.05,0.0};
     return g;
+}
+
+const char *answer_status_name(int status)
+{
+    static const char *names[]={"unknown","complete","stopped","length","error","other"};
+    return status>=AnswerUnknown && status<=AnswerOther ? names[status] : NULL;
+}
+
+int answer_status(int result, int finish)
+{
+    if(result==2) return AnswerStopped;
+    if(!result) return AnswerError;
+    if(finish==FinishLength) return AnswerLength;
+    if(finish==FinishStop) return AnswerComplete;
+    return AnswerOther;
 }
 
 int generation_valid(const Generation *g)
@@ -17,7 +32,48 @@ int generation_valid(const Generation *g)
         g->context_tokens>=512 && g->context_tokens<=1048576 &&
         g->thinking>=ThinkingAuto && g->thinking<=ThinkingOn &&
         g->repeat_penalty>=1 && g->repeat_penalty<=2 &&
-        g->dry_multiplier>=0 && g->dry_multiplier<=4;
+        g->dry_multiplier>=0 && g->dry_multiplier<=4 &&
+        g->top_k>=0 && g->top_k<=1000 && g->min_p>=0 && g->min_p<=1 &&
+        g->presence_penalty>=-2 && g->presence_penalty<=2;
+}
+
+double generation_value(const Generation *g, int field)
+{
+    switch(field) {
+    case GenResponse: return g->max_tokens;
+    case GenTemperature: return g->temperature;
+    case GenTopP: return g->top_p;
+    case GenContext: return g->context_tokens;
+    case GenThinking: return g->thinking;
+    case GenRepeat: return g->repeat_penalty;
+    case GenDry: return g->dry_multiplier;
+    case GenTopK: return g->top_k;
+    case GenMinP: return g->min_p;
+    case GenPresence: return g->presence_penalty;
+    default: return 0;
+    }
+}
+
+int generation_set(Generation *g, int field, double value)
+{
+    Generation next=*g;
+    if(!(value>=-2 && value<=1048576)) return 0;
+    if((field==GenResponse || field==GenContext || field==GenThinking || field==GenTopK) && value!=(int)value) return 0;
+    switch(field) {
+    case GenResponse: next.max_tokens=(int)value; break;
+    case GenTemperature: next.temperature=value; break;
+    case GenTopP: next.top_p=value; break;
+    case GenContext: next.context_tokens=(int)value; break;
+    case GenThinking: next.thinking=(int)value; break;
+    case GenRepeat: next.repeat_penalty=value; break;
+    case GenDry: next.dry_multiplier=value; break;
+    case GenTopK: next.top_k=(int)value; break;
+    case GenMinP: next.min_p=value; break;
+    case GenPresence: next.presence_penalty=value; break;
+    default: return 0;
+    }
+    if(!generation_valid(&next)) return 0;
+    *g=next; return 1;
 }
 
 Conversation conversation_suffix(const Conversation *c, size_t first)
@@ -76,6 +132,7 @@ conversation_add(Conversation *c, const char *role, const char *text)
 	p = copytext(text);
 	if(p == NULL)
 		return 0;
+	memset(&c->messages[c->count],0,sizeof(*c->messages));
 	c->messages[c->count].role = role;
 	c->messages[c->count++].text = p;
 	c->bytes += n;
@@ -125,6 +182,9 @@ request_with_settings(const Conversation *c, const Module *module, const char *p
 			goto done;
 	if(g && (!cJSON_AddNumberToObject(root, "temperature", g->temperature) ||
 	    !cJSON_AddNumberToObject(root, "top_p", g->top_p) ||
+	    !cJSON_AddNumberToObject(root, "top_k", g->top_k) ||
+	    !cJSON_AddNumberToObject(root, "min_p", g->min_p) ||
+	    !cJSON_AddNumberToObject(root, "presence_penalty", g->presence_penalty) ||
 	    !cJSON_AddNumberToObject(root, "repeat_penalty", g->repeat_penalty) ||
 	    !cJSON_AddNumberToObject(root, "dry_multiplier", g->dry_multiplier))) goto done;
 	if(g) {

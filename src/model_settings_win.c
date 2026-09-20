@@ -4,6 +4,10 @@
 #include <stdio.h>
 #include <wctype.h>
 #include "model_settings_win.h"
+#include "model_defaults.h"
+
+static const wchar_t *keys[GenCount]={L"max_tokens",L"temperature",L"top_p",L"context_tokens",
+    L"thinking",L"repeat_penalty",L"dry_multiplier",L"top_k",L"min_p",L"presence_penalty"};
 
 /* Key by the normalized full file path, not llama-server's shared "local" alias. */
 static int section_name(const wchar_t *model, wchar_t section[80])
@@ -36,29 +40,38 @@ static double read_number(const wchar_t *config, const wchar_t *section,
 void model_settings_load(const wchar_t *config, const wchar_t *model, Generation *g)
 {
     wchar_t section[80];
-    *g=generation_defaults();
-    /* Existing global settings supply the initial values for an unseen model. */
-    g->max_tokens=(int)read_number(config,L"generation",L"max_tokens",1024,1,16384,1);
-    g->temperature=read_number(config,L"generation",L"temperature100",70,0,200,1)/100;
-    g->top_p=read_number(config,L"generation",L"top_p100",95,1,100,1)/100;
-    if(!section_name(model,section)) return;
-    g->max_tokens=(int)read_number(config,section,L"max_tokens",g->max_tokens,1,16384,1);
-    g->temperature=read_number(config,section,L"temperature",g->temperature,0,2,0);
-    g->top_p=read_number(config,section,L"top_p",g->top_p,0.01,1,0);
-    g->context_tokens=(int)read_number(config,section,L"context_tokens",4096,512,1048576,1);
-    g->thinking=(int)read_number(config,section,L"thinking",ThinkingAuto,ThinkingAuto,ThinkingOn,1);
-    g->repeat_penalty=read_number(config,section,L"repeat_penalty",1,1,2,0);
-    g->dry_multiplier=read_number(config,section,L"dry_multiplier",0,0,4,0);
+    ModelInfo info;
+    int field, has_section=section_name(model,section);
+    int thinking=has_section?(int)read_number(config,section,L"thinking",-1,ThinkingAuto,ThinkingOn,1):-1;
+    model_defaults(model_read(model,&info)?&info:NULL,thinking,g);
+    /* Older saved values remain user choices, including old full sections. */
+    g->max_tokens=(int)read_number(config,L"generation",L"max_tokens",g->max_tokens,1,16384,1);
+    g->temperature=read_number(config,L"generation",L"temperature100",g->temperature*100,0,200,1)/100;
+    g->top_p=read_number(config,L"generation",L"top_p100",g->top_p*100,1,100,1)/100;
+    if(!has_section) return;
+    for(field=0;field<GenCount;field++) {
+        double value=read_number(config,section,keys[field],generation_value(g,field),-2,1048576,0);
+        generation_set(g,field,value);
+    }
 }
 
 int model_settings_save(const wchar_t *config, const wchar_t *model, const Generation *g)
 {
-    wchar_t section[80], data[512];
+    wchar_t section[80], data[768];
     int n;
     if(!generation_valid(g) || !section_name(model,section)) return 0;
-    n=swprintf(data,512,L"max_tokens=%d|temperature=%.17g|top_p=%.17g|context_tokens=%d|thinking=%d|repeat_penalty=%.17g|dry_multiplier=%.17g|",
-        g->max_tokens,g->temperature,g->top_p,g->context_tokens,g->thinking,g->repeat_penalty,g->dry_multiplier);
-    if(n<0 || n>=511) return 0;
+    n=swprintf(data,768,L"max_tokens=%d|temperature=%.17g|top_p=%.17g|context_tokens=%d|thinking=%d|repeat_penalty=%.17g|dry_multiplier=%.17g|top_k=%d|min_p=%.17g|presence_penalty=%.17g|",
+        g->max_tokens,g->temperature,g->top_p,g->context_tokens,g->thinking,g->repeat_penalty,g->dry_multiplier,
+        g->top_k,g->min_p,g->presence_penalty);
+    if(n<0 || n>=767) return 0;
     for(int i=0;i<n;i++) if(data[i]==L'|') data[i]=0;
     return WritePrivateProfileSectionW(section,data,config)!=0;
+}
+
+int model_settings_save_field(const wchar_t *config, const wchar_t *model, const Generation *g, int field)
+{
+    wchar_t section[80], value[64];
+    if(field<0 || field>=GenCount || !generation_valid(g) || !section_name(model,section)) return 0;
+    swprintf(value,64,L"%.17g",generation_value(g,field));
+    return WritePrivateProfileStringW(section,keys[field],value,config)!=0;
 }

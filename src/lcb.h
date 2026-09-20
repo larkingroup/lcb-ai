@@ -14,9 +14,15 @@ typedef struct Conversation Conversation;
 typedef struct Module Module;
 typedef struct Engine Engine;
 
+enum { AnswerUnknown, AnswerComplete, AnswerStopped, AnswerLength, AnswerError, AnswerOther };
+const char *answer_status_name(int status);
+int answer_status(int result, int finish);
+
 struct Message {
 	const char *role;
 	char *text;
+	int status;
+	char error[256];
 };
 
 struct Conversation {
@@ -43,14 +49,20 @@ extern const size_t lcb_module_count;
 extern const Engine lcb_local_engine;
 
 enum { ThinkingAuto, ThinkingOff, ThinkingOn };
+enum { GenResponse, GenTemperature, GenTopP, GenContext, GenThinking, GenRepeat,
+    GenDry, GenTopK, GenMinP, GenPresence, GenCount };
 typedef struct Generation {
 	int max_tokens;
 	double temperature, top_p;
 	int context_tokens, thinking;
 	double repeat_penalty, dry_multiplier;
+	int top_k;
+	double min_p, presence_penalty;
 } Generation;
 Generation generation_defaults(void);
 int generation_valid(const Generation *g);
+double generation_value(const Generation *g, int field);
+int generation_set(Generation *g, int field, double value);
 /* A borrowed suffix of a saved conversation; never free it. */
 Conversation conversation_suffix(const Conversation *c, size_t first);
 typedef struct StreamReply {
