@@ -62,10 +62,11 @@ model_read(const wchar_t *path, ModelInfo *m)
 	uint64_t tensors,count,i;
 	int ok=0;
 	int64_t bytes;
-	char key[128],value[1024],basename[256]={0};
+	char key[128],value[65537],basename[256]={0};
 	wchar_t *p;
 	if(wcslen(path)>=MAX_PATH) return 0;
 	memset(m,0,sizeof(*m)); m->filetype=UINT32_MAX;
+	m->sampling=generation_defaults();
 	r.file=_wfopen(path,L"rb"); if(!r.file) return 0;
 	setvbuf(r.file,NULL,_IOFBF,65536);
 	if(_fseeki64(r.file,0,SEEK_END) || (bytes=_ftelli64(r.file))<24 || _fseeki64(r.file,0,SEEK_SET)) goto done;
@@ -75,13 +76,21 @@ model_read(const wchar_t *path, ModelInfo *m)
 	    !take(&r,&tensors,8) || !take(&r,&count,8) || count>100000 || tensors>1000000) goto done;
 	for(i=0;i<count;i++) {
 		if(!string(&r,key,sizeof(key)) || !take(&r,&type,4)) goto done;
-		if(type==8 && (!strcmp(key,"general.name") || !strcmp(key,"general.basename") ||
+		if(type==8 && !strcmp(key,"tokenizer.chat_template")) {
+			if(!string(&r,value,sizeof(value))) goto done;
+			m->thinking_switch=strstr(value,"enable_thinking")!=NULL;
+		} else if(type==8 && (!strcmp(key,"general.name") || !strcmp(key,"general.basename") ||
+		    !strcmp(key,"general.base_model.0.name") || !strcmp(key,"general.base_model.0.repo_url") ||
 		    !strcmp(key,"general.architecture") || !strcmp(key,"general.size_label") || !strcmp(key,"general.type"))) {
 			if(!string(&r,value,sizeof(value))) goto done;
 			if(!strcmp(key,"general.name")) {
 				if(!MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,value,-1,m->name,256)) m->name[0]=0;
+				wcscpy(m->identity,m->name);
 			} else if(!strcmp(key,"general.basename")) {
 				if(strlen(value)<sizeof(basename)) strcpy(basename,value);
+				if(!MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,value,-1,m->basename,256)) m->basename[0]=0;
+			} else if(!strcmp(key,"general.base_model.0.name") || !strcmp(key,"general.base_model.0.repo_url")) {
+				if(!MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,value,-1,m->base_model,256)) m->base_model[0]=0;
 			} else if(!strcmp(key,"general.architecture")) {
 				if(!MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,value,-1,m->architecture,80)) m->architecture[0]=0;
 				if(!strcmp(value,"clip")) m->projector=1;
@@ -90,6 +99,23 @@ model_read(const wchar_t *path, ModelInfo *m)
 			} else if(!strcmp(value,"mmproj")) m->projector=1;
 		} else if(type==4 && !strcmp(key,"general.file_type")) {
 			if(!take(&r,&m->filetype,4)) goto done;
+		} else if(type==4 && !strcmp(key,"general.base_model.count")) {
+			if(!take(&r,&m->base_count,4)) goto done;
+		} else if(!strncmp(key,"general.sampling.",17)) {
+			int field=-1;
+			double number;
+			if(!strcmp(key+17,"temp")) field=GenTemperature;
+			else if(!strcmp(key+17,"top_p")) field=GenTopP;
+			else if(!strcmp(key+17,"top_k")) field=GenTopK;
+			else if(!strcmp(key+17,"min_p")) field=GenMinP;
+			else if(!strcmp(key+17,"penalty_repeat")) field=GenRepeat;
+			if(field<0) { if(!skip(&r,type)) goto done; continue; }
+			if(type==6) { float v; if(!take(&r,&v,4)) goto done; number=v; }
+			else if(type==12) { if(!take(&r,&number,8)) goto done; }
+			else if(type==4) { uint32_t v; if(!take(&r,&v,4)) goto done; number=v; }
+			else if(type==5) { int32_t v; if(!take(&r,&v,4)) goto done; number=v; }
+			else { if(!skip(&r,type)) goto done; continue; }
+			if(generation_set(&m->sampling,field,number)) m->sampling_fields|=1u<<field;
 		} else if(!skip(&r,type)) goto done;
 	}
 	wcscpy(m->path,path);
@@ -138,10 +164,20 @@ walk(Library *lib, const wchar_t *folder, int recursive, unsigned depth, volatil
 	FindClose(find);
 }
 
+int
+model_compare(const ModelInfo *a,const ModelInfo *b,int column)
+{
+	int result;
+	if(column==1 && a->bytes!=b->bytes) return a->bytes>b->bytes?1:-1;
+	result=_wcsicmp(a->name,b->name);
+	if(!result) result=_wcsicmp(a->path,b->path);
+	return (result>0)-(result<0);
+}
+
 static int
 compare(const void *a,const void *b)
 {
-	return _wcsicmp(((const ModelInfo *)a)->name,((const ModelInfo *)b)->name);
+	return model_compare(a,b,0);
 }
 
 void

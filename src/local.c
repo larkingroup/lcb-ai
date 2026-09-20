@@ -28,7 +28,7 @@ local_complete(unsigned short port, const char *body, char **answer,
 		return 0;
 	}
 	/* Literal loopback, no proxy, no redirects, no cookies or credentials. */
-	session = WinHttpOpen(L"lcb-ai/0.5.0-pre.1", WINHTTP_ACCESS_TYPE_NO_PROXY,
+	session = WinHttpOpen(L"lcb-ai/0.5.0-pre.2", WINHTTP_ACCESS_TYPE_NO_PROXY,
 	    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 	if(session == NULL)
 		goto done;

@@ -23,6 +23,20 @@ int main(int argc,char **argv)
 	FILE *f;
 	int width,height;
 	assert(lib);
+	{
+		ModelInfo first={0},second={0};
+		wcscpy(first.name,L"alpha"); wcscpy(second.name,L"Beta");
+		first.bytes=UINT64_MAX; second.bytes=10000000000ULL;
+		assert(model_compare(&first,&second,0)<0);
+		assert(model_compare(&first,&second,1)>0);
+		assert(model_compare(&second,&first,1)<0);
+		first.bytes=second.bytes;
+		assert(model_compare(&first,&second,1)<0);
+		wcscpy(second.name,L"ALPHA");
+		assert(!model_compare(&first,&second,0));
+		wcscpy(second.path,L"Z:\\model.gguf");
+		assert(model_compare(&first,&second,0)<0);
+	}
 	if(argc==2) {
 		assert(MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,argv[1],-1,root,MAX_PATH));
 		library_scan(lib,root,1,&cancel);

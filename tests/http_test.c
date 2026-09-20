@@ -291,7 +291,7 @@ static void streamtransport(void)
         "data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n"
         "data: [DONE]\n\n";
     Server s;
-    Conversation c={0}; Generation g={128,0.5,0.9,4096,ThinkingAuto,1,0};
+    Conversation c={0}; Generation g={128,0.5,0.9,4096,ThinkingAuto,1,0,20,0,0};
     HANDLE cancel=CreateEventW(NULL,TRUE,FALSE,NULL),thread;
     Updates u={0};
     char *request=conversation_generate(&c,&lcb_modules[0],"hello",&g),*answer,error[256];
@@ -316,7 +316,20 @@ static void streamtransport(void)
     start(&s,503,"{}");
     assert(!local_stream(s.port,request,cancel,NULL,NULL,&answer,error,sizeof(error))); assert(strstr(error,"503")); stop(&s,1);
     start(&s,200,"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n");
-    assert(!local_stream(s.port,request,cancel,NULL,NULL,&answer,error,sizeof(error))); assert(!answer); stop(&s,1);
+    assert(!local_stream(s.port,request,cancel,NULL,NULL,&answer,error,sizeof(error)));
+    assert(answer && !strcmp(answer,"Hello") && strstr(error,"ended the stream")); free(answer); stop(&s,1);
+    start(&s,200,"data: {\"choices\":[{\"delta\":{\"content\":\"caf\xc3\xa9\"}}]}\n\n"
+        "data: {broken\n\n");
+    assert(!local_stream(s.port,request,cancel,NULL,NULL,&answer,error,sizeof(error)));
+    assert(answer && !strcmp(answer,"caf\xc3\xa9")); free(answer); stop(&s,1);
+    start(&s,200,"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n"
+        "data: {\"error\":{\"message\":\"Engine failed\"}}\n\n");
+    assert(!local_stream(s.port,request,cancel,NULL,NULL,&answer,error,sizeof(error)));
+    assert(answer && !strcmp(answer,"Hello")); free(answer); stop(&s,1);
+    start(&s,200,"data: {\"choices\":[{\"delta\":{\"content\":\"Hello \xe2\x82\"}}]}\n\n"
+        "data: [DONE]\n\n");
+    assert(!local_stream(s.port,request,cancel,NULL,NULL,&answer,error,sizeof(error)));
+    assert(answer && !strcmp(answer,"Hello ") && strstr(error,"UTF-8")); free(answer); stop(&s,1);
     start(&s,200,"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think\"}}]}\n\n"
         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n"
         "data: [DONE]\n\n");

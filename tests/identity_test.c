@@ -29,6 +29,17 @@ int main(void)
     assert(conversation_add(&chat.conversation,"user","Existing question"));
     assert(conversation_add(&chat.conversation,"assistant","Existing answer"));
     assert(store_save(&old,&chat));
+    /* A pre-status chat has only role/content fields. */
+    {
+        FILE *legacychat;
+        swprintf(file,MAX_PATH,L"%ls\\chats\\%hs.json",legacy,id);
+        legacychat=_wfopen(file,L"wb"); assert(legacychat);
+        assert(fprintf(legacychat,"{\"version\":1,\"id\":\"%s\",\"workspace\":\"%s\","
+            "\"title\":\"Legacy chat\",\"draft\":\"Keep this unsent draft.\",\"messages\":["
+            "{\"role\":\"user\",\"content\":\"Existing question\"},"
+            "{\"role\":\"assistant\",\"content\":\"Existing answer\"}]}",id,w.id)>0);
+        assert(!fclose(legacychat));
+    }
     swprintf(file,MAX_PATH,L"%ls\\settings.ini",legacy);
     assert(WritePrivateProfileStringW(L"library",L"folder",L"C:\\Models",file));
     assert(app_data_root(base,root)); assert(!wcscmp(root,legacy));
@@ -36,6 +47,7 @@ int main(void)
     store_close(&old); chat_clear(&chat);
     assert(store_open(&app,root)); assert(store_load(&app,id,&loaded));
     assert(loaded.conversation.count==2 && !strcmp(loaded.draft,"Keep this unsent draft."));
+    assert(loaded.conversation.messages[1].status==AnswerUnknown && !loaded.conversation.messages[1].error[0]);
     assert(!strcmp(app.workspaces[0].prompt,"Keep this instruction."));
     GetPrivateProfileStringW(L"library",L"folder",L"",selected,MAX_PATH,file);
     assert(!wcscmp(selected,L"C:\\Models"));

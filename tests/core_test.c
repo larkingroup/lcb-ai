@@ -14,7 +14,7 @@ static void streaming(void)
         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":8}}\n\n"
         "data: [DONE]\n\n";
     StreamReply *reply=calloc(1,sizeof(*reply));
-    Generation settings={256,0.25,0.85,4096,ThinkingAuto,1,0};
+    Generation settings={256,0.25,0.85,4096,ThinkingAuto,1,0,20,0,1.5};
     Conversation c={0};
     char *request;
     cJSON *json;
@@ -43,6 +43,9 @@ static void streaming(void)
     assert(cJSON_GetObjectItem(json,"max_tokens")->valueint==256);
     assert(cJSON_GetObjectItem(json,"temperature")->valuedouble==0.25);
     assert(cJSON_GetObjectItem(json,"top_p")->valuedouble==0.85);
+    assert(cJSON_GetObjectItem(json,"top_k")->valueint==20);
+    assert(cJSON_GetObjectItem(json,"min_p")->valuedouble==0);
+    assert(cJSON_GetObjectItem(json,"presence_penalty")->valuedouble==1.5);
     assert(!cJSON_GetObjectItem(json,"chat_template_kwargs"));
     assert(cJSON_IsTrue(cJSON_GetObjectItem(cJSON_GetObjectItem(json,"stream_options"),"include_usage")));
     free(request); cJSON_Delete(json);
@@ -62,6 +65,11 @@ main(void)
 	    "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]} junk"};
 	size_t i;
 	streaming();
+	assert(answer_status(1,FinishStop)==AnswerComplete);
+	assert(answer_status(1,FinishLength)==AnswerLength);
+	assert(answer_status(2,FinishLength)==AnswerStopped);
+	assert(answer_status(0,FinishStop)==AnswerError);
+	assert(answer_status(1,FinishUnknown)==AnswerOther);
 	assert(conversation_add(&c, "user", "first"));
 	assert(conversation_add(&c, "assistant", "second"));
 	request = conversation_request(&c, &lcb_modules[0], "quote \" slash \\ newline\n");

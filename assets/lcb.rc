@@ -1,8 +1,8 @@
 #include <windows.h>
 101 ICON "lcb.ico"
 1 VERSIONINFO
-FILEVERSION 0,5,0,1
-PRODUCTVERSION 0,5,0,1
+FILEVERSION 0,5,0,2
+PRODUCTVERSION 0,5,0,2
 FILEFLAGSMASK 0x3fL
 FILEFLAGS VS_FF_PRERELEASE
 FILEOS VOS_NT_WINDOWS32
@@ -15,11 +15,11 @@ BEGIN
   BEGIN
    VALUE "CompanyName", "Larkin Computing Bureau\0"
    VALUE "FileDescription", "lcb-ai - Local AI workspace\0"
-   VALUE "FileVersion", "0.5.0-pre.1\0"
+   VALUE "FileVersion", "0.5.0-pre.2\0"
    VALUE "InternalName", "lcb-ai\0"
    VALUE "OriginalFilename", "lcb-ai.exe\0"
    VALUE "ProductName", "lcb-ai\0"
-   VALUE "ProductVersion", "0.5.0-pre.1\0"
+   VALUE "ProductVersion", "0.5.0-pre.2\0"
   END
  END
  BLOCK "VarFileInfo"

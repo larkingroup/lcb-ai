@@ -28,7 +28,13 @@ void store_close(Store *s);
 int store_workspace(Store *s, Workspace *w);
 int store_save(Store *s, Chat *chat);
 int store_load(Store *s, const char *id, Chat *chat);
+/* Removes an indexed chat. The index changes only after the file is deleted. */
+int store_delete(Store *s, const char *id);
 int store_new(Store *s, const char *workspace, Chat *chat);
+/* Copies exchanges before the zero-based turn. Destination can equal source;
+ * neither is changed unless the new chat is saved successfully. */
+int store_branch(Store *s, const Chat *source, size_t turn, const char *prompt,
+    const char *action, Chat *destination);
 Workspace *store_find_workspace(Store *s, const char *id);
 void chat_clear(Chat *chat);
 #endif

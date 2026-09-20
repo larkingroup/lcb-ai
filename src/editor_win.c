@@ -27,10 +27,14 @@ editorproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 	}
 	if(message==WM_COMMAND && LOWORD(wp)==IDOK) {
 		wchar_t name[481], *p;
-		GetWindowTextW(e->name,name,481);
-		for(p=name;*p==L' ' || *p==L'\t';p++) {}
-		if(!*p) { MessageBoxW(window,L"Enter a workspace name.",L"lcb-ai",MB_OK); return 0; }
-		GetWindowTextW(e->name,e->outname,(int)e->namecap);
+		if(e->name) {
+			GetWindowTextW(e->name,name,481);
+			for(p=name;*p==L' ' || *p==L'\t';p++) {}
+			if(!*p) { MessageBoxW(window,L"Enter a workspace name.",L"lcb-ai",MB_OK); return 0; }
+			GetWindowTextW(e->name,e->outname,(int)e->namecap);
+		} else if(!GetWindowTextLengthW(e->prompt)) {
+			MessageBoxW(window,L"Enter a message.",L"lcb-ai",MB_OK); return 0;
+		}
 		GetWindowTextW(e->prompt,e->outprompt,(int)e->promptcap);
 		e->ok=1; e->done=1; return 0;
 	}
@@ -47,8 +51,8 @@ child(HWND parent, HFONT font, const wchar_t *kind, const wchar_t *text,
 	SendMessageW(c,WM_SETFONT,(WPARAM)font,TRUE); SetWindowTheme(c,L"",L""); return c;
 }
 
-int
-edit_workspace(HWND owner, HFONT font, const wchar_t *title,
+static int
+edit_text(HWND owner, HFONT font, const wchar_t *title,
     wchar_t *name, size_t namecap, wchar_t *prompt, size_t promptcap)
 {
 	WNDCLASSW wc={0};
@@ -74,20 +78,33 @@ edit_workspace(HWND owner, HFONT font, const wchar_t *title,
 	if(!window) { UnregisterClassW(wc.lpszClassName,wc.hInstance); DeleteObject(brush); return 0; }
 	DwmSetWindowAttribute(window,33,&corner,sizeof(corner));
 	DwmSetWindowAttribute(window,35,&caption,sizeof(caption));
-	child(window,font,L"STATIC",L"Name",0,0,16,14,520,20,dpi);
-	e.name=child(window,font,L"EDIT",name,WS_BORDER|WS_TABSTOP|ES_AUTOHSCROLL,10,16,37,528,25,dpi);
-	SendMessageW(e.name,EM_SETLIMITTEXT,(WPARAM)namecap-1,0);
-	child(window,font,L"STATIC",L"Master prompt",0,0,16,77,520,20,dpi);
-	e.prompt=child(window,font,L"EDIT",prompt,WS_BORDER|WS_TABSTOP|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_WANTRETURN,11,16,100,528,215,dpi);
+	if(name) {
+		child(window,font,L"STATIC",L"Name",0,0,16,14,520,20,dpi);
+		e.name=child(window,font,L"EDIT",name,WS_BORDER|WS_TABSTOP|ES_AUTOHSCROLL,10,16,37,528,25,dpi);
+		SendMessageW(e.name,EM_SETLIMITTEXT,(WPARAM)namecap-1,0);
+	}
+	child(window,font,L"STATIC",name?L"Master prompt":L"Message",0,0,16,name?77:14,520,20,dpi);
+	e.prompt=child(window,font,L"EDIT",prompt,WS_BORDER|WS_TABSTOP|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_WANTRETURN,11,16,name?100:37,528,name?215:278,dpi);
 	SendMessageW(e.prompt,EM_SETLIMITTEXT,(WPARAM)promptcap-1,0);
-	child(window,font,L"STATIC",L"Used for the next message in every chat in this workspace.",0,0,16,323,528,20,dpi);
-	child(window,font,L"BUTTON",L"Save",WS_TABSTOP|BS_DEFPUSHBUTTON,IDOK,362,354,86,25,dpi);
+	child(window,font,L"STATIC",name?L"Used for the next message in every chat in this workspace.":L"Opens a new conversation from this exchange.",0,0,16,323,528,20,dpi);
+	child(window,font,L"BUTTON",name?L"Save":L"Send",WS_TABSTOP|BS_DEFPUSHBUTTON,IDOK,362,354,86,25,dpi);
 	child(window,font,L"BUTTON",L"Cancel",WS_TABSTOP,IDCANCEL,458,354,86,25,dpi);
-	EnableWindow(owner,FALSE); ShowWindow(window,SW_SHOW); SetFocus(e.name);
+	EnableWindow(owner,FALSE); ShowWindow(window,SW_SHOW); SetFocus(e.name?e.name:e.prompt);
 	while(!e.done && (result=GetMessageW(&msg,NULL,0,0))>0) {
 		if(!IsDialogMessageW(window,&msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
 	}
 	EnableWindow(owner,TRUE); DestroyWindow(window); SetActiveWindow(owner);
 	UnregisterClassW(wc.lpszClassName,wc.hInstance); DeleteObject(brush);
 	return e.ok;
+}
+
+int edit_workspace(HWND owner, HFONT font, const wchar_t *title,
+    wchar_t *name, size_t namecap, wchar_t *prompt, size_t promptcap)
+{
+	return edit_text(owner,font,title,name,namecap,prompt,promptcap);
+}
+
+int edit_message(HWND owner, HFONT font, wchar_t *prompt, size_t promptcap)
+{
+	return edit_text(owner,font,L"Edit and resend",NULL,0,prompt,promptcap);
 }

@@ -24,6 +24,78 @@ cleanup(const wchar_t *root, const wchar_t *folder)
 	swprintf(name,MAX_PATH,L"%ls\\%ls",root,folder); assert(RemoveDirectoryW(name));
 }
 
+static void
+branches(Store *s, const char *workspace)
+{
+	Chat source={0}, branch={0}, loaded={0};
+	char id[33], *request;
+	int status;
+	size_t count;
+	cJSON *json, *messages;
+	assert(store_new(s,workspace,&source));
+	strcpy(id,source.info.id);
+	strcpy(source.info.title,"Conversation"); strcpy(source.draft,"Unsent original draft");
+	for(status=AnswerUnknown;status<=AnswerOther;status++) {
+		assert(conversation_add(&source.conversation,"user","Original question"));
+		assert(conversation_add(&source.conversation,"assistant","Answer: caf\xc3\xa9"));
+		source.conversation.messages[source.conversation.count-1].status=status;
+		if(status==AnswerError) strcpy(source.conversation.messages[source.conversation.count-1].error,"Engine disconnected.");
+	}
+	assert(store_save(s,&source));
+	assert(store_load(s,id,&loaded));
+	for(status=AnswerUnknown;status<=AnswerOther;status++) assert(loaded.conversation.messages[status*2+1].status==status);
+	assert(!strcmp(loaded.conversation.messages[AnswerError*2+1].error,"Engine disconnected."));
+	assert(store_branch(s,&source,3,"Revised question","Edit",&branch));
+	assert(strcmp(branch.info.id,id) && !strcmp(branch.info.workspace,workspace));
+	assert(branch.conversation.count==6 && branch.conversation.messages[5].status==AnswerStopped);
+	assert(!strcmp(branch.draft,"Revised question"));
+	request=conversation_request(&branch.conversation,&lcb_modules[0],branch.draft); assert(request);
+	json=cJSON_Parse(request); free(request); assert(json);
+	messages=cJSON_GetObjectItem(json,"messages"); assert(cJSON_GetArraySize(messages)==8);
+	assert(!strcmp(cJSON_GetObjectItem(cJSON_GetArrayItem(messages,7),"content")->valuestring,"Revised question"));
+	assert(!cJSON_GetObjectItem(cJSON_GetArrayItem(messages,2),"status")); cJSON_Delete(json);
+	assert(store_load(s,branch.info.id,&loaded) && loaded.conversation.count==6);
+	assert(!strcmp(loaded.draft,"Revised question"));
+	/* Same-object retry copies its prompt before replacing the destination. */
+	assert(store_branch(s,&source,0,source.conversation.messages[0].text,"Retry",&source));
+	assert(source.conversation.count==0 && !strcmp(source.draft,"Original question"));
+	assert(store_load(s,id,&loaded) && loaded.conversation.count==12);
+	assert(!strcmp(loaded.draft,"Unsent original draft"));
+	assert(!store_branch(s,&loaded,6,"Invalid turn","Edit",&branch));
+	assert(branch.conversation.count==6 && !strcmp(branch.draft,"Revised question"));
+	/* A failed save must leave both the source and destination intact. */
+	count=s->nchats; s->nchats=StoreChats;
+	assert(!store_branch(s,&loaded,1,"Unsaved","Edit",&branch)); s->nchats=count;
+	assert(branch.conversation.count==6 && !strcmp(branch.draft,"Revised question"));
+	assert(loaded.conversation.count==12 && !strcmp(loaded.info.id,id));
+	chat_clear(&source); chat_clear(&branch); chat_clear(&loaded);
+}
+
+static void deletion(Store *s,const char *workspace)
+{
+	Chat chat={0},loaded={0};
+	char id[33];
+	wchar_t file[MAX_PATH];
+	HANDLE held;
+	size_t count=s->nchats;
+	assert(store_new(s,workspace,&chat)); strcpy(id,chat.info.id);
+	strcpy(chat.draft,"A draft to delete"); assert(store_save(s,&chat));
+	assert(!store_delete(s,"..\\escape"));
+	assert(!store_delete(s,"00000000000000000000000000000000"));
+	assert(s->nchats==count+1);
+	swprintf(file,MAX_PATH,L"%ls\\chats\\%hs.json",s->root,id);
+	held=CreateFileW(file,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,0,NULL); assert(held!=INVALID_HANDLE_VALUE);
+	assert(!store_delete(s,id) && s->nchats==count+1);
+	assert(store_load(s,id,&loaded) && !strcmp(loaded.draft,chat.draft));
+	CloseHandle(held);
+	/* Allow callers to pass the identifier directly from the compacted index. */
+	assert(store_delete(s,s->chats[count].id));
+	assert(s->nchats==count && GetFileAttributesW(file)==INVALID_FILE_ATTRIBUTES);
+	assert(!store_load(s,id,&loaded) && !strcmp(loaded.draft,chat.draft));
+	assert(!store_delete(s,id) && s->nchats==count);
+	chat_clear(&chat); chat_clear(&loaded);
+}
+
 int
 main(void)
 {
@@ -113,10 +185,12 @@ main(void)
 		assert(!strcmp(fresh.conversation.messages[0].text,"Hello\n\xe2\x98\xba"));
 		assert(!strcmp(fresh.conversation.messages[641].text,text));
 	}
+	branches(&s,firstworkspace);
+	deletion(&s,firstworkspace);
 	store_close(&s); chat_clear(&chat); chat_clear(&loaded); chat_clear(&fresh);
 	cleanup(root,L"chats"); cleanup(root,L"workspaces");
 	swprintf(file,MAX_PATH,L"%ls\\session.lock",root); assert(DeleteFileW(file));
 	assert(RemoveDirectoryW(root));
-	puts("Storage tests passed: reopen, Unicode, prompts, drafts, isolation, failed replacement, damaged files, locking.");
+	puts("Storage tests passed: reopen, Unicode, prompts, drafts, isolation, failed replacement, damaged files, locking, answer status, retry/edit branches.");
 	return 0;
 }

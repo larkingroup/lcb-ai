@@ -34,6 +34,18 @@ int local_stream(unsigned short port,const char *body,HANDLE cancel,StreamUpdate
 {
     return local_stream_report(port,body,cancel,update,context,answer,NULL,error,capacity);
 }
+static size_t utf8prefix(const char *text, size_t length)
+{
+    size_t i=0, n;
+    while(i<length) {
+        unsigned char ch=(unsigned char)text[i];
+        if(ch<0x80) { i++; continue; }
+        n=ch>=0xc2 && ch<=0xdf?2:ch>=0xe0 && ch<=0xef?3:ch>=0xf0 && ch<=0xf4?4:0;
+        if(!n || n>length-i || !MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,text+i,(int)n,NULL,0)) break;
+        i+=n;
+    }
+    return i;
+}
 int local_stream_report(unsigned short port,const char *body,HANDLE cancel,StreamUpdate update,
     void *context,char **answer,ReplyReport *report,char *error,size_t capacity)
 {
@@ -52,7 +64,7 @@ int local_stream_report(unsigned short port,const char *body,HANDLE cancel,Strea
     if(!port || !cancel || !reply || strlen(body)>LcbMaxWire) goto done;
     t.event=CreateEventW(NULL,FALSE,FALSE,NULL); t.closed=CreateEventW(NULL,TRUE,FALSE,NULL);
     if(!t.event || !t.closed) goto done;
-    session=WinHttpOpen(L"lcb-ai/0.5.0-pre.1",WINHTTP_ACCESS_TYPE_NO_PROXY,NULL,NULL,WINHTTP_FLAG_ASYNC);
+    session=WinHttpOpen(L"lcb-ai/0.5.0-pre.2",WINHTTP_ACCESS_TYPE_NO_PROXY,NULL,NULL,WINHTTP_FLAG_ASYNC);
     if(!session) goto done;
     WinHttpSetTimeouts(session,3000,3000,10000,90000);
     connection=WinHttpConnect(session,L"127.0.0.1",port,0);
@@ -100,7 +112,14 @@ done:
     if(session) WinHttpCloseHandle(session);
     if(t.event) CloseHandle(t.event);
     if(t.closed) CloseHandle(t.closed);
-    if(ok && reply && reply->used) {
+    if(reply && reply->used) {
+        size_t valid=utf8prefix(reply->text,reply->used);
+        if(valid<reply->used) {
+            reply->text[valid]=0; reply->used=valid; ok=0;
+            snprintf(error,capacity,"The engine returned invalid UTF-8 text.");
+        }
+    }
+    if(reply && reply->used) {
         *answer=malloc(reply->used+1);
         if(*answer) memcpy(*answer,reply->text,reply->used+1); else ok=0;
     }
@@ -131,7 +150,7 @@ int local_json(unsigned short port, const wchar_t *path, const char *body,
     wire=malloc(LcbMaxWire+1);
     t.event=CreateEventW(NULL,FALSE,FALSE,NULL); t.closed=CreateEventW(NULL,TRUE,FALSE,NULL);
     if(!wire || !t.event || !t.closed) goto done;
-    session=WinHttpOpen(L"lcb-ai/0.5.0-pre.1",WINHTTP_ACCESS_TYPE_NO_PROXY,NULL,NULL,WINHTTP_FLAG_ASYNC);
+    session=WinHttpOpen(L"lcb-ai/0.5.0-pre.2",WINHTTP_ACCESS_TYPE_NO_PROXY,NULL,NULL,WINHTTP_FLAG_ASYNC);
     if(!session) goto done;
     WinHttpSetTimeouts(session,3000,3000,10000,30000);
     connection=WinHttpConnect(session,L"127.0.0.1",port,0);
