@@ -4,7 +4,14 @@
 #define UNICODE
 #endif
 #define WIN32_LEAN_AND_MEAN
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <wchar.h>
+#define MAX_PATH 4096
+typedef long LONG;
+#define _wcsicmp wcscasecmp
+#endif
 #include <stdint.h>
 #include "lcb.h"
 

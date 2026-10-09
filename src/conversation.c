@@ -252,7 +252,27 @@ static int stream_line(StreamReply *s)
     if(cJSON_IsString(reason)) s->finish=!strcmp(reason->valuestring,"stop")?FinishStop:
         !strcmp(reason->valuestring,"length")?FinishLength:FinishOther;
     reason=cJSON_GetObjectItemCaseSensitive(delta,"reasoning_content");
-    if(cJSON_IsString(reason) && reason->valuestring[0]) s->saw_reasoning=1;
+    if(reason && !cJSON_IsNull(reason) && !cJSON_IsString(reason)) { cJSON_Delete(root); return 0; }
+    if(cJSON_IsString(reason) && reason->valuestring[0]) {
+        n=strlen(reason->valuestring);
+        if(n>LcbMaxReply-s->reasoning_used) { cJSON_Delete(root); return 0; }
+        memcpy(s->reasoning+s->reasoning_used,reason->valuestring,n+1);
+        s->reasoning_used+=n; s->saw_reasoning=1;
+    }
+    {
+        cJSON *progress=cJSON_GetObjectItemCaseSensitive(root,"prompt_progress");
+        cJSON *total=cJSON_GetObjectItemCaseSensitive(progress,"total");
+        cJSON *processed=cJSON_GetObjectItemCaseSensitive(progress,"processed");
+        cJSON *cached=cJSON_GetObjectItemCaseSensitive(progress,"cache");
+        cJSON *ms=cJSON_GetObjectItemCaseSensitive(progress,"time_ms");
+        if(cJSON_IsNumber(total) && cJSON_IsNumber(processed) &&
+            total->valueint>0 && processed->valueint>=0 && processed->valueint<=total->valueint) {
+            s->progress_total=total->valueint; s->progress_processed=processed->valueint;
+            if(cJSON_IsNumber(cached) && cached->valueint>=0 && cached->valueint<=total->valueint)
+                s->progress_cached=cached->valueint;
+            if(cJSON_IsNumber(ms) && ms->valuedouble>=0) s->progress_ms=ms->valuedouble;
+        }
+    }
     content=cJSON_GetObjectItemCaseSensitive(delta,"content");
     if(content && !cJSON_IsNull(content) && !cJSON_IsString(content)) { cJSON_Delete(root); return 0; }
     if(cJSON_IsString(content)) {
@@ -270,7 +290,7 @@ static int stream_line(StreamReply *s)
 int stream_feed(StreamReply *s, const char *data, size_t size)
 {
     size_t i;
-    if(s->failed || size>LcbMaxWire-s->wire) { s->failed=1; return 0; }
+    if(s->failed || s->wire>LcbMaxStreamWire || size>LcbMaxStreamWire-s->wire) { s->failed=1; return 0; }
     s->wire+=size;
     for(i=0;i<size && !s->done;i++) {
         if(data[i]==0) { s->failed=1; return 0; }

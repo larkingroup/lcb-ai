@@ -18,5 +18,8 @@ __pycache__/
 *.cmd
 *.sh
 
+/build-linux/
+!/src/linux/*.py
+
 /tests/
 /test/

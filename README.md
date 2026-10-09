@@ -1,6 +1,6 @@
 # lcb-ai
 
-A local AI desktop for Windows.
+A local AI desktop for Windows and Linux.
 Select a llama.cpp server and a GGUF model to start chatting.
 
 ## Build
@@ -13,3 +13,11 @@ cmake --build build --config Release
 ```
 
 Run `lcb-ai.exe` from `build/Release` or `build`.
+
+Linux also requires Python 3 and PySide6.
+
+```console
+cmake -S . -B build-linux -DCMAKE_BUILD_TYPE=Release
+cmake --build build-linux
+./build-linux/lcb-ai
+```

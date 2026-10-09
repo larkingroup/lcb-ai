@@ -1,0 +1,3 @@
+#!/bin/sh
+export LCB_NATIVE_LIBRARY="@CMAKE_CURRENT_BINARY_DIR@/liblcb_native.so"
+exec "@Python3_EXECUTABLE@" "@CMAKE_CURRENT_SOURCE_DIR@/src/linux/cli.py" "$@"

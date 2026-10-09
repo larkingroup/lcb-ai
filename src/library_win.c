@@ -4,6 +4,28 @@
 #include <string.h>
 #include <wchar.h>
 
+#ifndef _WIN32
+#include <limits.h>
+#define _fseeki64 fseeko
+#define _ftelli64 ftello
+#define CP_UTF8 0
+#define MB_ERR_INVALID_CHARS 0
+static FILE *_wfopen(const wchar_t *path, const wchar_t *mode)
+{
+    char narrow[16384], modes[16];
+    if(wcstombs(narrow,path,sizeof(narrow))>=sizeof(narrow) ||
+       wcstombs(modes,mode,sizeof(modes))>=sizeof(modes)) return NULL;
+    return fopen(narrow,modes);
+}
+static int MultiByteToWideChar(int cp,int flags,const char *s,int length,wchar_t *out,int cap)
+{
+    size_t n;
+    (void)cp; (void)flags; (void)length;
+    n=mbstowcs(out,s,(size_t)cap);
+    return n==(size_t)-1 || n>=(size_t)cap ? 0 : (int)n+1;
+}
+#endif
+
 typedef struct Reader {
 	FILE *file;
 	uint64_t left;
@@ -121,7 +143,9 @@ model_read(const wchar_t *path, ModelInfo *m)
 	wcscpy(m->path,path);
 	if(!m->name[0] && basename[0]) MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,basename,-1,m->name,256);
 	if(!m->name[0]) {
-		const wchar_t *file=wcsrchr(path,L'\\'); file=file?file+1:path;
+		const wchar_t *file=wcsrchr(path,L'\\');
+        if(!file) file=wcsrchr(path,L'/');
+        file=file?file+1:path;
 		wcsncpy(m->name,file,255); m->name[255]=0;
 		p=wcsrchr(m->name,L'.'); if(p && !_wcsicmp(p,L".gguf")) *p=0;
 		for(p=m->name;*p;p++) if(*p==L'_') *p=L' ';
@@ -131,6 +155,7 @@ done:
 	fclose(r.file); return ok;
 }
 
+#ifdef _WIN32
 static void
 walk(Library *lib, const wchar_t *folder, int recursive, unsigned depth, volatile LONG *cancel)
 {
@@ -164,6 +189,8 @@ walk(Library *lib, const wchar_t *folder, int recursive, unsigned depth, volatil
 	FindClose(find);
 }
 
+#endif
+
 int
 model_compare(const ModelInfo *a,const ModelInfo *b,int column)
 {
@@ -174,6 +201,7 @@ model_compare(const ModelInfo *a,const ModelInfo *b,int column)
 	return (result>0)-(result<0);
 }
 
+#ifdef _WIN32
 static int
 compare(const void *a,const void *b)
 {
@@ -187,3 +215,5 @@ library_scan(Library *lib, const wchar_t *folder, int recursive, volatile LONG *
 	walk(lib,folder,recursive,0,cancel);
 	qsort(lib->models,lib->count,sizeof(lib->models[0]),compare);
 }
+
+#endif

@@ -6,7 +6,8 @@
 enum {
 	LcbMaxPrompt = 16384,
 	LcbMaxReply = 65536,
-	LcbMaxWire = 1048576
+	LcbMaxWire = 1048576,
+    LcbMaxStreamWire = 16 * 1048576
 };
 
 typedef struct Message Message;
@@ -69,6 +70,10 @@ typedef struct StreamReply {
 	char line[LcbMaxReply + 1024], text[LcbMaxReply + 1];
 	size_t line_used, used, wire;
 	int done, failed, tokens, prompt_tokens, finish, saw_reasoning;
+    char reasoning[LcbMaxReply + 1];
+    size_t reasoning_used;
+    int progress_total, progress_processed, progress_cached;
+    double progress_ms;
 } StreamReply;
 enum { FinishUnknown, FinishStop, FinishLength, FinishOther };
 typedef struct ReplyReport { int prompt_tokens, tokens, finish, saw_reasoning; } ReplyReport;
