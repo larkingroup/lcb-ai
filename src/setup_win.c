@@ -5,12 +5,13 @@
 #include <dwmapi.h>
 #include <wchar.h>
 
-enum { EnginePath=10, ModelPath, BrowseEngine, BrowseModel, DownloadEngine, OtherEngines, DownloadModel };
+enum { EnginePath=10, ModelPath, BrowseEngine, BrowseModel, DownloadEngine, OtherEngines, DownloadModel,
+    ChooseLlama, ChooseOllama, ChooseKobold, DownloadOllama, DownloadKobold };
 typedef struct Setup {
-	HWND enginefield, modelfield, status, finish;
+	HWND enginefield, modelfield, enginenote, status, finish, choices[3];
 	wchar_t engine[MAX_PATH], model[MAX_PATH];
 	HBRUSH face;
-	int done, saved;
+	int done, saved, selected;
 } Setup;
 
 static int localfile(const wchar_t *path, const wchar_t *extension)
@@ -30,11 +31,20 @@ int setup_paths_ready(const wchar_t *engine, const wchar_t *model)
 static void refresh(Setup *s)
 {
 	int engine=localfile(s->engine,L".exe"),model=localfile(s->model,L".gguf");
+	int i;
+	for(i=0;i<3;i++) SendMessageW(s->choices[i],BM_SETCHECK,i==s->selected?BST_CHECKED:BST_UNCHECKED,0);
+	SetWindowTextW(s->enginenote,s->selected==0?
+	    L"For lcb-ai: extract the llama.cpp ZIP, keep its DLLs together, then choose llama-server.exe.\r\nCPU is the easiest starting point. Other builds include GPU acceleration.":
+	    s->selected==1?L"Ollama is a separate runner with its own model library and service.\r\nlcb-ai currently connects to llama.cpp; select llama.cpp to finish setup here.":
+	    L"KoboldCpp is a separate GGUF runner with its own web interface.\r\nlcb-ai currently connects to llama.cpp; select llama.cpp to finish setup here.");
+	EnableWindow(s->enginefield,s->selected==0);
+	EnableWindow(GetDlgItem(GetParent(s->enginefield),BrowseEngine),s->selected==0);
 	SetWindowTextW(s->enginefield,engine?s->engine:L"");
 	SetWindowTextW(s->modelfield,model?s->model:L"");
-	SetWindowTextW(s->status,engine && model?L"Both files are selected. Save setup, then choose Load in the toolbar.":
+	SetWindowTextW(s->status,s->selected!=0?L"Alternative engine downloads open in your browser. Choose llama.cpp to use your models in lcb-ai.":
+	    engine && model?L"Both files are selected. Save setup, then choose Load in the toolbar.":
 	    !engine?L"Choose llama-server.exe from the extracted engine folder.":L"Choose a local .gguf model file to finish setup.");
-	EnableWindow(s->finish,engine && model);
+	EnableWindow(s->finish,s->selected==0 && engine && model);
 }
 
 static void browse(HWND window, Setup *s, int engine)
@@ -73,15 +83,19 @@ static LRESULT CALLBACK setupproc(HWND window, UINT message, WPARAM wp, LPARAM l
 	if(message==WM_CLOSE) { s->done=1; return 0; }
 	if(message==WM_COMMAND) {
 		switch(LOWORD(wp)) {
-		case BrowseEngine: browse(window,s,1); break;
+		case ChooseLlama: case ChooseOllama: case ChooseKobold:
+			s->selected=LOWORD(wp)-ChooseLlama; refresh(s); break;
+		case BrowseEngine: if(s->selected==0) browse(window,s,1); break;
 		case BrowseModel: browse(window,s,0); break;
 		case DownloadEngine:
 			openlink(window,L"https://github.com/ggml-org/llama.cpp/releases/download/b10566/llama-b10566-bin-win-cpu-x64.zip"); break;
 		case OtherEngines: openlink(window,L"https://github.com/ggml-org/llama.cpp/releases"); break;
+		case DownloadOllama: openlink(window,L"https://ollama.com/download/windows"); break;
+		case DownloadKobold: openlink(window,L"https://github.com/LostRuins/koboldcpp/releases/latest"); break;
 		case DownloadModel:
 			openlink(window,L"https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf?download=true"); break;
 		case IDOK:
-			if(setup_paths_ready(s->engine,s->model)) { s->saved=1; s->done=1; }
+			if(s->selected==0 && setup_paths_ready(s->engine,s->model)) { s->saved=1; s->done=1; }
 			else refresh(s);
 			break;
 		case IDCANCEL: s->done=1; break;
@@ -104,7 +118,7 @@ int setup_dialog(HWND owner, HFONT font, wchar_t engine[MAX_PATH], wchar_t model
 	WNDCLASSW wc={0};
 	Setup s={0};
 	HWND window;
-	RECT r,bounds={0,0,600,454};
+	RECT r,bounds={0,0,780,604};
 	MSG msg={0};
 	HDC dc=GetDC(owner);
 	int dpi=GetDeviceCaps(dc,LOGPIXELSY),result=1;
@@ -123,24 +137,34 @@ int setup_dialog(HWND owner, HFONT font, wchar_t engine[MAX_PATH], wchar_t model
 	    bounds.right-bounds.left,bounds.bottom-bounds.top,owner,NULL,wc.hInstance,&s);
 	if(!window) { UnregisterClassW(wc.lpszClassName,wc.hInstance); DeleteObject(s.face); return 0; }
 	DwmSetWindowAttribute(window,33,&corner,sizeof(corner));
-	child(window,font,dpi,L"STATIC",L"Welcome to lcb-ai",0,0,18,16,564,20);
-	child(window,font,dpi,L"STATIC",L"Choose an engine and a model already on this computer, or get them below.",0,0,18,43,564,22);
-	child(window,font,dpi,L"BUTTON",L"1. Local engine",BS_GROUPBOX,0,16,76,568,146);
-	child(window,font,dpi,L"STATIC",L"Recommended: llama.cpp for Windows x64 (CPU). Download: about 19 MB.",0,0,30,99,540,20);
-	child(window,font,dpi,L"BUTTON",L"Download CPU engine...",WS_TABSTOP,DownloadEngine,30,124,174,25);
-	child(window,font,dpi,L"BUTTON",L"Other builds...",WS_TABSTOP,OtherEngines,213,124,116,25);
-	child(window,font,dpi,L"STATIC",L"Extract the ZIP. Keep its DLL files together, then choose llama-server.exe.",0,0,30,157,540,20);
-	s.enginefield=child(window,font,dpi,L"EDIT",L"",WS_BORDER|WS_TABSTOP|ES_READONLY|ES_AUTOHSCROLL,EnginePath,30,184,446,23);
-	child(window,font,dpi,L"BUTTON",L"Browse...",WS_TABSTOP,BrowseEngine,486,183,82,25);
-	child(window,font,dpi,L"BUTTON",L"2. Local model",BS_GROUPBOX,0,16,232,568,117);
-	child(window,font,dpi,L"STATIC",L"Use a .gguf file. SmolLM2 135M is a tiny starter model (105 MB).",0,0,30,255,540,20);
-	child(window,font,dpi,L"BUTTON",L"Download tiny model...",WS_TABSTOP,DownloadModel,30,279,174,25);
-	s.modelfield=child(window,font,dpi,L"EDIT",L"",WS_BORDER|WS_TABSTOP|ES_READONLY|ES_AUTOHSCROLL,ModelPath,30,313,446,23);
-	child(window,font,dpi,L"BUTTON",L"Browse...",WS_TABSTOP,BrowseModel,486,312,82,25);
-	s.status=child(window,font,dpi,L"STATIC",L"",0,0,18,360,564,34);
-	child(window,font,dpi,L"STATIC",L"Downloads open in your browser. Revisit this screen from Settings > Setup.",0,0,18,394,564,20);
-	s.finish=child(window,font,dpi,L"BUTTON",L"Save setup",WS_TABSTOP|BS_DEFPUSHBUTTON,IDOK,374,423,100,25);
-	child(window,font,dpi,L"BUTTON",L"Later",WS_TABSTOP,IDCANCEL,484,423,100,25);
+	child(window,font,dpi,L"STATIC",L"Welcome to lcb-ai",0,0,18,16,744,20);
+	child(window,font,dpi,L"STATIC",L"An engine runs your models. Choose one below; llama.cpp is the default for lcb-ai.",0,0,18,43,744,22);
+	child(window,font,dpi,L"BUTTON",L"1. Choose a local engine",BS_GROUPBOX,0,16,76,748,294);
+	child(window,font,dpi,L"BUTTON",L"",BS_GROUPBOX,0,30,100,236,166);
+	s.choices[0]=child(window,font,dpi,L"BUTTON",L"llama.cpp (default)",WS_TABSTOP|BS_RADIOBUTTON,ChooseLlama,42,114,212,23);
+	child(window,font,dpi,L"STATIC",L"Runs GGUF files on CPU or GPU.\r\nGood for direct model loading.\r\nWorks with lcb-ai.\r\nCPU download: about 19 MB.",0,0,42,145,212,72);
+	child(window,font,dpi,L"BUTTON",L"Download llama.cpp",WS_TABSTOP,DownloadEngine,42,230,212,25);
+	child(window,font,dpi,L"BUTTON",L"",BS_GROUPBOX,0,272,100,236,166);
+	s.choices[1]=child(window,font,dpi,L"BUTTON",L"Ollama",WS_TABSTOP|BS_RADIOBUTTON,ChooseOllama,284,114,212,23);
+	child(window,font,dpi,L"STATIC",L"Model library and local API.\r\nGood for managing models\r\nwith simple commands.\r\nRuns separately from lcb-ai.",0,0,284,145,212,72);
+	child(window,font,dpi,L"BUTTON",L"Get Ollama...",WS_TABSTOP,DownloadOllama,284,230,212,25);
+	child(window,font,dpi,L"BUTTON",L"",BS_GROUPBOX,0,514,100,236,166);
+	s.choices[2]=child(window,font,dpi,L"BUTTON",L"KoboldCpp",WS_TABSTOP|BS_RADIOBUTTON,ChooseKobold,526,114,212,23);
+	child(window,font,dpi,L"STATIC",L"Portable GGUF runner and web UI.\r\nGood for creative writing\r\nand roleplay.\r\nRuns separately from lcb-ai.",0,0,526,145,212,72);
+	child(window,font,dpi,L"BUTTON",L"Get KoboldCpp...",WS_TABSTOP,DownloadKobold,526,230,212,25);
+	s.enginenote=child(window,font,dpi,L"STATIC",L"",0,0,30,278,540,42);
+	child(window,font,dpi,L"BUTTON",L"Other llama.cpp builds...",WS_TABSTOP,OtherEngines,580,284,172,25);
+	s.enginefield=child(window,font,dpi,L"EDIT",L"",WS_BORDER|WS_TABSTOP|ES_READONLY|ES_AUTOHSCROLL,EnginePath,30,333,630,23);
+	child(window,font,dpi,L"BUTTON",L"Browse...",WS_TABSTOP,BrowseEngine,670,332,82,25);
+	child(window,font,dpi,L"BUTTON",L"2. Your local model",BS_GROUPBOX,0,16,380,748,117);
+	child(window,font,dpi,L"STATIC",L"Choose your existing .gguf file. Optional: SmolLM2 135M is a tiny setup test (105 MB).",0,0,30,403,722,20);
+	child(window,font,dpi,L"BUTTON",L"Download tiny test model...",WS_TABSTOP,DownloadModel,30,427,200,25);
+	s.modelfield=child(window,font,dpi,L"EDIT",L"",WS_BORDER|WS_TABSTOP|ES_READONLY|ES_AUTOHSCROLL,ModelPath,30,461,630,23);
+	child(window,font,dpi,L"BUTTON",L"Browse...",WS_TABSTOP,BrowseModel,670,460,82,25);
+	s.status=child(window,font,dpi,L"STATIC",L"",0,0,18,508,744,34);
+	child(window,font,dpi,L"STATIC",L"Downloads open in your browser. Revisit this screen from Settings > Setup.",0,0,18,550,744,20);
+	s.finish=child(window,font,dpi,L"BUTTON",L"Save setup",WS_TABSTOP|BS_DEFPUSHBUTTON,IDOK,554,573,100,25);
+	child(window,font,dpi,L"BUTTON",L"Later",WS_TABSTOP,IDCANCEL,664,573,100,25);
 	refresh(&s);
 	EnableWindow(owner,FALSE); ShowWindow(window,SW_SHOW);
 	SetFocus(GetDlgItem(window,setup_paths_ready(s.engine,s.model)?IDOK:
