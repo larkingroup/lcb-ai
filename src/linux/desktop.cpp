@@ -1906,8 +1906,7 @@ private:
         [this](const auto &result) {
           models = result;
           refresh_models();
-          set_phase(std::to_string(models.size()) +
-                    " models and companions found.");
+          set_phase(std::to_string(models.size()) + " models found.");
         });
   }
   void sort_models(int column) {
@@ -1932,6 +1931,13 @@ private:
       }
   }
   void refresh_models() {
+    // The workbench list is for choosing a chat model. Projector discovery
+    // reads the filesystem independently, and the media chooser remains
+    // available.
+    models.erase(
+        std::remove_if(models.begin(), models.end(),
+                       [](const ModelInfo &m) { return m.projector != 0; }),
+        models.end());
     model_list->entries.clear();
     for (const auto &m : models) {
       std::ostringstream size;
@@ -1945,6 +1951,13 @@ private:
     model_list->refresh(models.empty() ? 0 : 1);
     if (!models.empty())
       inspect_model();
+    else if (has_info)
+      show_model_details(info);
+    else {
+      details->entries = {{"Model", "No chat models found", ""},
+                          {"Projector", "Use Choose below", ""}};
+      details->refresh();
+    }
   }
   void show_model_details(const ModelInfo &m) {
     details->entries = {{"Name", utf8(m.name), ""},
