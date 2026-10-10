@@ -24,6 +24,7 @@ struct Message {
 	char *text;
 	int status;
 	char error[256];
+    char *reasoning; /* Saved locally; excluded from request messages. */
 };
 
 struct Conversation {
@@ -82,6 +83,18 @@ int stream_feed(StreamReply *s, const char *data, size_t size);
 char *conversation_generate(const Conversation *c, const Module *module,
     const char *prompt, const Generation *settings);
 
+char *conversation_generate_capable(const Conversation *c, const Module *module,
+    const char *prompt, const Generation *settings, int supports_effort);
+const char *reasoning_settings_error(const Generation *settings, int supports_effort);
+enum { CountFailed, CountOk, CountTooLarge };
+typedef int (*PromptCounter)(const char *request, void *context, int *tokens,
+    char *error, size_t capacity);
+typedef struct FitBudget { int prompt_tokens; size_t omitted_messages; } FitBudget;
+/* Counts exact candidates through the platform adapter. Never modifies history. */
+int conversation_fit(const Conversation *c, const Module *module, const char *prompt,
+    const Generation *settings, int context_tokens, int supports_effort,
+    PromptCounter counter, void *counter_context, char **request, FitBudget *budget,
+    char *error, size_t capacity);
 void conversation_clear(Conversation *c);
 int conversation_add(Conversation *c, const char *role, const char *text);
 char *conversation_request(const Conversation *c, const Module *module,

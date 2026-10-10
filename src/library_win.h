@@ -14,6 +14,7 @@ typedef long LONG;
 #endif
 #include <stdint.h>
 #include "lcb.h"
+#include "compatibility.h"
 
 enum { LibraryMax = 512 };
 typedef struct ModelInfo {
@@ -26,6 +27,7 @@ typedef struct ModelInfo {
 	uint64_t bytes;
 	uint32_t filetype;
 	int projector;
+	int runtime_requirement;
 } ModelInfo;
 typedef struct Library {
 	ModelInfo models[LibraryMax];
@@ -35,6 +37,7 @@ typedef struct Library {
 int model_read(const wchar_t *path, ModelInfo *model);
 int model_compare(const ModelInfo *a, const ModelInfo *b, int column);
 const wchar_t *model_quant(uint32_t filetype);
+const wchar_t *model_runtime_description(const ModelInfo *model);
 void library_scan(Library *library, const wchar_t *folder, int recursive,
     volatile LONG *cancel);
 #endif

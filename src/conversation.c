@@ -108,8 +108,10 @@ void
 conversation_clear(Conversation *c)
 {
 	size_t i;
-	for(i = 0; i < c->count; i++)
+	for(i = 0; i < c->count; i++) {
 		free(c->messages[i].text);
+        free(c->messages[i].reasoning);
+    }
 	free(c->messages);
 	memset(c, 0, sizeof(*c));
 }
@@ -155,7 +157,7 @@ addmessage(cJSON *messages, const char *role, const char *text)
 }
 
 static char *
-request_with_settings(const Conversation *c, const Module *module, const char *prompt, const Generation *g)
+request_with_settings(const Conversation *c, const Module *module, const char *prompt, const Generation *g, int supports_effort)
 {
 	cJSON *root, *messages, *settings;
 	char *result = NULL;
@@ -170,10 +172,15 @@ request_with_settings(const Conversation *c, const Module *module, const char *p
 	if(g && g->thinking!=ThinkingAuto) {
 		settings=cJSON_AddObjectToObject(root,"chat_template_kwargs");
 		if(!settings || !cJSON_AddBoolToObject(settings,"enable_thinking",g->thinking==ThinkingOn)) goto done;
+        if(supports_effort && g->thinking==ThinkingOn &&
+            !cJSON_AddStringToObject(root,"reasoning_effort","medium")) goto done;
 	}
 	if(messages == NULL ||
 	    cJSON_AddStringToObject(root, "model", "local") == NULL ||
 	    cJSON_AddBoolToObject(root, "stream", g != NULL) == NULL ||
+	    cJSON_AddStringToObject(root, "reasoning_format", "deepseek") == NULL ||
+	    cJSON_AddBoolToObject(root, "return_progress", 1) == NULL ||
+	    cJSON_AddNumberToObject(root, "sse_ping_interval", 5) == NULL ||
 	    cJSON_AddNumberToObject(root, "max_tokens", g ? g->max_tokens : 1024) == NULL ||
 	    !addmessage(messages, "system", module->instruction))
 		goto done;
@@ -226,12 +233,12 @@ response_parse(const char *wire, size_t length, char **answer)
 
 char *conversation_request(const Conversation *c, const Module *module, const char *prompt)
 {
-    return request_with_settings(c,module,prompt,NULL);
+    return request_with_settings(c,module,prompt,NULL,0);
 }
 char *conversation_generate(const Conversation *c, const Module *module, const char *prompt, const Generation *g)
 {
     if(!generation_valid(g)) return NULL;
-    return request_with_settings(c,module,prompt,g);
+    return request_with_settings(c,module,prompt,g,0);
 }
 static int stream_line(StreamReply *s)
 {
@@ -303,4 +310,17 @@ int stream_feed(StreamReply *s, const char *data, size_t size)
         }
     }
     return 1;
+}
+
+const char *reasoning_settings_error(const Generation *g, int supports_effort)
+{
+    if(g && g->thinking==ThinkingOff && supports_effort)
+        return "Thinking Off is not verified for this template's reasoning effort levels. Use Auto or On.";
+    return NULL;
+}
+char *conversation_generate_capable(const Conversation *c,const Module *module,
+    const char *prompt,const Generation *g,int supports_effort)
+{
+    if(!generation_valid(g) || reasoning_settings_error(g,supports_effort)) return NULL;
+    return request_with_settings(c,module,prompt,g,supports_effort);
 }

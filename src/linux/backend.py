@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import shlex
 import shutil
 import socket
 import subprocess
@@ -51,8 +52,8 @@ def model_role(model):
         return 'Projector companion'
     if re.search(r'(?:FastMTP|(?:^|[-_])MTP[-_](?:Q\d|F16|BF16|32K))', Path(model.path).name, re.I):
         return 'Draft companion'
-    if model.filetype == 143:
-        return 'Requires PTQ engine'
+    if getattr(model, 'runtime_requirement', 0) or model.filetype in (141, 142, 143):
+        return 'Requires PrismML engine'
     return 'Chat model'
 
 
@@ -80,7 +81,7 @@ class Generation(C.Structure):
                 ('presence_penalty', C.c_double)]
 
 class Message(C.Structure):
-    _fields_ = [('role', C.c_char_p), ('text', C.c_char_p), ('status', C.c_int), ('error', C.c_char * 256)]
+    _fields_ = [('role', C.c_char_p), ('text', C.c_char_p), ('status', C.c_int), ('error', C.c_char * 256), ('reasoning', C.c_void_p)]
 
 class Conversation(C.Structure):
     _fields_ = [('messages', C.POINTER(Message)), ('count', C.c_size_t),
@@ -105,11 +106,16 @@ class Model(C.Structure):
                 ('base_model', C.c_wchar * 256), ('sampling', Generation),
                 ('sampling_fields', C.c_uint), ('thinking_switch', C.c_int),
                 ('base_count', C.c_uint32), ('bytes', C.c_uint64),
-                ('filetype', C.c_uint32), ('projector', C.c_int)]
+                ('filetype', C.c_uint32), ('projector', C.c_int), ('runtime_requirement', C.c_int)]
 
 class TooLarge(ValueError):
     pass
 
+
+class FitBudget(C.Structure):
+    _fields_ = [('prompt_tokens', C.c_int), ('omitted_messages', C.c_size_t)]
+
+PromptCounter = C.CFUNCTYPE(C.c_int, C.c_char_p, C.c_void_p, C.POINTER(C.c_int), C.c_void_p, C.c_size_t)
 
 class Core:
     def __init__(self):
@@ -123,17 +129,30 @@ class Core:
         lib.conversation_clear.argtypes = [C.POINTER(Conversation)]
         lib.conversation_generate.argtypes = [C.POINTER(Conversation), C.POINTER(Module), C.c_char_p, C.POINTER(Generation)]
         lib.conversation_generate.restype = C.c_void_p
+        lib.conversation_generate_capable.argtypes = lib.conversation_generate.argtypes + [C.c_int]
+        lib.conversation_generate_capable.restype = C.c_void_p
+        lib.reasoning_settings_error.argtypes = [C.POINTER(Generation), C.c_int]
+        lib.reasoning_settings_error.restype = C.c_char_p
+        lib.conversation_fit.argtypes = [C.POINTER(Conversation), C.POINTER(Module), C.c_char_p,
+            C.POINTER(Generation), C.c_int, C.c_int, PromptCounter, C.c_void_p,
+            C.POINTER(C.c_void_p), C.POINTER(FitBudget), C.c_void_p, C.c_size_t]
+        self.context_counts = {}
         lib.cJSON_free.argtypes = [C.c_void_p]
         lib.stream_feed.argtypes = [C.POINTER(Stream), C.c_char_p, C.c_size_t]
         lib.model_read.argtypes = [C.c_wchar_p, C.POINTER(Model)]
         lib.model_defaults.argtypes = [C.POINTER(Model), C.c_int, C.POINTER(Generation)]
         lib.model_quant.argtypes = [C.c_uint32]
         lib.model_quant.restype = C.c_wchar_p
+        lib.model_runtime_description.argtypes = [C.POINTER(Model)]
+        lib.model_runtime_description.restype = C.c_wchar_p
+        lib.runtime_setup_url.restype = C.c_wchar_p
+        lib.engine_failure_advice.argtypes = [C.c_wchar_p]
+        lib.engine_failure_advice.restype = C.c_wchar_p
 
     def model(self, path):
         m = Model()
         if not self.lib.model_read(str(Path(path).resolve()), C.byref(m)):
-            raise ValueError('Cannot read this GGUF model header.')
+            raise ValueError('Cannot read the GGUF header or tensor index. Check file access, missing shards, and download completeness; the file was left unchanged.')
         return m
 
     def defaults(self, model=None, thinking=-1):
@@ -145,9 +164,12 @@ class Core:
         if not self.lib.generation_set(C.byref(g), field, float(value)):
             raise ValueError(f'Invalid {LABELS[field]} value.')
 
-    def request(self, messages, instruction, prompt, g):
+    def request(self, messages, instruction, prompt, g, supports_effort=False):
         text_ok(instruction, MAX_PROMPT)
         text_ok(prompt, MAX_PROMPT, False)
+        problem = self.lib.reasoning_settings_error(C.byref(g), int(supports_effort))
+        if problem:
+            raise ValueError(problem.decode())
         c = Conversation()
         try:
             for i, m in enumerate(messages):
@@ -155,7 +177,7 @@ class Core:
                 if not self.lib.conversation_add(C.byref(c), role, m['content'].encode()):
                     raise ValueError('Cannot prepare conversation.')
             module = Module(b'Workspace', instruction.encode())
-            result = self.lib.conversation_generate(C.byref(c), C.byref(module), prompt.encode(), C.byref(g))
+            result = self.lib.conversation_generate_capable(C.byref(c), C.byref(module), prompt.encode(), C.byref(g), int(supports_effort))
             if not result:
                 raise ValueError('Conversation request is invalid or too large.')
             try:
@@ -167,6 +189,42 @@ class Core:
                 self.lib.cJSON_free(result)
         finally:
             self.lib.conversation_clear(C.byref(c))
+
+    def fit(self, messages, instruction, prompt, g, context, supports_effort, count):
+        text_ok(instruction, MAX_PROMPT)
+        text_ok(prompt, MAX_PROMPT, False)
+        conversation, result, budget = Conversation(), C.c_void_p(), FitBudget()
+        error = C.create_string_buffer(512)
+        failures = []
+        @PromptCounter
+        def callback(wire, _context, tokens, output, capacity):
+            try:
+                tokens[0] = count(wire)
+                return 1
+            except Exception as exc:
+                detail = str(exc).encode()[:max(0, capacity - 1)] + b'\0'
+                C.memmove(output, detail, len(detail))
+                if isinstance(exc, TooLarge):
+                    return 2
+                failures.append(exc)
+                return 0
+        try:
+            for i, message in enumerate(messages):
+                if not self.lib.conversation_add(C.byref(conversation), b'assistant' if i % 2 else b'user', message['content'].encode()):
+                    raise ValueError('Cannot prepare conversation.')
+            module = Module(b'Workspace', instruction.encode())
+            ok = self.lib.conversation_fit(C.byref(conversation), C.byref(module), prompt.encode(),
+                C.byref(g), context, int(supports_effort), callback, None, C.byref(result),
+                C.byref(budget), error, len(error))
+            if not ok:
+                if failures:
+                    raise failures[0]
+                raise ValueError(error.value.decode() or 'Cannot count the current message.')
+            return C.string_at(result), budget
+        finally:
+            if result.value:
+                self.lib.cJSON_free(result)
+            self.lib.conversation_clear(C.byref(conversation))
 
 
 def text_ok(value, limit, empty=True):
@@ -499,9 +557,12 @@ class Transport:
             raise ValueError('Engine must report its context size and chat template.')
         if model and os.path.realpath(props.get('model_path', '')) != os.path.realpath(model):
             raise ValueError('The local server is running a different model. Select its GGUF file.')
-        thinking = 'enable_thinking' in template
-        if g.thinking and not thinking:
-            raise ValueError('This template has no thinking switch. Set Thinking to Auto.')
+        # /props reports effort control, not a general ability to emit reasoning.
+        # Always-thinking models and older servers must remain usable in Auto.
+        caps = props.get('chat_template_caps', {})
+        effort_supported = caps.get('supports_reasoning_effort') if isinstance(caps, dict) else None
+        if type(effort_supported) is not bool:
+            effort_supported = None
         available = context - g.max_tokens - 32
         if available < 1:
             raise ValueError('Response limit leaves no prompt room. Lower it or reload with more context.')
@@ -522,53 +583,43 @@ class Transport:
                 raise ValueError('Attachment storage is unavailable.')
             if sum(a['size'] for items in attachment_sets for a in items) > 46 * MAX_WIRE:
                 raise TooLarge('Conversation media exceeds 46 MiB. Start a new chat or use smaller files.')
-            request = json.loads(core.request(messages, instruction, prompt, g))
+            request = json.loads(core.request(messages, instruction, prompt, g, effort_supported is True))
             turns = [m for m in request['messages'] if m['role'] != 'system']
             for turn, items in zip(turns, attachment_sets):
                 if items:
                     self.check()
                     turn['content'] = [{'type': 'text', 'text': turn['content']}] + [store.media_part(a) for a in items]
-            request.update(reasoning_format='deepseek', return_progress=True, sse_ping_interval=5)
             wire = json.dumps(request, ensure_ascii=False).encode()
             if len(wire) > MAX_MEDIA_WIRE:
                 raise TooLarge('Media request exceeds 64 MiB. Use smaller attachments.')
-            return wire, dict(context=context, prompt=None, response=g.max_tokens, omitted=0, thinking=thinking)
+            return wire, dict(context=context, prompt=None, response=g.max_tokens, omitted=0, reasoning_effort_supported=effort_supported)
 
-        def counted(first):
-            wire = core.request(messages[first:], instruction, prompt, g)
+        # Runtime slot/timing fields are deliberately excluded from identity.
+        identity = json.dumps({
+            'model_path': props.get('model_path'), 'chat_template': template,
+            'n_ctx': context, 'build_info': props.get('build_info')}, sort_keys=True).encode()
+        cache = core.context_counts
+        # A template that calls the clock cannot reuse a request-level count.
+        cacheable = 'strftime_now' not in template
+        def counted(wire):
+            self.check()
+            key = hashlib.sha256(identity + b'\0' + wire).digest()
+            if cacheable and key in cache:
+                return cache[key]
             formatted = self.json('/apply-template', wire).get('prompt')
             if not isinstance(formatted, str):
                 raise ValueError('Engine could not apply the chat template.')
             tokens = self.json('/tokenize', {'content': formatted, 'add_special': True, 'parse_special': True}).get('tokens')
             if not isinstance(tokens, list) or any(type(t) is not int or t < 0 for t in tokens):
                 raise ValueError('Invalid token count from the engine.')
-            return wire, len(tokens)
-
-        first = len(messages)
-        wire, count = counted(first)
-        if count > available:
-            raise ValueError(f'Instructions and message need {count} tokens; only {available} available.')
-        low, high = 0, len(messages) // 2
-        while low < high:
-            self.check()
-            mid = (low + high + 1) // 2
-            suffix = messages[len(messages) - mid * 2:]
-            if sum(len(m['content'].encode()) for m in suffix) * 6 + len(suffix) * 64 + 200000 > MAX_WIRE:
-                high = mid - 1
-                continue
-            try:
-                candidate, n = counted(len(messages) - mid * 2)
-            except TooLarge:
-                high = mid - 1
-                continue
-            if n <= available:
-                low, wire, count, first = mid, candidate, n, len(messages) - mid * 2
-            else:
-                high = mid - 1
-        request = json.loads(wire)
-        request.update(reasoning_format='deepseek', return_progress=True, sse_ping_interval=5)
-        wire = json.dumps(request, ensure_ascii=False).encode()
-        return wire, dict(context=context, prompt=count, response=g.max_tokens, omitted=first // 2, thinking=thinking)
+            if cacheable:
+                if len(cache) >= 128:
+                    cache.pop(next(iter(cache)))
+                cache[key] = len(tokens)
+            return len(tokens)
+        wire, fitted = core.fit(messages, instruction, prompt, g, context, effort_supported is True, counted)
+        return wire, dict(context=context, prompt=fitted.prompt_tokens, response=g.max_tokens,
+                          omitted=fitted.omitted_messages // 2, reasoning_effort_supported=effort_supported)
 
     def generate(self, core, wire, update, telemetry=None):
         state = Stream()
@@ -634,12 +685,18 @@ class Engine:
             return ''
 
     def failure(self):
-        if 'invalid ggml type' in self.log_tail:
-            return 'This model uses a tensor format that the selected llama.cpp engine does not support. Choose a compatible GGUF or its required engine build.'
-        errors = [line for line in self.log_tail.splitlines() if re.search(r'error|failed|unsupported|out of memory', line, re.I)]
-        return '\n'.join(errors[-4:]) or 'The engine exited before loading. See the live engine log.'
+        # Read the final bounded tail directly: a large startup log can exceed
+        # the UI's incremental read size before a process exits.
+        if self.log_path:
+            try:
+                with self.log_path.open('rb') as log:
+                    log.seek(max(self.log_offset, self.log_path.stat().st_size - 16000))
+                    self.log_tail = (self.log_tail + log.read(16000).decode('utf-8', 'replace'))[-16000:]
+            except OSError:
+                pass
+        return Core().lib.engine_failure_advice(self.log_tail)
 
-    def start(self, exe, model, port, context, log, projector=''):
+    def start(self, exe, model, port, context, log, projector='', extra_arguments=''):
         if self.process:
             raise ValueError('Unload the current model first.')
         exe, model = str(Path(exe).resolve()), str(Path(model).resolve())
@@ -660,6 +717,10 @@ class Engine:
             if not Path(projector).is_file():
                 raise ValueError('The selected projector is unavailable.')
             args += ['--mmproj', str(Path(projector).resolve())]
+        # Parse argument text, never execute it through a shell. Put app-owned
+        # model/network settings last so tuning cannot replace those settings.
+        extra = shlex.split(extra_arguments)
+        args = [args[0], *extra, *args[1:]]
         self.command = args
         self.log_path = Path(log)
         self.log_tail = ''

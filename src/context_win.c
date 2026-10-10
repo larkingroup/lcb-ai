@@ -48,16 +48,25 @@ done:
     return oversized?2:ok;
 }
 
+typedef struct CounterContext { unsigned short port; HANDLE cancel; } CounterContext;
+static int count_callback(const char *wire,void *context,int *count,char *error,size_t capacity)
+{
+    CounterContext *c=context;
+    if(c->cancel && WaitForSingleObject(c->cancel,0)==WAIT_OBJECT_0) {
+        snprintf(error,capacity,"Stopped by user."); return CountFailed;
+    }
+    return count_request(c->port,wire,c->cancel,count,error,capacity);
+}
+
 int local_prepare(unsigned short port,const wchar_t *expected_model,const Conversation *c,
     const Module *module,const char *prompt,const Generation *settings,HANDLE cancel,
     char **request,ContextBudget *budget,char *error,size_t capacity)
 {
-    cJSON *props=NULL,*defaults,*context,*template,*build,*path;
-    size_t low=0,high=c->count/2,mid;
-    int count=0,available,ok=0,counted;
-    char *candidate=NULL;
+    cJSON *props=NULL,*defaults,*context,*template,*build,*path,*caps;
+    int ok=0;
+    FitBudget fitted;
+    CounterContext counter={port,cancel};
     wchar_t model[MAX_PATH];
-    Conversation view;
     *request=NULL; memset(budget,0,sizeof(*budget));
     if(!capacity) return 0;
     error[0]=0;
@@ -84,46 +93,17 @@ int local_prepare(unsigned short port,const wchar_t *expected_model,const Conver
     }
     budget->context_tokens=context->valueint;
     budget->response_tokens=settings->max_tokens;
-    /* This build has no supports_enable_thinking capability field. Only expose
-       the explicit boolean override when the template references that variable. */
-    budget->thinking_supported=strstr(template->valuestring,"enable_thinking")!=NULL;
+    /* Effort control is a capability, not a generic reasoning detector.
+       Missing/false does not rule out models that always emit reasoning. */
+    caps=cJSON_GetObjectItemCaseSensitive(props,"chat_template_caps");
+    budget->reasoning_effort_supported=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(caps,"supports_reasoning_effort"));
     if(cJSON_IsString(build)) snprintf(budget->build,sizeof(budget->build),"%s",build->valuestring);
-    if(settings->thinking!=ThinkingAuto && !budget->thinking_supported) {
-        snprintf(error,capacity,"This template does not advertise an enable_thinking switch. Set Thinking to Auto for this model."); goto done;
-    }
-    available=budget->context_tokens-settings->max_tokens-32;
-    if(available<1) { snprintf(error,capacity,"Response limit leaves no prompt room in the loaded context. Lower Response tokens or reload with a larger Context."); goto done; }
-    /* First establish that instructions plus the current message fit. Never cut
-       the current message or instructions. Binary search whole saved exchanges. */
-    view=conversation_suffix(c,c->count);
-    candidate=conversation_generate(&view,module,prompt,settings);
-    if(!candidate) goto memory;
-    if(count_request(port,candidate,cancel,&count,error,capacity)!=1) goto done;
-    if(count>available) { snprintf(error,capacity,"Instructions and current message need %d tokens; only %d remain after reserving the answer. Shorten the message or increase context.",count,available); goto done; }
-    *request=candidate; candidate=NULL; budget->prompt_tokens=count; budget->omitted_messages=c->count;
-    while(low<high) {
-        if(WaitForSingleObject(cancel,0)==WAIT_OBJECT_0) goto done;
-        mid=low+(high-low+1)/2;
-        view=conversation_suffix(c,c->count-mid*2);
-        /* Avoid building a huge JSON copy. Six bytes per source byte is the
-           worst-case JSON escaping; message overhead is accounted for too. */
-        if(view.bytes>(LcbMaxWire-200000)/6 || view.count>(LcbMaxWire-200000)/64 ||
-            view.bytes*6+view.count*64+200000>LcbMaxWire) { high=mid-1; continue; }
-        candidate=conversation_generate(&view,module,prompt,settings);
-        if(!candidate) goto memory;
-        counted=count_request(port,candidate,cancel,&count,error,capacity);
-        if(!counted) goto done;
-        if(counted==1 && count<=available) {
-            low=mid; free(*request); *request=candidate; candidate=NULL;
-            budget->prompt_tokens=count; budget->omitted_messages=c->count-mid*2;
-        } else high=mid-1;
-        free(candidate); candidate=NULL;
-    }
-    error[0]=0; ok=1; goto done;
-memory:
-    snprintf(error,capacity,"Cannot allocate the conversation request.");
+    ok=conversation_fit(c,module,prompt,settings,budget->context_tokens,
+        budget->reasoning_effort_supported,count_callback,&counter,request,&fitted,error,capacity);
+    if(ok) { budget->prompt_tokens=fitted.prompt_tokens; budget->omitted_messages=fitted.omitted_messages; }
+
 done:
-    free(candidate); cJSON_Delete(props);
+    cJSON_Delete(props);
     if(!ok) { free(*request); *request=NULL; }
     return ok;
 }

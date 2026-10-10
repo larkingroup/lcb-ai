@@ -3,6 +3,10 @@
 #include <windows.h>
 #include "lcb.h"
 typedef void (*StreamUpdate)(const char *text, void *context);
+typedef void (*StreamObserver)(const StreamReply *state, void *context);
+int local_stream_observe(unsigned short port, const char *body, HANDLE cancel,
+    StreamUpdate update, StreamObserver observer, void *context, char **answer,
+    ReplyReport *report, char *error, size_t capacity);
 enum { LocalJsonFailed, LocalJsonOk, LocalJsonTooLarge };
 /* Cancellable, bounded local JSON requests. Only LocalJsonOk supplies an answer. */
 int local_json(unsigned short port, const wchar_t *path, const char *body,

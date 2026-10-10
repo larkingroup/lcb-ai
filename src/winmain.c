@@ -25,14 +25,15 @@
 #include "context_win.h"
 #include "markdown.h"
 #include <windowsx.h>
+#include <shellapi.h>
 
 enum { IdModules = 100, IdPrompt, IdSend, IdNew, IdPort, IdExit, IdAbout,
 	IdLoad, IdUnload, IdBrowse, IdEngine, IdClear, IdCopy,
 	IdWorkspace, IdNewWorkspace, IdEditWorkspace, IdLibrary, IdScan, IdFolder,
 	IdRecursive, IdModels, IdChatTabs, IdLibraryTabs, IdDetails,
 	IdStop, IdCloseTab, IdGeneration, IdValue, IdViewLeft, IdViewRight, IdViewOutput, IdResetLayout, IdSetup,
-	IdExchange, IdRetry, IdResend, IdDeleteChat, IdOpenChat,
-	ReplyReady = WM_APP + 1, HealthReady, LibraryReady, StreamReady, BudgetReady, SettingsReady };
+	IdExchange, IdRetry, IdResend, IdDeleteChat, IdOpenChat, IdEngineArguments, IdOutputTabs,
+	ReplyReady = WM_APP + 1, HealthReady, LibraryReady, StreamReady, BudgetReady, SettingsReady, TelemetryReady };
 
 #define Paper RGB(255,255,255)
 #define Face RGB(236,233,216)
@@ -48,7 +49,7 @@ struct Work {
 	HWND target;
 	char *request;
 	char *prompt;
-	char *answer;
+	char *answer, *reasoning;
 	char error[256];
 	unsigned short port;
 	int ok;
@@ -66,11 +67,13 @@ typedef struct SettingsWork {
     unsigned epoch;
     wchar_t model[MAX_PATH], config[MAX_PATH];
     Generation settings;
+    ModelInfo info;
+    int model_ok;
 } SettingsWork;
 
 static struct {
 	HWND window, modules, transcript, prompt, send, fresh;
-	HWND status, port, load, unload, browse, engine, model, activity;
+	HWND status, port, load, unload, browse, engine, model, activity, outputtabs, thinking, progress;
 	HWND workspace, newworkspace, editworkspace;
 	HWND chattabs, librarytabs, models, folder, recursive, scan, details, master, folderlabel;
 	HWND stop, closetab, generation, value, genhelp;
@@ -82,6 +85,8 @@ static struct {
     Work *work;
     int property, treebusy, dragging, leftsize, rightsize, outputsize;
     int settings_pending;
+    int model_ok;
+    ModelInfo model_info;
     unsigned settings_epoch;
     int answerstart; size_t streamchars;
     int hideleft, hideright, hideoutput;
@@ -108,6 +113,7 @@ static struct {
 	unsigned short probeport;
 	EngineProcess process;
 	wchar_t enginepath[MAX_PATH], modelpath[MAX_PATH], config[MAX_PATH], dataroot[MAX_PATH];
+	wchar_t extra_arguments[2048], phase[160];
 	wchar_t activitytext[8192];
 	ULONGLONG started, loadstarted;
 	double lastseconds;
@@ -121,6 +127,7 @@ static int savechat(void);
 static void listchats(void);
 static void listworkspaces(void);
 static void showchat(void);
+static void showthinking(void);
 static void synctabs(void);
 static void opentab(void);
 static void generationrows(void);
@@ -158,6 +165,7 @@ modelproperties(const ModelInfo *model)
 		propertyrow(5,L"Type",model->projector?L"Projector companion":L"GGUF model");
 		propertyrow(6,L"File",basenamew(model->path));
 		propertyrow(7,L"Location",model->path);
+		propertyrow(8,L"Engine requirement",model->runtime_requirement?model_runtime_description(model):L"No special requirement detected (not a compatibility guarantee)");
 	} else {
 		propertyrow(0,L"Selection",L"No model selected");
 		propertyrow(1,L"Inspect",L"Click a model above");
@@ -243,6 +251,7 @@ readconfig(void)
 	swprintf(fallback, MAX_PATH, L"%ls\\LocalAI\\llama.cpp\\b10566\\llama-server.exe", base);
 	GetPrivateProfileStringW(L"engine", L"executable", fallback, app.enginepath, MAX_PATH, app.config);
 	GetPrivateProfileStringW(L"engine", L"model", L"", app.modelpath, MAX_PATH, app.config);
+    GetPrivateProfileStringW(L"engine", L"extra_arguments", L"", app.extra_arguments, 2048, app.config);
 	GetPrivateProfileStringW(L"library", L"folder", L"", app.libraryfolder, MAX_PATH, app.config);
 	app.recursivevalue=GetPrivateProfileIntW(L"library",L"recursive",1,app.config)!=0;
     app.leftsize=(int)GetPrivateProfileIntW(L"layout",L"left",210,app.config);
@@ -273,6 +282,65 @@ choosefile(int engine)
 	return 1;
 }
 
+enum { CompatibilityChoose = 201, CompatibilityGuide, CompatibilityTry, CompatibilityLog };
+
+static int compatibility_dialog(int failure)
+{
+    TASKDIALOGCONFIG dialog={0};
+    TASKDIALOG_BUTTON buttons[4];
+    wchar_t log[16385], details[4096], viewer[MAX_PATH], argument[MAX_PATH+3];
+    const wchar_t *excerpt;
+    const wchar_t *requirement=model_runtime_description(&app.model_info);
+    int count=0, selected=IDCANCEL;
+    buttons[count++]=(TASKDIALOG_BUTTON){CompatibilityChoose,L"Choose engine..."};
+    if(*requirement) buttons[count++]=(TASKDIALOG_BUTTON){CompatibilityGuide,L"Official PrismML setup guide"};
+    if(!failure) buttons[count++]=(TASKDIALOG_BUTTON){CompatibilityTry,L"Try selected engine"};
+    else if(app.process.logpath[0]) buttons[count++]=(TASKDIALOG_BUTTON){CompatibilityLog,L"Open engine log"};
+    dialog.cbSize=sizeof(dialog); dialog.hwndParent=app.window;
+    dialog.dwFlags=TDF_SIZE_TO_CONTENT|TDF_ALLOW_DIALOG_CANCELLATION;
+    dialog.dwCommonButtons=TDCBF_CANCEL_BUTTON; dialog.nDefaultButton=IDCANCEL;
+    dialog.pszWindowTitle=L"LCB-AI model compatibility";
+    dialog.pszMainIcon=TD_WARNING_ICON;
+    dialog.pszMainInstruction=failure?L"The engine stopped":L"This model needs a compatible engine";
+    if(failure) {
+        engine_read_log(&app.process,log,16385);
+        dialog.pszContent=engine_failure_advice(log);
+        /* TaskDialog's expanded text does not scroll; keep the complete log in
+         * the file and limit the on-screen excerpt to eight short lines. */
+        excerpt=log+wcslen(log);
+        for(int lines=0; excerpt>log && log+wcslen(log)-excerpt<700; ) {
+            if(*--excerpt==L'\n' && ++lines==8) { excerpt++; break; }
+        }
+        swprintf(details,4096,L"%ls\n\nExit code: %lu\nEngine: %ls\nModel: %ls\nLog: %ls\n\n%ls",
+            requirement,(unsigned long)app.process.exitcode,app.enginepath,app.modelpath,app.process.logpath,excerpt);
+    } else {
+        dialog.pszContent=requirement;
+        swprintf(details,4096,L"Engine: %ls\nModel: %ls\nGuide: %ls",app.enginepath,app.modelpath,runtime_setup_url());
+    }
+    dialog.pszExpandedInformation=details; dialog.pszExpandedControlText=L"Hide details";
+    dialog.pszCollapsedControlText=L"Show engine and model details";
+    dialog.pszFooter=failure?(*requirement?requirement:L"The log contains the engine's actual diagnostics. Your model and chats were left unchanged."):
+        L"Get the appropriate Windows llama-server from the official guide, then choose its executable. "
+        L"An executable's name does not prove support. Try selected engine only if your build supports this format. "
+        L"Renaming the model or downloading a projector cannot add engine support.";
+    dialog.cButtons=(UINT)count; dialog.pButtons=buttons;
+    if(FAILED(TaskDialogIndirect(&dialog,&selected,NULL,NULL))) {
+        MessageBoxW(app.window,dialog.pszContent,L"Model compatibility - use Choose engine to select a compatible build",MB_OK|MB_ICONWARNING);
+        return 0;
+    }
+    if(selected==CompatibilityChoose) choosefile(1);
+    else if(selected==CompatibilityGuide) ShellExecuteW(app.window,L"open",runtime_setup_url(),NULL,NULL,SW_SHOWNORMAL);
+    else if(selected==CompatibilityLog) {
+        UINT length=GetSystemDirectoryW(viewer,MAX_PATH);
+        if(length && length<MAX_PATH-13) {
+            wcscat(viewer,L"\\notepad.exe");
+            swprintf(argument,MAX_PATH+3,L"\"%ls\"",app.process.logpath);
+            ShellExecuteW(app.window,L"open",viewer,argument,NULL,SW_SHOWNORMAL);
+        }
+    }
+    return !failure && selected==CompatibilityTry;
+}
+
 static void
 loadmodel(void)
 {
@@ -284,7 +352,15 @@ loadmodel(void)
 	if(app.settings_pending) return;
 	commitproperty();
 	if(app.settings_pending) return;
-	if(!engine_start_context(&app.process, app.enginepath, app.modelpath, port, app.settings.context_tokens, error, 256)) { note(error); return; }
+	if(!app.model_ok) {
+        MessageBoxW(app.window,L"Cannot read the GGUF header or tensor index. Check file access, missing shards, and download completeness. The file was left unchanged.",L"Model inspection failed",MB_OK|MB_ICONWARNING);
+        return;
+    }
+    if(app.model_info.projector) { note(L"This is a projector companion. Select the main model GGUF instead."); return; }
+    if(app.model_info.runtime_requirement && !compatibility_dialog(0)) {
+        note(L"Load deferred. Select an engine with the required model support."); return;
+    }
+    if(!engine_start_arguments(&app.process, app.enginepath, app.modelpath, port, app.settings.context_tokens, app.extra_arguments, error, 256)) { note(error); return; }
 	app.epoch++; app.health = EngineLoading; app.loadstarted = GetTickCount64();
 	note(L"Loading model..."); refreshcontrols();
 }
@@ -306,7 +382,12 @@ pollengine(void)
 {
 	Probe *p;
 	HANDLE thread;
-	if(engine_exited(&app.process)) { app.health = EngineOffline; note(L"Engine exited. Check the selected engine and model."); refreshcontrols(); }
+	if(engine_exited(&app.process)) {
+        wchar_t log[16385];
+        app.epoch++; app.health=EngineOffline;
+        engine_read_log(&app.process,log,16385);
+        note(engine_failure_advice(log)); refreshcontrols(); compatibility_dialog(1);
+    }
 	if(app.checking || app.busy) return;
 	app.probeport = getport();
 	if(!app.probeport) { app.health = EngineOffline; refreshcontrols(); return; }
@@ -522,6 +603,15 @@ selectmodel(int use)
 	wcscpy(app.modelpath,m->path); SetWindowTextW(app.model,m->name); loadsettings(); saveconfig(); note(L"Model selected. Choose Load to start it.");
 }
 
+static void showthinking(void)
+{
+    Conversation *c=&app.chat.conversation;
+    char *trace=app.turn<c->count/2 ? c->messages[app.turn*2+1].reasoning : NULL;
+    wchar_t *text=trace?wide(trace):NULL;
+    SetWindowTextW(app.thinking,text?text:L"No thinking trace received for this exchange.");
+    free(text);
+}
+
 static void
 render(void)
 {
@@ -531,6 +621,7 @@ render(void)
 	SendMessageW(app.exchange,CB_RESETCONTENT,0,0);
 	SetWindowText(app.transcript, L"");
 	if(!app.ntabs) {
+		SetWindowTextW(app.thinking,L"No thinking trace received for this exchange.");
 		appendstyle(L"Choose a conversation or select New.\r\n",Muted,0,10);
 		refreshcontrols(); return;
 	}
@@ -579,6 +670,7 @@ render(void)
 		}
 	}
 	SendMessageW(app.exchange,CB_SETCURSEL,app.turn,0);
+    if(!app.busy) showthinking();
 	refreshcontrols();
 	SendMessage(app.transcript, EM_SCROLLCARET, 0, 0);
 	InvalidateRect(app.window, NULL, FALSE);
@@ -655,6 +747,7 @@ workfree(Work *w)
 	free(w->request);
 	free(w->prompt);
 	free(w->answer);
+    free(w->reasoning);
 	free(w->instruction);
 	free(w);
 }
@@ -667,6 +760,26 @@ static void streamupdate(const char *text,void *context)
     strcpy(copy,text);
     if(!PostMessageW(w->target,StreamReady,0,(LPARAM)copy)) free(copy);
 }
+typedef struct StreamSnapshot {
+    Work *source;
+    int total,processed,cached,content;
+    char trace[];
+} StreamSnapshot;
+static void streamobserve(const StreamReply *state,void *context)
+{
+    Work *w=context;
+    size_t size=state->reasoning_used+1;
+    StreamSnapshot *snapshot=malloc(sizeof(*snapshot)+size);
+    if(state->reasoning_used) {
+        char *trace=malloc(size);
+        if(trace) { memcpy(trace,state->reasoning,size); free(w->reasoning); w->reasoning=trace; }
+    }
+    if(!snapshot) return;
+    snapshot->source=w; snapshot->total=state->progress_total;
+    snapshot->processed=state->progress_processed; snapshot->cached=state->progress_cached;
+    snapshot->content=state->used!=0; memcpy(snapshot->trace,state->reasoning,size);
+    if(!PostMessageW(w->target,TelemetryReady,0,(LPARAM)snapshot)) free(snapshot);
+}
 static DWORD WINAPI
 complete(void *arg)
 {
@@ -675,7 +788,7 @@ complete(void *arg)
     if(local_prepare(w->port,w->modelpath,w->conversation,&module,w->prompt,&w->settings,
         w->cancel,&w->request,&w->budget,w->error,sizeof(w->error))) {
         PostMessageW(w->target,BudgetReady,0,(LPARAM)w);
-        w->ok=local_stream_report(w->port,w->request,w->cancel,streamupdate,w,&w->answer,&w->report,w->error,sizeof(w->error));
+        w->ok=local_stream_observe(w->port,w->request,w->cancel,streamupdate,streamobserve,w,&w->answer,&w->report,w->error,sizeof(w->error));
     }
     if(WaitForSingleObject(w->cancel,0)==WAIT_OBJECT_0) w->ok=2;
     if(!PostMessageW(w->target,ReplyReady,0,(LPARAM)w)) workfree(w);
@@ -742,11 +855,15 @@ submit(void)
 	appendstyle(L"\r\n\r\nAssistant\r\n",BlueInk,1,9);
     { CHARRANGE caret; SendMessageW(app.transcript,EM_EXGETSEL,0,(LPARAM)&caret); app.answerstart=caret.cpMax; }
     app.streamchars=0;
+    wcscpy(app.phase,L"Preparing message");
+    SetWindowTextW(app.thinking,L"Waiting for the model’s thinking trace.");
+    SetWindowTextW(app.progress,L"Preparing message");
     appendstyle(L"Waiting for reply...",Muted,0,9);
 	SendMessageW(app.transcript,EM_SCROLLCARET,0,0);
 	thread = CreateThread(NULL, 0, complete, w, 0, NULL);
 	if(thread == NULL) {
 		app.cancel=NULL; app.work=NULL; busy(0);
+    SetWindowTextW(app.progress,w->ok==2?L"Stopped":!w->ok?L"Generation failed":L"Completed");
 		render();
 		SetWindowText(app.status, L"Cannot start the local request worker.");
 		workfree(w);
@@ -760,14 +877,21 @@ static void
 received(Work *w)
 {
 	Conversation *c = &app.chat.conversation;
+    if(!w->answer && w->reasoning && w->reasoning[0]) {
+        const char *placeholder="[No final answer was emitted.]";
+        w->answer=malloc(strlen(placeholder)+1);
+        if(w->answer) strcpy(w->answer,placeholder);
+    }
 	wchar_t *answer = w->answer ? wide(w->answer) : NULL;
 	wchar_t *error;
 	size_t before = c->count, bytes = c->bytes;
 	app.cancel=NULL; app.work=NULL; busy(0);
+    SetWindowTextW(app.progress,w->ok==2?L"Stopped":!w->ok?L"Generation failed":L"Completed");
 	if(answer != NULL && conversation_add(c, "user", w->prompt) &&
 	    conversation_add(c, "assistant", w->answer)) {
 		wchar_t summary[128];
 		Message *message=&c->messages[c->count-1];
+		message->reasoning=w->reasoning; w->reasoning=NULL;
 		message->status=answer_status(w->ok,w->report.finish);
 		if(!w->ok) snprintf(message->error,sizeof(message->error),"%s",w->error);
 		app.turn=c->count/2-1;
@@ -785,7 +909,7 @@ received(Work *w)
 		app.dirty=1; savechat(); listchats(); synctabs();
 		render();
 	} else {
-		while(c->count > before) free(c->messages[--c->count].text);
+		while(c->count > before) { Message *m=&c->messages[--c->count]; free(m->text); free(m->reasoning); }
 		c->bytes = bytes;
 		{ wchar_t *draft=wide(w->prompt);
 		  app.restoring=1; SetWindowTextW(app.prompt,draft?draft:L""); app.restoring=0; free(draft); }
@@ -946,7 +1070,7 @@ paint(HDC dc)
         } else fill(dc,rect(p.rightx+3,84,p.right-6,p.bottom-94),Face);
     }
     if(!app.hideoutput) {
-        panel(dc,4,p.bottom,w-8,h-p.bottom-29,L"Output / Session activity",app.activepane==3,ClassicOutput);
+        panel(dc,4,p.bottom,w-8,h-p.bottom-29,L"Output",app.activepane==3,ClassicOutput);
         if(app.health==EngineLoading) {
             int i,step=(int)((GetTickCount64()/125)%24);
             RECT bar=rect(w-184,p.bottom+4,172,14);
@@ -962,7 +1086,7 @@ paint(HDC dc)
     classic_edge(dc,rect(4,h-22,206,20),0);
     classic_edge(dc,rect(213,h-22,260,20),0);
     classic_edge(dc,rect(476,h-22,w-480,20),0);
-    label(dc,rect(12,h-22,190,20),app.busy?L"Generating...":app.health==EngineReady?L"Engine ready":app.health==EngineLoading?L"Loading model...":L"Engine offline",Ink,app.normal,DT_LEFT);
+    label(dc,rect(12,h-22,190,20),app.busy?app.phase:app.health==EngineReady?L"Engine ready":app.health==EngineLoading?L"Loading model...":L"Engine offline",Ink,app.normal,DT_LEFT);
     if(app.busy) swprintf(text,256,L"Elapsed: %.1f s",(double)(GetTickCount64()-app.started)/1000.0);
     else swprintf(text,256,L"Last reply: %.2f s",app.lastseconds);
     label(dc,rect(221,h-22,244,20),text,Muted,app.normal,DT_LEFT);
@@ -1103,8 +1227,14 @@ layout(void)
     ShowWindow(app.generation,right && tab==1?SW_SHOW:SW_HIDE); ShowWindow(app.genhelp,right && tab==1?SW_SHOW:SW_HIDE);
     ShowWindow(app.folderlabel,right && tab==2?SW_SHOW:SW_HIDE); ShowWindow(app.folder,right && tab==2?SW_SHOW:SW_HIDE);
     ShowWindow(app.recursive,right && tab==2?SW_SHOW:SW_HIDE); ShowWindow(app.scan,right && tab==2?SW_SHOW:SW_HIDE);
-    place(app.activity,9,p.bottom+24,w-18,h-p.bottom-59);
-    ShowWindow(app.activity,out?SW_SHOW:SW_HIDE); ShowWindow(app.status,SW_HIDE);
+    place(app.outputtabs,9,p.bottom+24,270,24);
+    place(app.progress,290,p.bottom+25,w-308,22);
+    place(app.activity,9,p.bottom+51,w-18,h-p.bottom-86);
+    place(app.thinking,9,p.bottom+51,w-18,h-p.bottom-86);
+    ShowWindow(app.outputtabs,out?SW_SHOW:SW_HIDE);
+    ShowWindow(app.progress,out?SW_SHOW:SW_HIDE);
+    ShowWindow(app.activity,out && TabCtrl_GetCurSel(app.outputtabs)!=1?SW_SHOW:SW_HIDE);
+    ShowWindow(app.thinking,out && TabCtrl_GetCurSel(app.outputtabs)==1?SW_SHOW:SW_HIDE); ShowWindow(app.status,SW_HIDE);
     ShowWindow(app.value,SW_HIDE); app.property=-1;
     InvalidateRect(app.window,NULL,FALSE);
 }
@@ -1431,6 +1561,7 @@ static DWORD WINAPI readsettings(void *context)
 {
     SettingsWork *work=context;
     model_settings_load(work->config,work->model,&work->settings);
+    work->model_ok=model_read(work->model,&work->info);
     if(!PostMessageW(work->window,SettingsReady,0,(LPARAM)work)) free(work);
     return 0;
 }
@@ -1440,6 +1571,7 @@ static void loadsettings(void)
     HANDLE thread;
     app.settings_epoch++;
     app.settings_pending=1;
+    app.model_ok=0; memset(&app.model_info,0,sizeof(app.model_info));
     memset(&app.budget,0,sizeof(app.budget));
     if(work) {
         work->window=app.window; work->epoch=app.settings_epoch;
@@ -1542,6 +1674,7 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
         SettingsWork *work=(SettingsWork *)lp;
         if(work->epoch==app.settings_epoch && !_wcsicmp(work->model,app.modelpath)) {
             app.settings=work->settings; app.settings_pending=0;
+            app.model_ok=work->model_ok; app.model_info=work->info;
             generationrows(); refreshcontrols();
         }
         free(work); return 0;
@@ -1642,6 +1775,8 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
         else if(n->idFrom==IdChatTabs && n->code==TCN_SELCHANGE) {
             int index=TabCtrl_GetCurSel(app.chattabs);
             if(index>=0 && index<app.ntabs) activatechat(app.tabs[index]);
+        } else if(n->idFrom==IdOutputTabs && n->code==TCN_SELCHANGE) {
+            layout();
         } else if(n->idFrom==IdLibraryTabs && n->code==TCN_SELCHANGE) {
             commitproperty(); layout(); SetFocus(n->hwndFrom);
         } else if(n->idFrom==IdModels) {
@@ -1673,6 +1808,17 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 		break;
 	case WM_COMMAND:
 		switch(LOWORD(wp)) {
+        case IdEngineArguments: {
+            wchar_t extra[2048];
+            if(app.busy || app.process.process) { note(L"Unload the model before changing engine arguments."); break; }
+            wcscpy(extra,app.extra_arguments);
+            if(edit_engine_arguments(app.window,app.normal,extra,2048)) {
+                if(!engine_arguments_valid(extra)) note(L"Extra arguments contain unmatched quotes or control characters.");
+                else if(!WritePrivateProfileStringW(L"engine",L"extra_arguments",extra,app.config)) note(L"Cannot save engine arguments.");
+                else { wcscpy(app.extra_arguments,extra); note(L"Engine arguments saved. Load the model to apply them."); }
+            }
+            break;
+        }
         case IdSetup: runsetup(); break;
         case IdStop: stopreply(); break;
         case IdCloseTab: closetab(); break;
@@ -1694,7 +1840,7 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 				LRESULT row=SendMessageW(app.exchange,CB_GETCURSEL,0,0);
 				if(row>=0) {
 					CHARRANGE caret;
-					app.turn=(size_t)row;
+					app.turn=(size_t)row; showthinking();
 					caret.cpMin=caret.cpMax=(LONG)SendMessageW(app.exchange,CB_GETITEMDATA,(WPARAM)row,0);
 					SendMessageW(app.transcript,EM_EXSETSEL,0,(LPARAM)&caret);
 					SendMessageW(app.transcript,EM_SCROLLCARET,0,0);
@@ -1736,6 +1882,21 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 			break;
 		}
 		return 0;
+    case TelemetryReady: {
+        StreamSnapshot *snapshot=(StreamSnapshot *)lp;
+        if(app.busy && app.work==snapshot->source) {
+            wchar_t *trace=wide(snapshot->trace);
+            if(trace) { SetWindowTextW(app.thinking,trace); free(trace); }
+            if(snapshot->content) wcscpy(app.phase,L"Writing answer");
+            else if(snapshot->trace[0]) wcscpy(app.phase,L"Thinking");
+            else if(snapshot->total>0) swprintf(app.phase,160,L"Reading prompt: %d / %d (%d cached)",
+                snapshot->processed,snapshot->total,snapshot->cached);
+            else wcscpy(app.phase,L"Waiting for model");
+            SetWindowTextW(app.progress,app.phase);
+            InvalidateRect(app.window,NULL,FALSE);
+        }
+        free(snapshot); return 0;
+    }
     case StreamReady: {
         char *part=(char *)lp;
         if(app.busy && app.work) {
@@ -1760,9 +1921,9 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
         Work *w=(Work *)lp;
         wchar_t summary[320];
         app.budget=w->budget;
-        swprintf(summary,320,L"Context: %d prompt + %d reserved reply + 32 safety / %d tokens. %zu older exchanges excluded; all remain saved. Thinking switch: %ls.",
+        swprintf(summary,320,L"Context: %d prompt + %d reserved reply + 32 safety / %d tokens. %zu older exchanges excluded; all remain saved. Reasoning effort control: %ls.",
             w->budget.prompt_tokens,w->budget.response_tokens,w->budget.context_tokens,w->budget.omitted_messages/2,
-            w->budget.thinking_supported?L"supported":L"not advertised");
+            w->budget.reasoning_effort_supported?L"advertised":L"not reported (Auto remains available)");
         note(summary);
         return 0;
     }
@@ -1843,6 +2004,7 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
     AppendMenuW(engine,MF_STRING,IdStop,L"&Stop generation\tEsc");
     AppendMenuW(settings,MF_STRING,IdGeneration,L"&Generation properties");
     AppendMenuW(settings,MF_STRING,IdSetup,L"&Setup...");
+    AppendMenuW(settings,MF_STRING,IdEngineArguments,L"Engine &arguments...");
     AppendMenuW(edit,MF_STRING,IdCopy,L"&Copy\tCtrl+C");
 	AppendMenuW(edit,MF_SEPARATOR,0,NULL);
 	AppendMenuW(edit,MF_STRING,IdRetry,L"&Retry selected exchange");
@@ -1899,6 +2061,14 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	SendMessageW(app.port,EM_SETLIMITTEXT,5,0);
 	app.activity=control(L"EDIT",L"",WS_TABSTOP|WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL,0);
 	SendMessageW(app.activity,WM_SETFONT,(WPARAM)app.fixed,TRUE);
+    app.outputtabs=control(WC_TABCONTROLW,L"Output views",WS_TABSTOP,IdOutputTabs);
+    tab.mask=TCIF_TEXT; tab.pszText=L"Session activity"; TabCtrl_InsertItem(app.outputtabs,0,&tab);
+    tab.pszText=L"Thinking"; TabCtrl_InsertItem(app.outputtabs,1,&tab);
+    app.thinking=control(L"EDIT",L"No thinking trace received for this exchange.",
+        WS_TABSTOP|WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL,0);
+    SendMessageW(app.thinking,EM_SETLIMITTEXT,LcbMaxReply,0);
+    SendMessageW(app.thinking,WM_SETFONT,(WPARAM)app.fixed,TRUE);
+    app.progress=control(L"STATIC",L"Ready",SS_LEFT,0);
 	app.chattabs=control(WC_TABCONTROLW,L"Conversation views",WS_TABSTOP|TCS_OWNERDRAWFIXED|TCS_FIXEDWIDTH,IdChatTabs);
 	TabCtrl_SetPadding(app.chattabs,px(8),px(3));
     TabCtrl_SetItemSize(app.chattabs,px(148),px(23));

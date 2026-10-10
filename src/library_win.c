@@ -31,6 +31,11 @@ typedef struct Reader {
 	uint64_t left;
 } Reader;
 
+const wchar_t *model_runtime_description(const ModelInfo *model)
+{
+	return runtime_requirement_text(model->runtime_requirement);
+}
+
 const wchar_t *
 model_quant(uint32_t type)
 {
@@ -38,6 +43,8 @@ model_quant(uint32_t type)
 	    L"Q8_0",L"Q5_0",L"Q5_1",L"Q2_K",L"Q3_K_S",L"Q3_K_M",L"Q3_K_L",L"Q4_K_S",L"Q4_K_M",
 	    L"Q5_K_S",L"Q5_K_M",L"Q6_K",L"IQ2_XXS",L"IQ2_XS",L"Q2_K_S",L"IQ3_XS",L"IQ3_XXS",
 	    L"IQ1_S",L"IQ4_NL",L"IQ3_S",L"IQ3_M",L"IQ2_S",L"IQ2_M",L"IQ4_XS",L"IQ1_M",L"BF16"};
+	if(type==141 || type==142) return L"PQ2_0 (PrismML)";
+	if(type==143) return L"PTQ1_0 (PrismML)";
 	return type<sizeof(names)/sizeof(names[0])?names[type]:L"Unspecified";
 }
 
@@ -119,8 +126,16 @@ model_read(const wchar_t *path, ModelInfo *m)
 			} else if(!strcmp(key,"general.size_label")) {
 				if(!MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,value,-1,m->size,40)) m->size[0]=0;
 			} else if(!strcmp(value,"mmproj")) m->projector=1;
+        /* PrismML-Eng/llama.cpp (prism branch): llama.h file types 141/142/143;
+         * ggml.h tensor types 142/143. These are different enum namespaces.
+         * prism.hadamard.* also identifies legacy transformed weights. */
 		} else if(type==4 && !strcmp(key,"general.file_type")) {
 			if(!take(&r,&m->filetype,4)) goto done;
+			if(m->filetype==143) m->runtime_requirement=RuntimePTQ;
+			else if(m->filetype==141 || m->filetype==142) m->runtime_requirement=RuntimePQ;
+		} else if(!strncmp(key,"prism.hadamard.",15)) {
+			if(!m->runtime_requirement) m->runtime_requirement=RuntimeHadamard;
+			if(!skip(&r,type)) goto done;
 		} else if(type==4 && !strcmp(key,"general.base_model.count")) {
 			if(!take(&r,&m->base_count,4)) goto done;
 		} else if(!strncmp(key,"general.sampling.",17)) {
@@ -139,6 +154,18 @@ model_read(const wchar_t *path, ModelInfo *m)
 			else { if(!skip(&r,type)) goto done; continue; }
 			if(generation_set(&m->sampling,field,number)) m->sampling_fields|=1u<<field;
 		} else if(!skip(&r,type)) goto done;
+	}
+	/* Inspect tensor descriptors only, never read model weights. Mixed-format
+	 * models may omit or mislabel general.file_type. Keep the 64 MiB read bound. */
+	for(i=0;i<tensors;i++) {
+		uint32_t dimensions, tensor_type;
+		uint64_t dimension, offset;
+		unsigned j;
+		if(!string(&r,NULL,0) || !take(&r,&dimensions,4) || dimensions<1 || dimensions>4) goto done;
+		for(j=0;j<dimensions;j++) if(!take(&r,&dimension,8) || !dimension) goto done;
+		if(!take(&r,&tensor_type,4) || !take(&r,&offset,8)) goto done;
+		if(tensor_type==143) m->runtime_requirement=RuntimePTQ;
+		else if(tensor_type==142 && m->runtime_requirement!=RuntimePTQ) m->runtime_requirement=RuntimePQ;
 	}
 	wcscpy(m->path,path);
 	if(!m->name[0] && basename[0]) MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,basename,-1,m->name,256);

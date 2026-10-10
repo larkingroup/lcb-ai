@@ -8,7 +8,7 @@ struct Editor {
 	HWND name, prompt;
 	wchar_t *outname, *outprompt;
 	size_t namecap, promptcap;
-	int done, ok;
+	int done, ok, arguments;
 	HBRUSH face;
 };
 
@@ -32,7 +32,7 @@ editorproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 			for(p=name;*p==L' ' || *p==L'\t';p++) {}
 			if(!*p) { MessageBoxW(window,L"Enter a workspace name.",L"lcb-ai",MB_OK); return 0; }
 			GetWindowTextW(e->name,e->outname,(int)e->namecap);
-		} else if(!GetWindowTextLengthW(e->prompt)) {
+		} else if(!e->arguments && !GetWindowTextLengthW(e->prompt)) {
 			MessageBoxW(window,L"Enter a message.",L"lcb-ai",MB_OK); return 0;
 		}
 		GetWindowTextW(e->prompt,e->outprompt,(int)e->promptcap);
@@ -53,7 +53,7 @@ child(HWND parent, HFONT font, const wchar_t *kind, const wchar_t *text,
 
 static int
 edit_text(HWND owner, HFONT font, const wchar_t *title,
-    wchar_t *name, size_t namecap, wchar_t *prompt, size_t promptcap)
+    wchar_t *name, size_t namecap, wchar_t *prompt, size_t promptcap, int arguments)
 {
 	WNDCLASSW wc={0};
 	Editor e={0};
@@ -65,10 +65,11 @@ edit_text(HWND owner, HFONT font, const wchar_t *title,
 	HBRUSH brush=CreateSolidBrush(RGB(223,220,207));
 	DWORD corner=1, caption=RGB(223,220,207);
 	ReleaseDC(owner,dc);
+    if(arguments) bounds.bottom=160;
 	wc.lpfnWndProc=editorproc; wc.hInstance=GetModuleHandleW(NULL);
 	wc.hCursor=LoadCursorW(NULL,IDC_ARROW); wc.hbrBackground=brush; wc.lpszClassName=L"LCBWorkspaceEditor";
 	if(!RegisterClassW(&wc)) { DeleteObject(brush); return 0; }
-	e.outname=name; e.namecap=namecap; e.outprompt=prompt; e.promptcap=promptcap; e.face=brush;
+	e.arguments=arguments; e.outname=name; e.namecap=namecap; e.outprompt=prompt; e.promptcap=promptcap; e.face=brush;
 	bounds.right=MulDiv(bounds.right,dpi,96); bounds.bottom=MulDiv(bounds.bottom,dpi,96);
 	AdjustWindowRect(&bounds,WS_CAPTION|WS_SYSMENU|WS_DLGFRAME,FALSE);
 	GetWindowRect(owner,&r);
@@ -83,12 +84,12 @@ edit_text(HWND owner, HFONT font, const wchar_t *title,
 		e.name=child(window,font,L"EDIT",name,WS_BORDER|WS_TABSTOP|ES_AUTOHSCROLL,10,16,37,528,25,dpi);
 		SendMessageW(e.name,EM_SETLIMITTEXT,(WPARAM)namecap-1,0);
 	}
-	child(window,font,L"STATIC",name?L"Master prompt":L"Message",0,0,16,name?77:14,520,20,dpi);
-	e.prompt=child(window,font,L"EDIT",prompt,WS_BORDER|WS_TABSTOP|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_WANTRETURN,11,16,name?100:37,528,name?215:278,dpi);
+	child(window,font,L"STATIC",arguments?L"Extra arguments":name?L"Master prompt":L"Message",0,0,16,name?77:14,520,20,dpi);
+	e.prompt=child(window,font,L"EDIT",prompt,WS_BORDER|WS_TABSTOP|(arguments?ES_AUTOHSCROLL:WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_WANTRETURN),11,16,name?100:37,528,arguments?25:name?215:278,dpi);
 	SendMessageW(e.prompt,EM_SETLIMITTEXT,(WPARAM)promptcap-1,0);
-	child(window,font,L"STATIC",name?L"Used for the next message in every chat in this workspace.":L"Opens a new conversation from this exchange.",0,0,16,323,528,20,dpi);
-	child(window,font,L"BUTTON",name?L"Save":L"Send",WS_TABSTOP|BS_DEFPUSHBUTTON,IDOK,362,354,86,25,dpi);
-	child(window,font,L"BUTTON",L"Cancel",WS_TABSTOP,IDCANCEL,458,354,86,25,dpi);
+	child(window,font,L"STATIC",arguments?L"Example: --gpu-layers 99 --threads 8 --flash-attn on --mlock":name?L"Used for the next message in every chat in this workspace.":L"Opens a new conversation from this exchange.",0,0,16,arguments?77:323,528,20,dpi);
+	child(window,font,L"BUTTON",arguments||name?L"Save":L"Send",WS_TABSTOP|BS_DEFPUSHBUTTON,IDOK,362,arguments?124:354,86,25,dpi);
+	child(window,font,L"BUTTON",L"Cancel",WS_TABSTOP,IDCANCEL,458,arguments?124:354,86,25,dpi);
 	EnableWindow(owner,FALSE); ShowWindow(window,SW_SHOW); SetFocus(e.name?e.name:e.prompt);
 	while(!e.done && (result=GetMessageW(&msg,NULL,0,0))>0) {
 		if(!IsDialogMessageW(window,&msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
@@ -101,10 +102,15 @@ edit_text(HWND owner, HFONT font, const wchar_t *title,
 int edit_workspace(HWND owner, HFONT font, const wchar_t *title,
     wchar_t *name, size_t namecap, wchar_t *prompt, size_t promptcap)
 {
-	return edit_text(owner,font,title,name,namecap,prompt,promptcap);
+	return edit_text(owner,font,title,name,namecap,prompt,promptcap,0);
 }
 
 int edit_message(HWND owner, HFONT font, wchar_t *prompt, size_t promptcap)
 {
-	return edit_text(owner,font,L"Edit and resend",NULL,0,prompt,promptcap);
+	return edit_text(owner,font,L"Edit and resend",NULL,0,prompt,promptcap,0);
+}
+
+int edit_engine_arguments(HWND owner, HFONT font, wchar_t *arguments, size_t capacity)
+{
+    return edit_text(owner,font,L"Engine arguments",NULL,0,arguments,capacity,1);
 }

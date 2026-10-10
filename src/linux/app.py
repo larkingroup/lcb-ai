@@ -62,12 +62,6 @@ def row(*widgets):
     return w
 
 
-def heading(text):
-    w = QLabel(text)
-    w.setObjectName('heading')
-    return w
-
-
 def button(text, fn):
     b = QPushButton(text)
     b.clicked.connect(fn)
@@ -132,7 +126,7 @@ class Window(QMainWindow):
             sizes = json.loads(self.config.get('linux-layout', 'sizes', '[210, 730, 280]'))
             self.horizontal.setSizes(sizes)
             self.vertical.setSizes(json.loads(self.config.get('linux-layout', 'vertical', '[640, 128]')))
-            for key, widget in (('left', self.left), ('right', self.right), ('output', self.output)):
+            for key, widget in (('left', self.left), ('right', self.right)):
                 widget.setVisible(self.config.get('linux-layout', key, '1') == '1')
         except (ValueError, TypeError):
             self.reset_layout()
@@ -171,19 +165,39 @@ class Window(QMainWindow):
         except ValueError:
             self.port.setValue(8080)
         self.port.valueChanged.connect(self.port_changed)
-        toolbar = row(self.new_button, self.load_button, self.unload_button, self.engine_button,
-                      self.model_button, self.model_text, self.port, QLabel('lcb-ai'))
-        toolbar.layout().setStretch(5, 1)
+        self.settings_dialog = QDialog(self)
+        self.settings_dialog.setWindowTitle('Settings')
+        self.settings_dialog.resize(560, 200)
+        settings_layout = QVBoxLayout(self.settings_dialog)
+        settings_form = QFormLayout()
+        self.engine_text = QLineEdit()
+        self.engine_text.setReadOnly(True)
+        self.engine_text.setPlaceholderText('Select a Linux llama-server executable')
+        settings_form.addRow('Engine', row(self.engine_text, self.engine_button))
+        settings_form.addRow('Model', row(self.model_text, self.model_button))
+        settings_form.addRow('Port', self.port)
+        self.extra_arguments = QLineEdit(self.config.get('engine', 'extra_arguments'))
+        self.extra_arguments.setPlaceholderText('--gpu-layers 99 --threads 8 --flash-attn on --mlock')
+        self.extra_arguments.setToolTip('Additional llama-server arguments. Saved when you leave this field; reload to apply.')
+        self.extra_arguments.editingFinished.connect(self.save_engine_arguments)
+        settings_form.addRow('Extra arguments', self.extra_arguments)
+        settings_layout.addLayout(settings_form)
+        settings_layout.addWidget(row(self.load_button, self.unload_button))
+        settings_buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        settings_buttons.rejected.connect(self.settings_dialog.reject)
+        settings_layout.addWidget(settings_buttons)
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
         self.tree.itemClicked.connect(self.tree_selected)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.chat_menu)
-        self.workspace_new = button('Workspace…', lambda: self.edit_workspace(True))
-        self.workspace_edit = button('Edit…', self.edit_workspace)
-        self.left = column(heading('Chats and workspaces'), row(self.workspace_new, self.workspace_edit),
-                           self.tree, QLabel('Saved locally'))
-        self.left.layout().setStretch(2, 1)
+        self.workspace_new = QPushButton('Workspace')
+        workspace_menu = QMenu(self.workspace_new)
+        workspace_menu.addAction('New workspace…', lambda: self.edit_workspace(True))
+        workspace_menu.addAction('Workspace settings…', self.edit_workspace)
+        self.workspace_new.setMenu(workspace_menu)
+        self.left = column(row(self.new_button, self.workspace_new), self.tree)
+        self.left.layout().setStretch(1, 1)
         self.tabs = QTabBar()
         self.tabs.setExpanding(False)
         self.tabs.setTabsClosable(True)
@@ -193,13 +207,16 @@ class Window(QMainWindow):
         self.exchange.currentIndexChanged.connect(self.scroll_exchange)
         self.retry_button = button('Retry', lambda: self.retry(False))
         self.resend_button = button('Edit and resend…', lambda: self.retry(True))
-        exchange_row = row(self.exchange, self.retry_button, self.resend_button)
-        exchange_row.layout().setStretch(0, 1)
+        self.exchange_row = row(self.exchange, self.retry_button, self.resend_button)
+        self.exchange_row.layout().setStretch(0, 1)
+        self.exchange_row.hide()
         self.transcript = QTextBrowser()
         self.transcript.setObjectName('chatTranscript')
         self.transcript.document().setDocumentMargin(14)
         self.transcript.setOpenLinks(False)
         self.transcript.anchorClicked.connect(self.open_link)
+        self.transcript.cursorPositionChanged.connect(self.select_message)
+        self.transcript.selectionChanged.connect(self.select_message)
         self.prompt = QPlainTextEdit()
         self.prompt.setPlaceholderText('Write a message…    Ctrl+Enter to send')
         self.prompt.setMinimumHeight(76)
@@ -226,11 +243,11 @@ class Window(QMainWindow):
         self.thinking_text = QPlainTextEdit()
         self.thinking_text.setReadOnly(True)
         self.thinking_text.setPlaceholderText('The model’s emitted thinking appears here. No trace has been received.')
-        self.center = column(heading('Conversations'), self.tabs, exchange_row,
+        self.center = column(self.tabs, self.exchange_row,
                              self.phase_label, self.transcript,
                              self.attachment_list, attachment_row,
                              row(self.prompt, buttons))
-        self.center.layout().setStretch(4, 1)
+        self.center.layout().setStretch(3, 1)
         self.right_tabs = QTabWidget()
         self.models = QTableWidget(0, 2)
         self.models.setHorizontalHeaderLabels(['Model and support', 'Size'])
@@ -257,7 +274,7 @@ class Window(QMainWindow):
         self.projector_button = button('Choose…', self.choose_projector)
         self.projector_clear = button('Text only', lambda: self.set_projector(''))
         self.use_model_button = button('Use selected model', self.use_selected_model)
-        model_page = column(self.models, self.use_model_button, heading('Model properties'), self.details,
+        model_page = column(self.models, self.use_model_button, QLabel('Model properties'), self.details,
                             QLabel('Selected model’s media projector (reload to apply)'), self.projector_text,
                             row(self.projector_button, self.projector_clear))
         model_page.layout().setStretch(0, 3)
@@ -298,10 +315,10 @@ class Window(QMainWindow):
         self.master = QPlainTextEdit()
         self.master.setReadOnly(True)
         library_page = column(QLabel('Model folder'), self.folder, row(self.folder_button, self.scan_button),
-                              self.recursive, heading('Workspace master prompt'), self.master)
+                              self.recursive, QLabel('Workspace master prompt'), self.master)
         library_page.layout().setStretch(5, 1)
         self.right_tabs.addTab(library_page, 'Library')
-        self.right = column(heading('Properties and Models'), self.right_tabs)
+        self.right = column(self.right_tabs)
         self.horizontal = QSplitter(Qt.Horizontal)
         for w in (self.left, self.center, self.right):
             self.horizontal.addWidget(w)
@@ -319,21 +336,24 @@ class Window(QMainWindow):
         self.output_tabs.addTab(self.engine_log, 'Live llama.cpp log')
         self.thinking_tab = self.output_tabs.addTab(self.thinking_text, 'Thinking')
         self.output_tabs.setTabToolTip(self.thinking_tab, 'Thinking emitted by the local model for the selected exchange.')
-        self.output = column(heading('Output'), self.output_tabs)
+        self.output = column(self.output_tabs)
+        self.output.hide()
         self.vertical = QSplitter(Qt.Vertical)
         self.vertical.addWidget(self.horizontal)
         self.vertical.addWidget(self.output)
         self.vertical.setStretchFactor(0, 1)
-        central = column(toolbar, self.vertical)
-        central.layout().setStretch(1, 1)
+        central = column(self.vertical)
+        central.layout().setStretch(0, 1)
         self.setCentralWidget(central)
         self.engine_status = QLabel('Engine offline')
+        self.configuration_status = QLabel()
         self.context_status = QLabel('Context counted before sending')
         self.progress = QProgressBar()
         self.progress.setMaximumWidth(110)
         self.progress.setRange(0, 0)
         self.progress.hide()
         self.statusBar().addPermanentWidget(self.engine_status)
+        self.statusBar().addPermanentWidget(self.configuration_status)
         self.statusBar().addPermanentWidget(self.progress)
         self.statusBar().addPermanentWidget(self.context_status, 1)
 
@@ -362,7 +382,9 @@ class Window(QMainWindow):
         self.action(edit, 'Edit and resend…', lambda: self.retry(True))
         view = menu.addMenu('&View')
         for title, w in (('Workspace Explorer', self.left), ('Properties', self.right), ('Output', self.output)):
-            self.action(view, 'Show / hide ' + title, lambda checked=False, pane=w: pane.setVisible(not pane.isVisible()))
+            self.action(view, 'Show / hide ' + title,
+                        lambda checked=False, pane=w: pane.setVisible(pane.isHidden()),
+                        'F12' if w is self.output else None)
         self.action(view, 'Reset layout', self.reset_layout)
         engine = menu.addMenu('&Engine')
         self.action(engine, 'Stop generation', self.stop, 'Esc')
@@ -372,6 +394,7 @@ class Window(QMainWindow):
         self.action(engine, 'Unload model', self.unload)
         self.action(engine, 'Engine details / live log', self.engine_details)
         settings = menu.addMenu('&Settings')
+        self.action(settings, 'Engine and model…', self.settings_dialog.show, 'Ctrl+,')
         self.action(settings, 'Generation properties', lambda: self.show_properties(1))
         self.action(settings, 'Setup…', self.setup)
         self.action(settings, 'Model library…', lambda: self.show_properties(2))
@@ -391,7 +414,7 @@ class Window(QMainWindow):
     def reset_layout(self):
         self.left.show()
         self.right.show()
-        self.output.show()
+        self.output.hide()
         self.horizontal.setSizes([210, 730, 280])
         self.vertical.setSizes([640, 128])
 
@@ -518,10 +541,10 @@ class Window(QMainWindow):
 
     def refresh_controls(self):
         running = self.engine.process is not None or self.starting_engine
-        for w in (self.new_button, self.tree, self.workspace_new, self.workspace_edit, self.tabs,
+        for w in (self.new_button, self.tree, self.workspace_new, self.tabs,
                   self.retry_button, self.resend_button, self.exchange, self.prompt):
             w.setEnabled(not self.busy and not self.importing_media)
-        for w in (self.engine_button, self.model_button, self.port, self.use_model_button):
+        for w in (self.engine_button, self.model_button, self.port, self.extra_arguments, self.use_model_button):
             w.setEnabled(not self.busy and not running and not self.settings_loading)
         self.load_button.setEnabled(not self.busy and not running and not self.settings_loading)
         self.unload_button.setEnabled(not self.busy and running)
@@ -533,13 +556,18 @@ class Window(QMainWindow):
         self.attach_button.setToolTip('Load a model with its matching projector to enable supported media inputs. Up to 8 files, 16 MiB each.')
         self.remove_attachment_button.setEnabled(not self.busy and not self.importing_media and bool(self.attachments))
         self.send_button.setEnabled(self.send_button.isEnabled() and not self.importing_media)
-        self.retry_button.setEnabled(not self.busy and not self.importing_media and self.exchange.count() > 0)
-        self.resend_button.setEnabled(not self.busy and not self.importing_media and self.exchange.count() > 0)
+        self.retry_button.setEnabled(not self.busy and not self.importing_media and self.exchange.currentIndex() >= 0)
+        self.resend_button.setEnabled(not self.busy and not self.importing_media and self.exchange.currentIndex() >= 0)
         for w in self.generation_widgets:
             w.setEnabled(not self.busy and not self.settings_loading and bool(self.model_path))
         self.scan_button.setEnabled(not self.scanning)
         self.progress.setVisible(self.busy or self.health == 'Loading')
         self.engine_status.setText(self.health)
+        self.engine_text.setText(Path(self.engine_path).name if self.engine_path else '')
+        self.engine_text.setToolTip(self.engine_path)
+        self.configuration_status.setText(
+            f'Port: {self.port.value()} · Engine: {Path(self.engine_path).name if self.engine_path else "None"} · Model: {self.model_name() or "None"}')
+        self.configuration_status.setToolTip(f'Engine: {self.engine_path}\nModel: {self.model_path}')
 
     def refresh_tree(self):
         self.tree.clear()
@@ -631,7 +659,8 @@ class Window(QMainWindow):
         if self.chat:
             for i in range(0, len(self.chat['messages']), 2):
                 self.exchange.addItem(f'{i // 2 + 1}: {self.chat["messages"][i]["content"][:70]}')
-        self.exchange.setCurrentIndex(self.exchange.count() - 1)
+        self.exchange.setCurrentIndex(-1)
+        self.exchange_row.hide()
         self.render()
         self.restoring = False
         self.refresh_tree()
@@ -651,9 +680,21 @@ class Window(QMainWindow):
         cursor.insertBlock(QTextBlockFormat(), QTextCharFormat())
 
     def render(self, partial=None, prompt=None):
+        self.transcript.blockSignals(True)
+        self.exchange_row.hide()
+        self.exchange.blockSignals(True)
+        self.exchange.setCurrentIndex(-1)
+        self.exchange.blockSignals(False)
+        try:
+            self.render_messages(partial, prompt)
+        finally:
+            self.transcript.blockSignals(False)
+
+    def render_messages(self, partial=None, prompt=None):
         self.transcript.clear()
         cursor = self.transcript.textCursor()
         self.exchange_positions = []
+        self.saved_messages_end = 0
         if not self.chat or (not self.chat['messages'] and prompt is None):
             self.chat_heading(cursor, 'Your chat is ready')
             cursor.insertText('Load a model, type a message, and press Send.\n'
@@ -683,6 +724,7 @@ class Window(QMainWindow):
                     cursor.insertText('↳ ' + item['name'] + ' · ' + item['kind'], link)
                     cursor.setCharFormat(QTextCharFormat())
             cursor.insertBlock(QTextBlockFormat(), QTextCharFormat())
+        self.saved_messages_end = cursor.position()
         if prompt is not None:
             self.chat_heading(cursor, 'You', True)
             cursor.insertText(prompt)
@@ -760,6 +802,20 @@ class Window(QMainWindow):
         if self.engine.command:
             self.note('Engine command: ' + shlex.join(self.engine.command))
         self.note('Official llama.cpp server documentation: https://github.com/ggml-org/llama.cpp/blob/b10566/tools/server/README.md')
+
+    def select_message(self):
+        if self.restoring or self.busy or not self.chat:
+            return
+        position = self.transcript.textCursor().selectionStart()
+        index = next((i for i in range(len(self.exchange_positions) - 1, -1, -1)
+                      if self.exchange_positions[i] <= position < self.saved_messages_end), -1)
+        self.exchange.blockSignals(True)
+        self.exchange.setCurrentIndex(index)
+        self.exchange.blockSignals(False)
+        self.exchange_row.setVisible(index >= 0)
+        if index >= 0:
+            self.show_thinking(self.chat['messages'][index * 2 + 1].get('reasoning_content', ''))
+        self.refresh_controls()
 
     def scroll_exchange(self, index):
         if self.restoring or not self.chat or index < 0:
@@ -926,7 +982,7 @@ class Window(QMainWindow):
                     self.load_settings()
                     self.note('Model selected: ' + model.name)
                     if not self.busy and not self.engine.process:
-                        self.set_phase('PTQ1_0 model · requires a compatible PrismML engine; stock b10566 cannot load it' if model.filetype == 143 else 'Model selected · press Load model, then send a message')
+                        self.set_phase(self.core.lib.model_runtime_description(C.byref(model)) or 'Model selected · press Load model, then send a message')
                 except (OSError, ValueError) as exc:
                     self.set_phase('Cannot select model · ' + str(exc))
                     self.error(exc)
@@ -997,6 +1053,15 @@ class Window(QMainWindow):
         except OSError as exc:
             self.error(exc)
 
+    def save_engine_arguments(self):
+        try:
+            shlex.split(self.extra_arguments.text())
+            self.config.save('engine', 'extra_arguments', self.extra_arguments.text())
+            return True
+        except (ValueError, OSError) as exc:
+            self.error('Extra arguments could not be saved: ' + str(exc))
+            return False
+
     def setup(self):
         if self.busy or self.engine.process:
             self.note('Stop generation and unload the model before changing setup.')
@@ -1022,8 +1087,36 @@ class Window(QMainWindow):
         layout.addWidget(buttons)
         dialog.exec()
 
+    def check_runtime_requirement(self):
+        if not self.model_info:
+            self.error(ValueError('Model inspection has not succeeded. Select an accessible main GGUF model before loading.'))
+            return False
+        if not self.model_info.runtime_requirement:
+            return True
+        text = self.core.lib.model_runtime_description(C.byref(self.model_info))
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle('This model needs a compatible engine')
+        dialog.setIcon(QMessageBox.Warning)
+        dialog.setText(text)
+        dialog.setInformativeText('Download/extract the appropriate Linux llama-server build from the official PrismML setup guide, then choose its executable in Engine.\n\n'
+            'LCB-AI cannot verify these capabilities from the executable name. A projector or filename change does not add them. Try this engine only if it supports this format.')
+        dialog.setDetailedText('Model: ' + self.model_path + '\nSelected engine: ' + self.engine_path + '\nGuide: ' + self.core.lib.runtime_setup_url())
+        choose = dialog.addButton('Choose engine…', QMessageBox.ActionRole)
+        guide = dialog.addButton('Official setup guide', QMessageBox.HelpRole)
+        attempt = dialog.addButton('Try selected engine', QMessageBox.AcceptRole)
+        cancel = dialog.addButton(QMessageBox.Cancel)
+        dialog.setDefaultButton(cancel)
+        dialog.exec()
+        if dialog.clickedButton() == choose:
+            self.choose_engine()
+        elif dialog.clickedButton() == guide:
+            QDesktopServices.openUrl(QUrl(self.core.lib.runtime_setup_url()))
+        return dialog.clickedButton() == attempt
+
     def load_model(self):
         if self.busy or self.engine.process or self.starting_engine or self.settings_loading:
+            return
+        if not self.save_engine_arguments():
             return
         if not self.engine_path:
             self.choose_engine()
@@ -1032,6 +1125,9 @@ class Window(QMainWindow):
             return
         if not self.engine_path:
             return
+        if not self.check_runtime_requirement():
+            self.set_phase('Load deferred · select an engine with the required model support')
+            return
         self.starting_engine = True
         self.health = 'Loading'
         self.phase_started = time.monotonic()
@@ -1039,8 +1135,9 @@ class Window(QMainWindow):
         self.refresh_controls()
         exe, model, port, context = self.engine_path, self.model_path, self.port.value(), self.g.context_tokens
         projector = self.projector_path
+        extra_arguments = self.extra_arguments.text()
         def start(_job):
-            self.engine.start(exe, model, port, context, self.store.root / 'engine.log', projector)
+            self.engine.start(exe, model, port, context, self.store.root / 'engine.log', projector, extra_arguments)
         def done(result):
             self.starting_engine = False
             if result[0]:
@@ -1071,6 +1168,7 @@ class Window(QMainWindow):
             return
         if self.engine.process and self.engine.process.poll() is not None:
             self.refresh_activity()
+            was_ready = self.health == 'Ready'
             code = self.engine.process.returncode
             self.engine.stop()
             detail = self.engine.failure()
@@ -1079,6 +1177,22 @@ class Window(QMainWindow):
             self.note(detail)
             self.output.show()
             self.output_tabs.setCurrentIndex(1)
+            dialog = QMessageBox(self)
+            dialog.setWindowTitle('Engine stopped' if was_ready else 'Model could not load')
+            dialog.setIcon(QMessageBox.Warning)
+            dialog.setText(detail)
+            requirement = self.core.lib.model_runtime_description(C.byref(self.model_info)) if self.model_info else ''
+            dialog.setInformativeText(requirement or 'Your model and saved chats were left unchanged.')
+            dialog.setDetailedText('Exit code: ' + str(code) + '\nEngine: ' + self.engine_path + '\nModel: ' + self.model_path +
+                                  '\nLog: ' + str(self.engine.log_path) + '\n\n' + self.engine.log_tail)
+            choose = dialog.addButton('Choose engine…', QMessageBox.ActionRole)
+            guide = dialog.addButton('Official setup guide', QMessageBox.HelpRole) if requirement else None
+            dialog.addButton(QMessageBox.Close)
+            dialog.exec()
+            if dialog.clickedButton() == choose:
+                self.choose_engine()
+            elif guide and dialog.clickedButton() == guide:
+                QDesktopServices.openUrl(QUrl(self.core.lib.runtime_setup_url()))
         if self.probing:
             return
         self.probing = True
@@ -1152,7 +1266,12 @@ class Window(QMainWindow):
                 for i, model in enumerate(models):
                     role = model_role(model)
                     if role == 'Chat model':
-                        role = 'Media projector found' if model.projector_hint else 'Text only · no projector found'
+                        saved = self.config.get(self.config.section(model.path), 'projector', '__auto__')
+                        if saved != '__auto__':
+                            model.projector_hint = saved
+                            role = 'Media projector selected' if saved else 'Text only · selected by you'
+                        else:
+                            role = 'Media projector found' if model.projector_hint else 'Text only · no projector found'
                     name = QTableWidgetItem(Path(model.path).stem + '\n' + role)
                     name.setToolTip(model.name + '\n' + model.path + '\n' + role)
                     name.setData(Qt.UserRole, model.path)
@@ -1180,6 +1299,7 @@ class Window(QMainWindow):
                   ('Parameters', model.size or 'Unspecified'), ('File size', f'{model.bytes:,} bytes'),
                   ('Quantization', self.core.lib.model_quant(model.filetype)),
                   ('Type', model_role(model)),
+                  ('Engine requirement', self.core.lib.model_runtime_description(C.byref(model)) or 'No special requirement detected (not a compatibility guarantee)'),
                   ('Media projector', Path(getattr(model, 'projector_hint', '')).name if getattr(model, 'projector_hint', '') else 'None detected; select a matching projector to enable media'),
                   ('File', Path(model.path).name), ('Location', model.path)]
         self.details.setRowCount(len(values))
@@ -1293,7 +1413,7 @@ class Window(QMainWindow):
             self.note('Stopping. Close again after the partial reply is saved.')
             event.ignore()
             return
-        if not self.save_draft():
+        if not self.save_engine_arguments() or not self.save_draft():
             event.ignore()
             return
         try:
@@ -1360,13 +1480,11 @@ def apply_theme(app):
         QMainWindow, QDialog, QWidget { background: #ece9d8; }
         QLineEdit, QPlainTextEdit, QTextBrowser, QTreeWidget, QTableWidget, QSpinBox,
         QDoubleSpinBox, QComboBox { background: white; selection-background-color: #c0d3e0; selection-color: #2f373a; }
-        QTextBrowser#chatTranscript { font-size: 14px; border: 1px solid #c8c9c1; border-radius: 5px; }
-        QLabel#chatPhase { padding: 8px; background: #e4edf3; color: #31546b; border-radius: 4px; }
-        QLabel#heading { background: #d9d8c9; border: 1px solid #999a91; padding: 3px; font-weight: bold; }
-        QPushButton { padding: 5px 10px; min-height: 20px; }
+        QTextBrowser#chatTranscript { font-size: 14px; border: 1px solid #c8c9c1; }
+        QLabel#chatPhase { background: #e4edf3; color: #31546b; }
+        QPushButton { min-height: 20px; }
         QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { min-height: 24px; }
-        QTabBar::tab { padding: 6px 10px; }
-        QHeaderView::section { padding: 4px; background: #e2e1d6; border: none; }
+        QHeaderView::section { background: #e2e1d6; border: none; }
         QListWidget { background: white; border: 1px solid #c8c9c1; }
         QTabBar::tab:selected { background: #c0d3e0; }
         QSplitter::handle { background: #c9c8b9; }

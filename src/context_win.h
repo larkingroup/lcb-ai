@@ -2,7 +2,7 @@
 #define CONTEXT_WIN_H
 #include "stream_win.h"
 typedef struct ContextBudget {
-    int context_tokens, prompt_tokens, response_tokens, thinking_supported;
+    int context_tokens, prompt_tokens, response_tokens, reasoning_effort_supported;
     size_t omitted_messages;
     char build[96];
 } ContextBudget;

@@ -150,6 +150,14 @@ chat_parse(cJSON *json, Chat *chat)
 			cJSON *status=cJSON_GetObjectItemCaseSensitive(m,"status");
 			cJSON *error=cJSON_GetObjectItemCaseSensitive(m,"error");
 			Message *message=&chat->conversation.messages[i];
+            cJSON *reasoning=cJSON_GetObjectItemCaseSensitive(m,"reasoning_content");
+            if(reasoning) {
+                size_t n;
+                if(!cJSON_IsString(reasoning) || !validtext(reasoning->valuestring,LcbMaxReply,1)) return 0;
+                n=strlen(reasoning->valuestring)+1;
+                message->reasoning=malloc(n); if(!message->reasoning) return 0;
+                memcpy(message->reasoning,reasoning->valuestring,n);
+            }
 			if(status) {
 				int code;
 				if(!cJSON_IsString(status)) return 0;
@@ -254,6 +262,8 @@ store_save(Store *s, Chat *chat)
 			const char *status=answer_status_name(message->status);
 			ok=status && validtext(message->error,sizeof(message->error)-1,1) &&
 			    cJSON_AddStringToObject(m,"status",status) && cJSON_AddStringToObject(m,"error",message->error);
+            if(ok && message->reasoning) ok=validtext(message->reasoning,LcbMaxReply,1) &&
+                cJSON_AddStringToObject(m,"reasoning_content",message->reasoning);
 		}
 		if(ok) ok=cJSON_AddItemToArray(messages,m);
 		if(!ok) cJSON_Delete(m);
@@ -300,6 +310,12 @@ store_branch(Store *s, const Chat *source, size_t turn, const char *prompt,
 	for(i=0;i<turn*2;i++) {
 		const Message *m=&source->conversation.messages[i];
 		if(!conversation_add(&next->conversation,m->role,m->text)) goto done;
+        if(m->reasoning) {
+            size_t length=strlen(m->reasoning)+1;
+            next->conversation.messages[i].reasoning=malloc(length);
+            if(!next->conversation.messages[i].reasoning) goto done;
+            memcpy(next->conversation.messages[i].reasoning,m->reasoning,length);
+        }
 		next->conversation.messages[i].status=m->status;
 		memcpy(next->conversation.messages[i].error,m->error,sizeof(m->error));
 	}

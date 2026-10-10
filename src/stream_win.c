@@ -49,6 +49,12 @@ static size_t utf8prefix(const char *text, size_t length)
 int local_stream_report(unsigned short port,const char *body,HANDLE cancel,StreamUpdate update,
     void *context,char **answer,ReplyReport *report,char *error,size_t capacity)
 {
+    return local_stream_observe(port,body,cancel,update,NULL,context,answer,report,error,capacity);
+}
+int local_stream_observe(unsigned short port,const char *body,HANDLE cancel,
+    StreamUpdate update,StreamObserver observer,void *context,char **answer,
+    ReplyReport *report,char *error,size_t capacity)
+{
     HINTERNET session=NULL,connection=NULL,request=NULL;
     Transfer t={0};
     StreamReply *reply=calloc(1,sizeof(*reply));
@@ -56,7 +62,7 @@ int local_stream_report(unsigned short port,const char *body,HANDLE cancel,Strea
     DWORD flags,status=0,n=sizeof(status);
     DWORD_PTR ctx=(DWORD_PTR)&t;
     int ok=0,callback=0;
-    ULONGLONG lastupdate=0;
+    ULONGLONG lastupdate=0,lastobserve=0;
     *answer=NULL;
     if(report) memset(report,0,sizeof(*report));
     if(!capacity) { free(reply); return 0; }
@@ -94,11 +100,14 @@ int local_stream_report(unsigned short port,const char *body,HANDLE cancel,Strea
         if(!ready(&t,cancel,WinHttpReadData(request,buffer,available,NULL))) goto done;
         if(!t.bytes) break;
         if(!stream_feed(reply,buffer,t.bytes)) { snprintf(error,capacity,"Invalid or oversized streaming response."); goto done; }
+        if(observer && (reply->done || GetTickCount64()-lastobserve>=40)) {
+            observer(reply,context); lastobserve=GetTickCount64();
+        }
         if(update && reply->used>before && (reply->done || GetTickCount64()-lastupdate>=40)) {
             update(reply->text,context); lastupdate=GetTickCount64();
         }
     }
-    if(reply->done && reply->used) ok=1;
+    if(reply->done && (reply->used || (observer && reply->reasoning_used))) ok=1;
     else if(reply->done && reply->finish==FinishLength && reply->saw_reasoning)
         snprintf(error,capacity,"Response limit reached during thinking. Increase Response tokens or set Thinking to Off. Your draft was retained.");
     else if(reply->done && !reply->used)
@@ -119,6 +128,14 @@ done:
             snprintf(error,capacity,"The engine returned invalid UTF-8 text.");
         }
     }
+    if(reply && reply->reasoning_used) {
+        size_t valid=utf8prefix(reply->reasoning,reply->reasoning_used);
+        if(valid<reply->reasoning_used) {
+            reply->reasoning[valid]=0; reply->reasoning_used=valid; ok=0;
+            snprintf(error,capacity,"The engine returned invalid UTF-8 reasoning.");
+        }
+    }
+    if(observer && reply) observer(reply,context);
     if(reply && reply->used) {
         *answer=malloc(reply->used+1);
         if(*answer) memcpy(*answer,reply->text,reply->used+1); else ok=0;

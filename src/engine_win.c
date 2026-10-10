@@ -3,6 +3,7 @@
 #include <winhttp.h>
 #include <wchar.h>
 #include <string.h>
+#include <stdlib.h>
 #include "cJSON.h"
 
 int
@@ -82,8 +83,32 @@ int
 engine_exited(EngineProcess *p)
 {
 	if(!p->process || WaitForSingleObject(p->process, 0) != WAIT_OBJECT_0) return 0;
+	GetExitCodeProcess(p->process,&p->exitcode);
 	engine_stop(p);
 	return 1;
+}
+
+void
+engine_read_log(const EngineProcess *p, wchar_t *text, size_t capacity)
+{
+    HANDLE file;
+    LARGE_INTEGER size, offset;
+    char bytes[16384]; DWORD got=0;
+    int count;
+    if(!capacity) return;
+    text[0]=0;
+    file=CreateFileW(p->logpath,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
+    if(file==INVALID_HANDLE_VALUE) return;
+    if(GetFileSizeEx(file,&size)) {
+        offset.QuadPart=size.QuadPart>(LONGLONG)sizeof(bytes)?size.QuadPart-(LONGLONG)sizeof(bytes):0;
+        if(SetFilePointerEx(file,offset,NULL,FILE_BEGIN) && ReadFile(file,bytes,sizeof(bytes),&got,NULL)) {
+            count=MultiByteToWideChar(CP_UTF8,0,bytes,(int)got,NULL,0);
+            if(count>0 && (size_t)count<capacity) {
+                MultiByteToWideChar(CP_UTF8,0,bytes,(int)got,text,count); text[count]=0;
+            }
+        }
+    }
+    CloseHandle(file);
 }
 
 int
@@ -97,12 +122,37 @@ int
 engine_start_context(EngineProcess *p, const wchar_t *exe, const wchar_t *model,
     unsigned short port, int context, wchar_t *error, size_t capacity)
 {
+    return engine_start_arguments(p,exe,model,port,context,L"",error,capacity);
+}
+
+int engine_arguments_valid(const wchar_t *extra)
+{
+    int quoted=0,slashes=0;
+    if(!extra || wcslen(extra)>2047) return 0;
+    for(;*extra;extra++) {
+        if(*extra<L' ') return 0;
+        if(*extra==L'"' && slashes%2==0) quoted=!quoted;
+        slashes=*extra==L'\\'?slashes+1:0;
+    }
+    return !quoted;
+}
+
+int
+engine_start_arguments(EngineProcess *p, const wchar_t *exe, const wchar_t *model,
+    unsigned short port, int context, const wchar_t *extra, wchar_t *error, size_t capacity)
+{
 	wchar_t command[4096], directory[MAX_PATH], *slash;
-	STARTUPINFOW startup = {0};
+	STARTUPINFOEXW startup = {0};
+    SECURITY_ATTRIBUTES security={sizeof(security),NULL,TRUE};
+    HANDLE output=INVALID_HANDLE_VALUE, input=INVALID_HANDLE_VALUE, inherited[2];
+    SIZE_T attribute_size=0;
+    wchar_t temporary[MAX_PATH];
+    DWORD failure_code=0, temporary_length;
 	PROCESS_INFORMATION info = {0};
 	JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
 	int n;
 	DWORD attributes;
+	if(!engine_arguments_valid(extra)) { swprintf(error,capacity,L"Extra arguments are too long or contain unmatched quotes/control characters."); return 0; }
 	if(context<512 || context>1048576) { swprintf(error,capacity,L"Context must be between 512 and 1048576 tokens."); return 0; }
 	if(p->process) { swprintf(error, capacity, L"Unload the current model first."); return 0; }
 	attributes = GetFileAttributesW(exe);
@@ -125,28 +175,52 @@ engine_start_context(EngineProcess *p, const wchar_t *exe, const wchar_t *model,
 	slash = wcsrchr(directory, L'\\');
 	if(!slash) { swprintf(error, capacity, L"Use a full engine path."); return 0; }
 	*slash = 0;
-	n = swprintf(command, 4096, L"\"%ls\" --model \"%ls\" --alias local --host 127.0.0.1 --port %u "
-	    L"--ctx-size %d --parallel 1 --fit on --gpu-layers auto --cache-type-k q8_0 --jinja "
-	    L"--cache-type-v q8_0 --no-webui --no-agent --no-ui-mcp-proxy --cors-origins localhost --no-cors-credentials",
-	    exe, model, port, context);
+	n = swprintf(command, 4096, L"\"%ls\" %ls --model \"%ls\" --alias local --host 127.0.0.1 --port %u "
+	    L"--ctx-size %d --parallel 1 --jinja --reasoning-format deepseek --sse-ping-interval 5 "
+	    L"--no-webui --no-agent --no-ui-mcp-proxy --cors-origins localhost --no-cors-credentials",
+	    exe, extra, model, port, context);
 	if(n < 0 || n >= 4096) { swprintf(error, capacity, L"Engine command is too long."); return 0; }
+    p->logpath[0]=0; p->exitcode=0;
+    temporary_length=GetTempPathW(MAX_PATH,temporary);
+    if(!temporary_length) goto failed;
+    if(temporary_length>=MAX_PATH-14) { SetLastError(ERROR_FILENAME_EXCED_RANGE); goto failed; }
+    if(!GetTempFileNameW(temporary,L"LCB",0,p->logpath)) goto failed;
+    output=CreateFileW(p->logpath,GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,&security,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
+    input=CreateFileW(L"NUL",GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,&security,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
+    if(output==INVALID_HANDLE_VALUE || input==INVALID_HANDLE_VALUE) goto failed;
+    InitializeProcThreadAttributeList(NULL,1,0,&attribute_size);
+    startup.lpAttributeList=malloc(attribute_size);
+    if(!startup.lpAttributeList) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); goto failed; }
+    if(!InitializeProcThreadAttributeList(startup.lpAttributeList,1,0,&attribute_size)) {
+        free(startup.lpAttributeList); startup.lpAttributeList=NULL; goto failed;
+    }
+    inherited[0]=output; inherited[1]=input;
+    if(!UpdateProcThreadAttribute(startup.lpAttributeList,0,PROC_THREAD_ATTRIBUTE_HANDLE_LIST,inherited,sizeof(inherited),NULL,NULL)) goto failed;
 	p->job = CreateJobObjectW(NULL, NULL);
 	limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 	if(!p->job || !SetInformationJobObject(p->job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) goto failed;
-	startup.cb = sizeof(startup);
-	if(!CreateProcessW(exe, command, NULL, NULL, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
-	    NULL, directory, &startup, &info)) goto failed;
+	startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags=STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdOutput=output; startup.StartupInfo.hStdError=output; startup.StartupInfo.hStdInput=input;
+	if(!CreateProcessW(exe, command, NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+	    NULL, directory, &startup.StartupInfo, &info)) goto failed;
 	if(!AssignProcessToJobObject(p->job, info.hProcess)) {
-		TerminateProcess(info.hProcess, 1); CloseHandle(info.hProcess); CloseHandle(info.hThread); goto failed;
+		failure_code=GetLastError(); TerminateProcess(info.hProcess, 1); CloseHandle(info.hProcess); CloseHandle(info.hThread); goto failed;
 	}
 	p->process = info.hProcess;
 	if(ResumeThread(info.hThread) == (DWORD)-1) {
-		CloseHandle(info.hThread); engine_stop(p); goto failed;
+		failure_code=GetLastError(); CloseHandle(info.hThread); engine_stop(p); goto failed;
 	}
 	CloseHandle(info.hThread);
+    DeleteProcThreadAttributeList(startup.lpAttributeList); free(startup.lpAttributeList);
+    CloseHandle(input); CloseHandle(output);
 	return 1;
 failed:
-	swprintf(error, capacity, L"Cannot start the local engine (Windows error %lu).", (unsigned long)GetLastError());
+    if(!failure_code) failure_code=GetLastError();
+    if(startup.lpAttributeList) { DeleteProcThreadAttributeList(startup.lpAttributeList); free(startup.lpAttributeList); }
+    if(input!=INVALID_HANDLE_VALUE) CloseHandle(input);
+    if(output!=INVALID_HANDLE_VALUE) CloseHandle(output);
+	swprintf(error, capacity, L"Cannot start the local engine (Windows error %lu).", (unsigned long)failure_code);
 	engine_stop(p);
 	return 0;
 }
