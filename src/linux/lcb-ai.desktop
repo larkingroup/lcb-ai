@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=LCB-AI
+Comment=Local AI workbench
+Exec=lcb-ai
+Icon=lcb-ai
+Terminal=false
+Categories=Utility;
+StartupWMClass=lcb-ai
