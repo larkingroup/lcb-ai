@@ -1,5 +1,6 @@
 """Native Linux services around the original LCB C request/model/stream core."""
 import configparser
+import base64
 import copy
 import ctypes as C
 import fcntl
@@ -11,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -19,6 +21,52 @@ import time
 import uuid
 
 MAX_PROMPT, MAX_REPLY, MAX_WIRE = 16384, 65536, 1048576
+MAX_MEDIA = 16 * MAX_WIRE
+MAX_MEDIA_WIRE = 64 * MAX_WIRE
+MEDIA_TYPES = {'.png': ('vision', 'image/png'), '.jpg': ('vision', 'image/jpeg'),
+               '.jpeg': ('vision', 'image/jpeg'),
+               '.bmp': ('vision', 'image/bmp'), '.gif': ('vision', 'image/gif'),
+               '.wav': ('audio', 'audio/wav'), '.mp3': ('audio', 'audio/mpeg'),
+               '.flac': ('audio', 'audio/flac'), '.mp4': ('video', 'video/mp4'),
+               '.mkv': ('video', 'video/x-matroska'), '.webm': ('video', 'video/webm'),
+               '.mov': ('video', 'video/quicktime')}
+
+
+def validate_attachments(items):
+    if not isinstance(items, list) or len(items) > 8:
+        raise ValueError('Use at most 8 attachments per message.')
+    for item in items:
+        if not isinstance(item, dict) or not re.fullmatch(r'[a-f0-9]{64}\.[a-z0-9]+', item.get('file', '')):
+            raise ValueError('Invalid saved attachment.')
+        suffix = Path(item['file']).suffix
+        if suffix not in MEDIA_TYPES or item.get('kind') != MEDIA_TYPES[suffix][0]:
+            raise ValueError('Invalid attachment format.')
+        text_ok(item.get('name'), 1024, False)
+        if type(item.get('size')) is not int or not 0 < item['size'] <= MAX_MEDIA:
+            raise ValueError('Each attachment must be between 1 byte and 16 MiB.')
+
+
+def model_role(model):
+    if model.projector:
+        return 'Projector companion'
+    if re.search(r'(?:FastMTP|(?:^|[-_])MTP[-_](?:Q\d|F16|BF16|32K))', Path(model.path).name, re.I):
+        return 'Draft companion'
+    if model.filetype == 143:
+        return 'Requires PTQ engine'
+    return 'Chat model'
+
+
+def suggested_projector(core, model):
+    """Suggest only an unambiguous same-release filename match, never cross-pair models."""
+    def stem(path):
+        value = Path(path).stem.casefold().removeprefix('mmproj-')
+        return re.sub(r'-(?:iq\d[^-]*|q\d[^-]*|bf16|f16|f32)$', '', value)
+    matches = [p for p in Path(model.path).parent.glob('*.gguf')
+               if p.name.lower().startswith('mmproj-') and stem(p) == stem(model.path)]
+    try:
+        return str(matches[0]) if len(matches) == 1 and core.model(matches[0]).projector else ''
+    except (ValueError, OSError):
+        return ''
 FIELDS = ('max_tokens', 'temperature', 'top_p', 'context_tokens', 'thinking',
           'repeat_penalty', 'dry_multiplier', 'top_k', 'min_p', 'presence_penalty')
 LABELS = ('Response tokens', 'Temperature', 'Top P', 'Context (reload)', 'Thinking',
@@ -194,12 +242,14 @@ class Store:
                 raise ValueError('Workspace not found')
             text_ok(obj['title'], 240, False)
             text_ok(obj['draft'], MAX_PROMPT)
+            validate_attachments(obj.get('draft_attachments', []))
             if not isinstance(obj['messages'], list) or len(obj['messages']) % 2:
                 raise ValueError('Incomplete saved conversation')
             for i, m in enumerate(obj['messages']):
                 if m['role'] != ('assistant' if i % 2 else 'user'):
                     raise ValueError('Invalid message order')
                 text_ok(m['content'], MAX_REPLY, False)
+                validate_attachments(m.get('attachments', []))
                 if i % 2:
                     if m.get('status', 'unknown') not in STATUSES:
                         raise ValueError('Invalid answer status')
@@ -231,7 +281,8 @@ class Store:
         text_ok(prompt, MAX_PROMPT, False)
         obj = copy.deepcopy(chat)
         obj.update(id=uuid.uuid4().hex, title=truncate(f'{action} {turn + 1}: {chat["title"]}', 240),
-                   draft=prompt, messages=obj['messages'][:turn * 2])
+                   draft=prompt, draft_attachments=copy.deepcopy(chat['messages'][turn * 2].get('attachments', [])),
+                   messages=obj['messages'][:turn * 2])
         self.save('chats', obj)
         return obj
 
@@ -243,6 +294,40 @@ class Store:
 
     def close(self):
         self.lock.close()
+
+    def import_attachment(self, source):
+        source = Path(source)
+        suffix = source.suffix.lower()
+        if suffix not in MEDIA_TYPES or not source.is_file():
+            raise ValueError('Choose a supported image, audio, or video file.')
+        with source.open('rb') as stream:
+            data = stream.read(MAX_MEDIA + 1)
+        if not 0 < len(data) <= MAX_MEDIA:
+            raise ValueError('Each attachment must be between 1 byte and 16 MiB.')
+        item = dict(file=hashlib.sha256(data).hexdigest() + suffix, name=source.name,
+                    kind=MEDIA_TYPES[suffix][0], size=len(data))
+        validate_attachments([item])
+        folder = self.root / 'attachments'
+        folder.mkdir(mode=0o700, exist_ok=True)
+        target = folder / item['file']
+        if not target.exists():
+            atomic_write(target, data)
+        return item
+
+    def media_part(self, item):
+        validate_attachments([item])
+        path = self.root / 'attachments' / item['file']
+        if path.is_symlink():
+            raise ValueError('Attachment storage must contain regular files.')
+        with path.open('rb') as stream:
+            data = stream.read(MAX_MEDIA + 1)
+        if len(data) != item['size'] or hashlib.sha256(data).hexdigest() != Path(item['file']).stem:
+            raise ValueError('Saved attachment changed or is incomplete: ' + item['name'])
+        encoded = base64.b64encode(data).decode('ascii')
+        if item['kind'] == 'vision':
+            return dict(type='image_url', image_url={'url': 'data:' + MEDIA_TYPES[path.suffix][1] + ';base64,' + encoded})
+        key = 'input_' + item['kind']
+        return {'type': key, key: {'data': encoded, 'format': path.suffix[1:]}}
 
 
 def truncate(text, length):
@@ -340,8 +425,9 @@ class Transport:
         self.check()
         if body is not None and not isinstance(body, bytes):
             body = json.dumps(body).encode()
-        if body and len(body) > MAX_WIRE:
-            raise TooLarge('Request exceeds 1 MiB.')
+        limit = MAX_MEDIA_WIRE if path == '/v1/chat/completions' else MAX_WIRE
+        if body and len(body) > limit:
+            raise TooLarge(f'Request exceeds {limit // MAX_WIRE} MiB. Use fewer or smaller attachments.')
         connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=timeout)
         start = time.monotonic()
         watchdog = threading.Timer(deadline, self._deadline) if deadline else None
@@ -405,7 +491,7 @@ class Transport:
             raise ValueError('Invalid JSON from the local engine.')
         return obj
 
-    def prepare(self, core, model, messages, instruction, prompt, g):
+    def prepare(self, core, model, messages, instruction, prompt, g, attachments=None, store=None):
         props = self.json('/props')
         context = props.get('default_generation_settings', {}).get('n_ctx')
         template = props.get('chat_template')
@@ -419,6 +505,34 @@ class Transport:
         available = context - g.max_tokens - 32
         if available < 1:
             raise ValueError('Response limit leaves no prompt room. Lower it or reload with more context.')
+
+        attachment_sets = [m.get('attachments', []) for m in messages] + [attachments or []]
+        if any(attachment_sets):
+            # Text /tokenize cannot count image/audio embeddings. Let libmtmd
+            # validate the full prompt; never silently discard media or history.
+            modalities = props.get('modalities', {})
+            for items in attachment_sets:
+                validate_attachments(items)
+                for item in items:
+                    if modalities.get(item['kind']) is not True:
+                        raise ValueError(f'The loaded engine does not support {item["kind"]} input. Load a matching projector/model, or remove the attachment ({item["name"]}).')
+                    if item['kind'] == 'video' and not all(shutil.which(exe) for exe in ('ffmpeg', 'ffprobe')):
+                        raise ValueError('Video requires ffmpeg and ffprobe on PATH. On Fedora: sudo dnf install ffmpeg-free. Reload the engine after installing them.')
+            if store is None:
+                raise ValueError('Attachment storage is unavailable.')
+            if sum(a['size'] for items in attachment_sets for a in items) > 46 * MAX_WIRE:
+                raise TooLarge('Conversation media exceeds 46 MiB. Start a new chat or use smaller files.')
+            request = json.loads(core.request(messages, instruction, prompt, g))
+            turns = [m for m in request['messages'] if m['role'] != 'system']
+            for turn, items in zip(turns, attachment_sets):
+                if items:
+                    self.check()
+                    turn['content'] = [{'type': 'text', 'text': turn['content']}] + [store.media_part(a) for a in items]
+            request.update(reasoning_format='deepseek', return_progress=True, sse_ping_interval=5)
+            wire = json.dumps(request, ensure_ascii=False).encode()
+            if len(wire) > MAX_MEDIA_WIRE:
+                raise TooLarge('Media request exceeds 64 MiB. Use smaller attachments.')
+            return wire, dict(context=context, prompt=None, response=g.max_tokens, omitted=0, thinking=thinking)
 
         def counted(first):
             wire = core.request(messages[first:], instruction, prompt, g)
@@ -525,7 +639,7 @@ class Engine:
         errors = [line for line in self.log_tail.splitlines() if re.search(r'error|failed|unsupported|out of memory', line, re.I)]
         return '\n'.join(errors[-4:]) or 'The engine exited before loading. See the live engine log.'
 
-    def start(self, exe, model, port, context, log):
+    def start(self, exe, model, port, context, log, projector=''):
         if self.process:
             raise ValueError('Unload the current model first.')
         exe, model = str(Path(exe).resolve()), str(Path(model).resolve())
@@ -542,6 +656,10 @@ class Engine:
                 '--ctx-size', str(context), '--parallel', '1', '--jinja', '--reasoning-format', 'deepseek',
                 '--sse-ping-interval', '5', '--no-webui',
                 '--no-agent', '--no-ui-mcp-proxy', '--cors-origins', 'localhost', '--no-cors-credentials']
+        if projector:
+            if not Path(projector).is_file():
+                raise ValueError('The selected projector is unavailable.')
+            args += ['--mmproj', str(Path(projector).resolve())]
         self.command = args
         self.log_path = Path(log)
         self.log_tail = ''
@@ -584,7 +702,9 @@ def scan_models(core, folder, recursive, cancel):
             if path.suffix.lower() != '.gguf' or path.is_symlink():
                 continue
             try:
-                models.append(core.model(path))
+                model = core.model(path)
+                model.projector_hint = suggested_projector(core, model) if model_role(model) == 'Chat model' else ''
+                models.append(model)
             except ValueError:
                 skipped += 1
     return models, skipped

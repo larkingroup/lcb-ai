@@ -6,6 +6,7 @@ import ctypes as C
 import json
 import os
 import shlex
+import shutil
 from pathlib import Path
 import sys
 import threading
@@ -17,9 +18,10 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
     QLabel, QPushButton, QLineEdit, QPlainTextEdit, QTextBrowser, QTreeWidget, QTreeWidgetItem,
     QComboBox, QSpinBox, QDoubleSpinBox, QTabWidget, QTabBar, QSplitter, QTableWidget,
     QTableWidgetItem, QHeaderView, QFileDialog, QMessageBox, QDialog, QDialogButtonBox,
-    QFormLayout, QCheckBox, QMenu, QProgressBar, QAbstractItemView)
+    QFormLayout, QCheckBox, QMenu, QProgressBar, QAbstractItemView, QListWidget, QListWidgetItem, QSizePolicy)
 from backend import (Core, Store, Settings, Engine, Transport, Cancelled, Generation,
-    FIELDS, LABELS, MAX_PROMPT, truncate, text_ok, scan_models, EngineHTTPError)
+    FIELDS, LABELS, MAX_PROMPT, truncate, text_ok, scan_models, EngineHTTPError,
+    MEDIA_TYPES, model_role, suggested_projector)
 
 
 class Job(QThread):
@@ -97,6 +99,10 @@ class Window(QMainWindow):
         self.metadata_epoch = 0
         self.settings_loading = False
         self.starting_engine = False
+        self.importing_media = False
+        self.attachments = []
+        self.projector_path = ''
+        self.modalities = {}
         self.engine_path = self.config.get('engine', 'executable')
         self.model_path = self.config.get('engine', 'model')
         self.g = self.core.defaults()
@@ -155,7 +161,7 @@ class Window(QMainWindow):
         self.unload_button = button('Unload', self.unload)
         self.engine_button = button('Engine…', self.choose_engine)
         self.model_button = button('Model…', self.choose_model)
-        self.model_text = QLineEdit(self.model_path)
+        self.model_text = QLineEdit(Path(self.model_path).name if self.model_path else '')
         self.model_text.setReadOnly(True)
         self.model_text.setPlaceholderText('Select a GGUF model')
         self.port = QSpinBox()
@@ -200,6 +206,19 @@ class Window(QMainWindow):
         self.prompt.setMaximumHeight(90)
         self.send_button = button('Send', self.send)
         self.stop_button = button('Stop', self.stop)
+        self.attach_button = button('Attach…', self.choose_attachments)
+        self.remove_attachment_button = button('Remove', self.remove_attachment)
+        self.attachment_list = QListWidget()
+        self.attachment_list.setMaximumHeight(64)
+        self.attachment_list.itemDoubleClicked.connect(self.preview_attachment)
+        self.attachment_list.hide()
+        self.media_status = QLabel('Text · load a model to check media support')
+        self.media_status.setWordWrap(True)
+        attachment_row = row(self.attach_button, self.remove_attachment_button, self.media_status)
+        attachment_row.layout().setStretch(2, 1)
+        attachment_row.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        self.attach_button.setFixedWidth(90)
+        self.remove_attachment_button.setFixedWidth(80)
         buttons = column(self.send_button, self.stop_button)
         self.phase_label = QLabel(self.phase_text)
         self.phase_label.setWordWrap(True)
@@ -209,16 +228,17 @@ class Window(QMainWindow):
         self.thinking_text.setPlaceholderText('The model’s emitted thinking appears here. No trace has been received.')
         self.center = column(heading('Conversations'), self.tabs, exchange_row,
                              self.phase_label, self.transcript,
-                             QLabel('Message'), row(self.prompt, buttons))
+                             self.attachment_list, attachment_row,
+                             row(self.prompt, buttons))
         self.center.layout().setStretch(4, 1)
         self.right_tabs = QTabWidget()
         self.models = QTableWidget(0, 2)
-        self.models.setHorizontalHeaderLabels(['Name', 'Size'])
+        self.models.setHorizontalHeaderLabels(['Model and support', 'Size'])
         self.models.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.models.setSelectionMode(QAbstractItemView.SingleSelection)
         self.models.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.models.verticalHeader().hide()
-        self.models.verticalHeader().setDefaultSectionSize(22)
+        self.models.verticalHeader().setDefaultSectionSize(42)
         self.models.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.models.setColumnWidth(1, 75)
         self.models.setSortingEnabled(True)
@@ -231,9 +251,17 @@ class Window(QMainWindow):
         self.details.verticalHeader().setDefaultSectionSize(22)
         self.details.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.details.setWordWrap(False)
-        model_page = column(self.models, heading('Model properties'), self.details)
+        self.projector_text = QLineEdit()
+        self.projector_text.setReadOnly(True)
+        self.projector_text.setPlaceholderText('No projector · text only')
+        self.projector_button = button('Choose…', self.choose_projector)
+        self.projector_clear = button('Text only', lambda: self.set_projector(''))
+        self.use_model_button = button('Use selected model', self.use_selected_model)
+        model_page = column(self.models, self.use_model_button, heading('Model properties'), self.details,
+                            QLabel('Selected model’s media projector (reload to apply)'), self.projector_text,
+                            row(self.projector_button, self.projector_clear))
         model_page.layout().setStretch(0, 3)
-        model_page.layout().setStretch(2, 2)
+        model_page.layout().setStretch(3, 2)
         self.right_tabs.addTab(model_page, 'Models')
         self.generation_widgets = []
         gen_page = QWidget()
@@ -377,6 +405,91 @@ class Window(QMainWindow):
     def open_link(self, url):
         if url.scheme() in ('https', 'http'):
             QDesktopServices.openUrl(url)
+        elif url.scheme() == 'lcb-attachment' and self.chat:
+            for message in self.chat['messages']:
+                for item in message.get('attachments', []):
+                    if item['file'] == url.path():
+                        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.store.root / 'attachments' / item['file'])))
+                        return
+
+    def refresh_attachments(self):
+        self.attachment_list.clear()
+        for item in self.attachments:
+            row_item = QListWidgetItem(f'{item["name"]}  ·  {item["kind"]}  ·  {item["size"] / 1024:.0f} KiB')
+            row_item.setToolTip('Saved local copy. Double-click to open. Removing from this message leaves the source file untouched.')
+            self.attachment_list.addItem(row_item)
+        self.attachment_list.setVisible(bool(self.attachments))
+        self.remove_attachment_button.setVisible(bool(self.attachments))
+
+    def preview_attachment(self, item):
+        attachment = self.attachments[self.attachment_list.row(item)]
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.store.root / 'attachments' / attachment['file'])))
+
+    def choose_attachments(self):
+        suffixes = ' '.join('*' + ext for ext, (kind, _) in MEDIA_TYPES.items() if self.modalities.get(kind))
+        paths, _ = QFileDialog.getOpenFileNames(self, 'Attach media · up to 16 MiB per file', '', f'Supported media ({suffixes})')
+        if paths:
+            self.add_attachments(paths)
+
+    def add_attachments(self, paths):
+        if self.busy or self.importing_media or not self.chat:
+            return
+        if len(paths) + len(self.attachments) > 8:
+            self.error('Use at most 8 attachments per message.')
+            return
+        self.importing_media = True
+        chat_id = self.chat['id']
+        self.set_phase('Copying attachments into this chat · source files are left untouched')
+        self.refresh_controls()
+        def done(result):
+            self.importing_media = False
+            if result[0] and self.chat and self.chat['id'] == chat_id:
+                self.attachments.extend(result[1])
+                self.refresh_attachments()
+                self.save_draft()
+                self.set_phase('Attachments ready · add a message and Send')
+            elif not result[0]:
+                self.set_phase('Attachment could not be added · ' + result[1])
+                self.error(result[1])
+            self.refresh_controls()
+        self.job(lambda _job: [self.store.import_attachment(path) for path in paths], done)
+
+    def remove_attachment(self):
+        index = self.attachment_list.currentRow()
+        if not self.busy and not self.importing_media and self.attachments:
+            self.attachments.pop(index if index >= 0 else -1)
+            self.refresh_attachments()
+            self.save_draft()
+            self.refresh_controls()
+
+    def set_projector(self, path):
+        if self.engine.process or self.busy or self.starting_engine or self.settings_loading:
+            return
+        try:
+            self.config.save(self.config.section(self.model_path), 'projector', path)
+        except OSError as exc:
+            self.error('Projector setting could not be saved: ' + str(exc))
+            return
+        self.projector_path = path
+        self.projector_text.setText(Path(path).name if path else '')
+        self.projector_text.setToolTip(path)
+        self.media_status.setText('Projector selected · load to verify media' if path else 'Text only · no projector selected')
+        self.note('Projector: ' + (path or 'Text only'))
+
+    def choose_projector(self):
+        path, _ = QFileDialog.getOpenFileName(self, 'Choose the matching media projector', str(Path(self.model_path).parent), 'GGUF projectors (*.gguf)')
+        if not path:
+            return
+        self.settings_loading = True
+        self.refresh_controls()
+        def done(result):
+            self.settings_loading = False
+            if result[0] and result[1].projector:
+                self.set_projector(path)
+            else:
+                self.error('Choose a multimodal projector GGUF from the same model release.')
+            self.refresh_controls()
+        self.job(lambda _job: self.core.model(path), done)
 
     def note(self, text):
         self.activity.appendPlainText(time.strftime('%H:%M:%S   ') + text)
@@ -407,15 +520,21 @@ class Window(QMainWindow):
         running = self.engine.process is not None or self.starting_engine
         for w in (self.new_button, self.tree, self.workspace_new, self.workspace_edit, self.tabs,
                   self.retry_button, self.resend_button, self.exchange, self.prompt):
-            w.setEnabled(not self.busy)
-        for w in (self.engine_button, self.model_button, self.port):
+            w.setEnabled(not self.busy and not self.importing_media)
+        for w in (self.engine_button, self.model_button, self.port, self.use_model_button):
             w.setEnabled(not self.busy and not running and not self.settings_loading)
         self.load_button.setEnabled(not self.busy and not running and not self.settings_loading)
         self.unload_button.setEnabled(not self.busy and running)
         self.send_button.setEnabled(not self.busy and not self.settings_loading and self.chat is not None and bool(self.model_path) and self.health == 'Ready')
         self.stop_button.setEnabled(self.busy)
-        self.retry_button.setEnabled(not self.busy and self.exchange.count() > 0)
-        self.resend_button.setEnabled(not self.busy and self.exchange.count() > 0)
+        for w in (self.projector_button, self.projector_clear):
+            w.setEnabled(not self.busy and not running and not self.settings_loading and bool(self.model_path))
+        self.attach_button.setEnabled(not self.busy and not self.importing_media and any(self.modalities.values()))
+        self.attach_button.setToolTip('Load a model with its matching projector to enable supported media inputs. Up to 8 files, 16 MiB each.')
+        self.remove_attachment_button.setEnabled(not self.busy and not self.importing_media and bool(self.attachments))
+        self.send_button.setEnabled(self.send_button.isEnabled() and not self.importing_media)
+        self.retry_button.setEnabled(not self.busy and not self.importing_media and self.exchange.count() > 0)
+        self.resend_button.setEnabled(not self.busy and not self.importing_media and self.exchange.count() > 0)
         for w in self.generation_widgets:
             w.setEnabled(not self.busy and not self.settings_loading and bool(self.model_path))
         self.scan_button.setEnabled(not self.scanning)
@@ -473,6 +592,7 @@ class Window(QMainWindow):
         try:
             candidate = copy.deepcopy(self.chat)
             candidate['draft'] = self.prompt.toPlainText()
+            candidate['draft_attachments'] = copy.deepcopy(self.attachments)
             self.store.save('chats', candidate)
             self.chat = candidate
             return True
@@ -485,7 +605,7 @@ class Window(QMainWindow):
             self.save_timer.start()
 
     def open_chat(self, identifier):
-        if self.busy or not self.save_draft():
+        if self.busy or self.importing_media or not self.save_draft():
             return
         index = self.tab_index(identifier)
         self.tabs.blockSignals(True)
@@ -505,6 +625,8 @@ class Window(QMainWindow):
     def show_chat(self):
         self.restoring = True
         self.prompt.setPlainText(self.chat['draft'] if self.chat else '')
+        self.attachments = copy.deepcopy(self.chat.get('draft_attachments', [])) if self.chat else []
+        self.refresh_attachments()
         self.exchange.clear()
         if self.chat:
             for i in range(0, len(self.chat['messages']), 2):
@@ -552,6 +674,14 @@ class Window(QMainWindow):
                     cursor.insertText('\n' + m['error'])
             else:
                 cursor.insertText(m['content'])
+                for item in m.get('attachments', []):
+                    cursor.insertText('\n')
+                    link = QTextCharFormat()
+                    link.setAnchor(True)
+                    link.setAnchorHref('lcb-attachment:' + item['file'])
+                    link.setForeground(QColor('#315f8a'))
+                    cursor.insertText('↳ ' + item['name'] + ' · ' + item['kind'], link)
+                    cursor.setCharFormat(QTextCharFormat())
             cursor.insertBlock(QTextBlockFormat(), QTextCharFormat())
         if prompt is not None:
             self.chat_heading(cursor, 'You', True)
@@ -652,7 +782,7 @@ class Window(QMainWindow):
             self.open_chat(self.tabs.tabData(index))
 
     def close_tab(self, index):
-        if self.busy or index < 0 or not self.save_draft():
+        if self.busy or self.importing_media or index < 0 or not self.save_draft():
             return
         self.tabs.blockSignals(True)
         self.tabs.removeTab(index)
@@ -665,9 +795,9 @@ class Window(QMainWindow):
             self.show_chat()
 
     def new_chat(self):
-        if self.busy or not self.save_draft():
+        if self.busy or self.importing_media or not self.save_draft():
             return
-        if self.chat and self.chat['workspace'] == self.workspace_id and not self.chat['messages'] and not self.chat['draft']:
+        if self.chat and self.chat['workspace'] == self.workspace_id and not self.chat['messages'] and not self.chat['draft'] and not self.attachments:
             self.prompt.setFocus()
             return
         try:
@@ -678,7 +808,7 @@ class Window(QMainWindow):
             self.error(exc)
 
     def delete_chat(self, identifier=None):
-        if self.busy:
+        if self.busy or self.importing_media:
             return
         identifier = identifier if isinstance(identifier, str) else self.chat['id'] if self.chat else None
         if not identifier:
@@ -731,7 +861,7 @@ class Window(QMainWindow):
         dialog.exec()
 
     def retry(self, edit):
-        if self.busy or not self.chat or self.exchange.currentIndex() < 0 or not self.save_draft():
+        if self.busy or self.importing_media or not self.chat or self.exchange.currentIndex() < 0 or not self.save_draft():
             return
         turn = self.exchange.currentIndex()
         prompt = self.chat['messages'][turn * 2]['content']
@@ -758,7 +888,7 @@ class Window(QMainWindow):
 
     def load_settings(self):
         self.g = self.config.generation(self.model_path, self.model_info)
-        self.model_text.setText(self.model_path)
+        self.model_text.setText(Path(self.model_path).name if self.model_path else '')
         self.model_text.setToolTip(self.model_path)
         for i, widget in enumerate(self.generation_widgets):
             widget.blockSignals(True)
@@ -779,19 +909,24 @@ class Window(QMainWindow):
                 return
             self.settings_loading = False
             if result[0]:
-                model = result[1]
+                model, projector = result[1]
                 try:
-                    if model.projector:
-                        raise ValueError('This is a projector companion. Choose a language model GGUF.')
+                    if model_role(model) in ('Projector companion', 'Draft companion'):
+                        raise ValueError('This is a ' + model_role(model).lower() + '. Choose a main chat model GGUF.')
                     if not initial:
                         self.config.import_windows_model(self.model_path, path)
                         self.config.save('engine', 'model', path)
                     self.model_path, self.model_info = path, model
+                    self.projector_path = projector
+                    self.projector_text.setText(Path(projector).name if projector else '')
+                    self.projector_text.setToolTip(projector)
+                    self.modalities = {}
+                    self.media_status.setText('Projector selected · load to verify media' if projector else 'Text only · no matching projector selected')
                     self.show_model_details(model)
                     self.load_settings()
                     self.note('Model selected: ' + model.name)
                     if not self.busy and not self.engine.process:
-                        self.set_phase('Model selected · press Load model, then send a message')
+                        self.set_phase('PTQ1_0 model · requires a compatible PrismML engine; stock b10566 cannot load it' if model.filetype == 143 else 'Model selected · press Load model, then send a message')
                 except (OSError, ValueError) as exc:
                     self.set_phase('Cannot select model · ' + str(exc))
                     self.error(exc)
@@ -801,7 +936,13 @@ class Window(QMainWindow):
             self.refresh_controls()
             if auto_load and result[0] and self.model_path == path and self.model_info and not self.model_info.projector:
                 self.load_model()
-        self.job(lambda _job: self.core.model(path), done)
+        def inspect(_job):
+            model = self.core.model(path)
+            saved = self.config.get(self.config.section(path), 'projector', '__auto__')
+            projector = suggested_projector(self.core, model) if saved == '__auto__' else saved
+            model.projector_hint = projector
+            return model, projector
+        self.job(inspect, done)
 
     def edit_generation(self, field, value):
         if self.busy or not self.model_path:
@@ -897,8 +1038,9 @@ class Window(QMainWindow):
         self.set_phase('Loading model · ' + self.model_name())
         self.refresh_controls()
         exe, model, port, context = self.engine_path, self.model_path, self.port.value(), self.g.context_tokens
+        projector = self.projector_path
         def start(_job):
-            self.engine.start(exe, model, port, context, self.store.root / 'engine.log')
+            self.engine.start(exe, model, port, context, self.store.root / 'engine.log', projector)
         def done(result):
             self.starting_engine = False
             if result[0]:
@@ -918,6 +1060,8 @@ class Window(QMainWindow):
             return
         self.engine.stop()
         self.health = 'Engine offline'
+        self.modalities = {}
+        self.media_status.setText('Text · load a model to check media support')
         self.note('Model unloaded.')
         self.set_phase('Model unloaded · load a model to continue')
         self.refresh_controls()
@@ -943,15 +1087,28 @@ class Window(QMainWindow):
         def probe(_job):
             try:
                 data = json.loads(Transport(port).exchange('/health', timeout=.5, deadline=2))
-                return 'Ready' if data.get('status') == 'ok' else 'Port is not a ready engine'
+                if data.get('status') == 'ok':
+                    props = json.loads(Transport(port).exchange('/props', timeout=.5, deadline=2))
+                    return 'Ready', props.get('modalities', {}), props.get('model_path', '')
+                return 'Port is not a ready engine', {}, ''
             except EngineHTTPError as exc:
-                return 'Loading' if exc.status == 503 else str(exc)
+                return ('Loading' if exc.status == 503 else str(exc)), {}, ''
             except Exception:
-                return 'Loading' if process and process.poll() is None else 'Engine offline'
+                return ('Loading' if process and process.poll() is None else 'Engine offline'), {}, ''
         def done(result):
             self.probing = False
             if port == self.port.value() and process is self.engine.process:
-                health = result[1] if result[0] else 'Engine offline'
+                health, modalities, loaded = result[1] if result[0] else ('Engine offline', {}, '')
+                matches = loaded and os.path.realpath(loaded) == os.path.realpath(self.model_path)
+                self.modalities = modalities if matches and health == 'Ready' else {}
+                missing_video = self.modalities.get('video') and not all(shutil.which(exe) for exe in ('ffmpeg', 'ffprobe'))
+                if missing_video:
+                    self.modalities = dict(self.modalities, video=False)
+                if health == 'Ready' and not matches:
+                    health = 'Different model on this port'
+                kinds = [{'vision': 'Images', 'audio': 'Audio (experimental)', 'video': 'Video'}[key] for key in ('vision', 'audio', 'video') if self.modalities.get(key) is True]
+                self.media_status.setText('Text' + (' + ' + ' + '.join(kinds) if kinds else ' only') + (' · engine capabilities' if health == 'Ready' else ' · load to check media'))
+                self.media_status.setToolTip('Input types reported by the engine; this does not verify output accuracy. Audio quality depends on the model and runtime.' + (' Video requires ffmpeg and ffprobe; on Fedora: sudo dnf install ffmpeg-free.' if missing_video else ''))
                 if health != self.health:
                     self.health = health
                     self.note(health)
@@ -993,7 +1150,11 @@ class Window(QMainWindow):
                 self.models.setRowCount(len(models))
                 self.library_models = {m.path: m for m in models}
                 for i, model in enumerate(models):
-                    name = QTableWidgetItem(model.name)
+                    role = model_role(model)
+                    if role == 'Chat model':
+                        role = 'Media projector found' if model.projector_hint else 'Text only · no projector found'
+                    name = QTableWidgetItem(Path(model.path).stem + '\n' + role)
+                    name.setToolTip(model.name + '\n' + model.path + '\n' + role)
                     name.setData(Qt.UserRole, model.path)
                     size = SizeItem(f'{model.bytes / 1024**3:.2f} GiB')
                     size.setData(Qt.UserRole, model.bytes)
@@ -1018,7 +1179,8 @@ class Window(QMainWindow):
         values = [('Name', model.name), ('Architecture', model.architecture or 'Unspecified'),
                   ('Parameters', model.size or 'Unspecified'), ('File size', f'{model.bytes:,} bytes'),
                   ('Quantization', self.core.lib.model_quant(model.filetype)),
-                  ('Type', 'Projector companion' if model.projector else 'GGUF model'),
+                  ('Type', model_role(model)),
+                  ('Media projector', Path(getattr(model, 'projector_hint', '')).name if getattr(model, 'projector_hint', '') else 'None detected; select a matching projector to enable media'),
                   ('File', Path(model.path).name), ('Location', model.path)]
         self.details.setRowCount(len(values))
         for i, (key, value) in enumerate(values):
@@ -1032,9 +1194,11 @@ class Window(QMainWindow):
             self.set_model(self.models.item(index, 0).data(Qt.UserRole))
 
     def send(self):
-        if self.busy or self.settings_loading or self.starting_engine or not self.chat:
+        if self.busy or self.settings_loading or self.starting_engine or self.importing_media or not self.chat:
             return
         prompt = self.prompt.toPlainText()
+        if not prompt.strip() and self.attachments:
+            prompt = 'Describe the attached media.'
         try:
             text_ok(prompt, MAX_PROMPT, False)
             if not self.model_path:
@@ -1045,6 +1209,7 @@ class Window(QMainWindow):
             self.error(exc)
             return
         messages = copy.deepcopy(self.chat['messages'])
+        attachments = copy.deepcopy(self.attachments)
         instruction = self.store.workspaces[self.chat['workspace']]['master_prompt']
         g = Generation.from_buffer_copy(self.g)
         model = self.model_path
@@ -1059,12 +1224,14 @@ class Window(QMainWindow):
         self.refresh_controls()
         self.render('', prompt)
         def work(job):
-            wire, budget = transport.prepare(self.core, model, messages, instruction, prompt, g)
+            wire, budget = transport.prepare(self.core, model, messages, instruction, prompt, g, attachments, self.store)
             job.budget.emit(budget)
             job.phase.emit('Reading prompt · waiting for the model’s first token')
             return transport.generate(self.core, wire, job.progress.emit, job.telemetry.emit)
         def budget_ready(budget):
             text = f'Context: {budget["prompt"]} + {budget["response"]} reply + 32 / {budget["context"]}; {budget["omitted"]} older exchanges excluded'
+            if budget['prompt'] is None:
+                text = f'Media context: engine checks full history against {budget["context"]} tokens; reply up to {budget["response"]}. No history omitted.'
             self.context_status.setText(text)
             self.note(text + '; all history remains saved.')
         def done(result):
@@ -1079,11 +1246,12 @@ class Window(QMainWindow):
                 reply = result[1]
                 if reply['content'] or reply.get('reasoning_content'):
                     candidate = copy.deepcopy(self.chat)
-                    candidate['messages'].extend([dict(role='user', content=prompt),
+                    candidate['messages'].extend([dict(role='user', content=prompt, attachments=attachments),
                         dict(role='assistant', content=reply['content'] or '[No final answer was emitted.]',
                              reasoning_content=reply.get('reasoning_content', ''), model=self.model_name(),
                              status=reply['status'], error=reply['error'])])
                     candidate['draft'] = ''
+                    candidate['draft_attachments'] = []
                     if len(candidate['messages']) == 2:
                         candidate['title'] = truncate(prompt.replace('\n', ' '), 80)
                     # Keep the generated text in memory if the disk save fails. Closing retries it.
@@ -1115,7 +1283,7 @@ class Window(QMainWindow):
             self.note('Stopping generation; keeping any received text.')
 
     def closeEvent(self, event):
-        if self.starting_engine or self.settings_loading or self.scanning:
+        if self.starting_engine or self.settings_loading or self.scanning or self.importing_media:
             self.scan_cancel.set()
             self.note('Waiting for the current file or engine operation to finish. Close again when it completes.')
             event.ignore()
@@ -1188,14 +1356,18 @@ def apply_theme(app):
         palette.setColor(QPalette.Disabled, role, QColor('#777b72'))
     app.setPalette(palette)
     app.setStyleSheet('''
-        QWidget { font-family: "DejaVu Sans"; font-size: 11px; color: #2f373a; }
+        QWidget { font-family: "DejaVu Sans"; font-size: 12px; color: #2f373a; }
         QMainWindow, QDialog, QWidget { background: #ece9d8; }
         QLineEdit, QPlainTextEdit, QTextBrowser, QTreeWidget, QTableWidget, QSpinBox,
         QDoubleSpinBox, QComboBox { background: white; selection-background-color: #c0d3e0; selection-color: #2f373a; }
-        QTextBrowser#chatTranscript { font-size: 13px; }
-        QLabel#chatPhase { padding: 6px; background: #e4edf3; color: #31546b; }
+        QTextBrowser#chatTranscript { font-size: 14px; border: 1px solid #c8c9c1; border-radius: 5px; }
+        QLabel#chatPhase { padding: 8px; background: #e4edf3; color: #31546b; border-radius: 4px; }
         QLabel#heading { background: #d9d8c9; border: 1px solid #999a91; padding: 3px; font-weight: bold; }
-        QPushButton { padding: 3px 8px; min-height: 18px; }
+        QPushButton { padding: 5px 10px; min-height: 20px; }
+        QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { min-height: 24px; }
+        QTabBar::tab { padding: 6px 10px; }
+        QHeaderView::section { padding: 4px; background: #e2e1d6; border: none; }
+        QListWidget { background: white; border: 1px solid #c8c9c1; }
         QTabBar::tab:selected { background: #c0d3e0; }
         QSplitter::handle { background: #c9c8b9; }
         QWidget:disabled { color: #85877d; }
