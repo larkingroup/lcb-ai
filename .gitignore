@@ -1,5 +1,4 @@
-/build/
-/build-msvc/
+/build*/
 /local/
 /docs/
 /research/
@@ -18,8 +17,57 @@ __pycache__/
 *.cmd
 *.sh
 
-/build-linux/
 !/src/linux/*.py
 
+# Local tests and validation artifacts
 /tests/
 /test/
+**/test_*
+**/*_test.*
+**/*_tests.*
+/Testing/
+/coverage/
+*.gcda
+*.gcno
+*.profraw
+
+# Generated build and release output
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/Makefile
+/build.ninja
+/.ninja_*
+/_deps/
+/dist/
+/release/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dll
+*.exe
+*.dSYM/
+*.tar.gz
+*.zip
+
+# Machine-specific settings and local data
+/.vscode/
+/.idea/
+.env
+.env.*
+*.local
+*.log
+*.gguf
+*.sqlite
+*.sqlite3
+*.db
+.DS_Store
+Thumbs.db
+
+# Private agent instructions
+AGENTS.md
+agents.md
+AGENTS.local.md

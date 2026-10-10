@@ -595,7 +595,6 @@ public:
     return Fl_Double_Window::handle(event);
   }
 
-
 private:
   void guard(const std::function<void()> &fn) {
     try {
