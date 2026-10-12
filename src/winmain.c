@@ -33,6 +33,7 @@ enum { IdModules = 100, IdPrompt, IdSend, IdNew, IdPort, IdExit, IdAbout,
 	IdRecursive, IdModels, IdChatTabs, IdLibraryTabs, IdDetails,
 	IdStop, IdCloseTab, IdGeneration, IdValue, IdViewLeft, IdViewRight, IdViewOutput, IdResetLayout, IdSetup,
 	IdExchange, IdRetry, IdResend, IdDeleteChat, IdOpenChat, IdEngineArguments, IdOutputTabs,
+    IdLatest, IdViewChats, IdChatSearch, IdSidebarMenu,
 	ReplyReady = WM_APP + 1, HealthReady, LibraryReady, StreamReady, BudgetReady, SettingsReady, TelemetryReady };
 
 #define Paper RGB(255,255,255)
@@ -41,10 +42,16 @@ enum { IdModules = 100, IdPrompt, IdSend, IdNew, IdPort, IdExit, IdAbout,
 #define Shadow RGB(153,154,145)
 #define Ink RGB(47,55,58)
 #define Muted RGB(103,113,115)
+#define ThinkingInk RGB(128,133,137)
 #define Blue RGB(192,211,224)
 #define BlueInk RGB(49,76,96)
 
 typedef struct Work Work;
+typedef struct StreamSnapshot StreamSnapshot;
+enum { SidebarSection, SidebarWorkspace, SidebarChat, SidebarEmpty };
+typedef struct SidebarRow { int kind, index, indented, expanded; } SidebarRow;
+typedef struct RecentChat { size_t index; ULONGLONG modified; } RecentChat;
+typedef struct ThinkingSection { LONG start,end; size_t turn; } ThinkingSection;
 struct Work {
 	HWND target;
 	char *request;
@@ -73,7 +80,11 @@ typedef struct SettingsWork {
 
 static struct {
 	HWND window, modules, transcript, prompt, send, fresh;
-	HWND status, port, load, unload, browse, engine, model, activity, outputtabs, thinking, progress;
+	HWND status, port, load, unload, browse, engine, model, activity, outputtabs, progress;
+    HWND latest, explorertoggle, chatstoggle, speed, chatsearch, sidebarmenu;
+    SidebarRow sidebar[StoreChats*2+StoreWorkspaces*2+4];
+    int nsidebar, sidebarhover;
+    wchar_t sidebartip[StoreName];
 	HWND workspace, newworkspace, editworkspace;
 	HWND chattabs, librarytabs, models, folder, recursive, scan, details, master, folderlabel;
 	HWND stop, closetab, generation, value, genhelp;
@@ -83,13 +94,17 @@ static struct {
     ContextBudget budget;
     HANDLE cancel;
     Work *work;
-    int property, treebusy, dragging, leftsize, rightsize, outputsize;
+    int property, sidebarbusy, dragging, leftsize, rightsize, outputsize;
     int settings_pending;
     int model_ok;
     ModelInfo model_info;
     unsigned settings_epoch;
-    int answerstart; size_t streamchars;
-    int hideleft, hideright, hideoutput;
+    int answerstart;
+    int hideleft, hideright, hideoutput, hidechats, followchat;
+    StreamSnapshot *live;
+    ThinkingSection *sections;
+    unsigned char *thinking_closed;
+    size_t nsections, thinking_capacity;
     char tabs[32][33];
     int ntabs;
     double firstseconds;
@@ -126,8 +141,12 @@ static void pollengine(void);
 static int savechat(void);
 static void listchats(void);
 static void listworkspaces(void);
+static void sidebaractivate(int row,int menu);
+static int sidebarchat(int row,char id[33]);
+static void sidebaroptions(void);
 static void showchat(void);
-static void showthinking(void);
+static void render_stream(void);
+static void render_pending(void);
 static void synctabs(void);
 static void opentab(void);
 static void generationrows(void);
@@ -254,12 +273,14 @@ readconfig(void)
     GetPrivateProfileStringW(L"engine", L"extra_arguments", L"", app.extra_arguments, 2048, app.config);
 	GetPrivateProfileStringW(L"library", L"folder", L"", app.libraryfolder, MAX_PATH, app.config);
 	app.recursivevalue=GetPrivateProfileIntW(L"library",L"recursive",1,app.config)!=0;
-    app.leftsize=(int)GetPrivateProfileIntW(L"layout",L"left",210,app.config);
+    app.leftsize=(int)GetPrivateProfileIntW(L"layout",L"left",244,app.config);
     app.rightsize=(int)GetPrivateProfileIntW(L"layout",L"right",280,app.config);
     app.outputsize=(int)GetPrivateProfileIntW(L"layout",L"output",128,app.config);
     app.hideleft=GetPrivateProfileIntW(L"layout",L"hide_left",0,app.config)!=0;
     app.hideright=GetPrivateProfileIntW(L"layout",L"hide_right",0,app.config)!=0;
     app.hideoutput=GetPrivateProfileIntW(L"layout",L"hide_output",0,app.config)!=0;
+    app.hidechats=GetPrivateProfileIntW(L"layout",L"hide_chats",0,app.config)!=0;
+    app.followchat=1;
     app.settings=generation_defaults();
 }
 
@@ -459,20 +480,50 @@ appendstyle(const wchar_t *s, COLORREF color, int bold, int points)
 	SendMessage(app.transcript, EM_REPLACESEL, FALSE, (LPARAM)s);
 }
 
+static void paragraph(int indent)
+{
+    PARAFORMAT2 format={0};
+    format.cbSize=sizeof(format);
+    format.dwMask=PFM_STARTINDENT|PFM_OFFSET|PFM_RIGHTINDENT|PFM_SPACEBEFORE|PFM_SPACEAFTER|PFM_LINESPACING;
+    format.dxStartIndent=indent*15;
+    format.bLineSpacingRule=5; format.dyLineSpacing=22;
+    SendMessageW(app.transcript,EM_SETSEL,(WPARAM)-1,-1);
+    SendMessageW(app.transcript,EM_SETPARAFORMAT,0,(LPARAM)&format);
+}
+
+static void appendspeaker(int assistant)
+{
+    paragraph(0);
+    appendstyle(assistant?L"Assistant says:\r\n":L"You say:\r\n",assistant?BlueInk:Muted,0,9);
+    paragraph(8);
+}
+
 static void markdownspan(void *context,const wchar_t *text,unsigned style)
 {
     CHARFORMAT2W format={0};
-    (void)context;
     format.cbSize=sizeof(format);
     format.dwMask=CFM_COLOR|CFM_BOLD|CFM_ITALIC|CFM_SIZE|CFM_FACE|CFM_BACKCOLOR;
     format.dwEffects=(style&MdBold?CFE_BOLD:0)|(style&MdItalic?CFE_ITALIC:0);
-    format.crTextColor=style&MdQuote?Muted:Ink;
+    format.crTextColor=context?ThinkingInk:style&MdQuote?Muted:Ink;
     format.crBackColor=style&MdCode?RGB(243,241,230):Paper;
-    format.yHeight=(style&MdHeading?12:10)*20;
+    format.yHeight=(context?9:10)*20;
     wcscpy(format.szFaceName,style&MdCode?L"Consolas":L"Tahoma");
     SendMessageW(app.transcript,EM_SETSEL,(WPARAM)-1,-1);
     SendMessageW(app.transcript,EM_SETCHARFORMAT,SCF_SELECTION,(LPARAM)&format);
     SendMessageW(app.transcript,EM_REPLACESEL,FALSE,(LPARAM)text);
+}
+
+static void appendmessage(const char *content,int formatted,int thinking)
+{
+    wchar_t *text=wide(content);
+    size_t length;
+    if(!text) return;
+    length=wcslen(text);
+    while(length && (text[length-1]==L'\r' || text[length-1]==L'\n')) text[--length]=0;
+    paragraph(8);
+    if(formatted) markdown_render(text,markdownspan,thinking?(void *)1:NULL);
+    else appendstyle(text,Ink,0,10);
+    free(text);
 }
 
 static int CALLBACK comparemodels(LPARAM a,LPARAM b,LPARAM context)
@@ -603,13 +654,55 @@ selectmodel(int use)
 	wcscpy(app.modelpath,m->path); SetWindowTextW(app.model,m->name); loadsettings(); saveconfig(); note(L"Model selected. Choose Load to start it.");
 }
 
-static void showthinking(void)
+static void followchat(int follow)
 {
-    Conversation *c=&app.chat.conversation;
-    char *trace=app.turn<c->count/2 ? c->messages[app.turn*2+1].reasoning : NULL;
-    wchar_t *text=trace?wide(trace):NULL;
-    SetWindowTextW(app.thinking,text?text:L"No thinking trace received for this exchange.");
-    free(text);
+    app.followchat=follow;
+    ShowWindow(app.latest,!follow && app.ntabs?SW_SHOW:SW_HIDE);
+}
+static int chatbottom(void)
+{
+    SCROLLINFO info={sizeof(info),SIF_ALL,0,0,0,0,0};
+    if(!GetScrollInfo(app.transcript,SB_VERT,&info)) return 1;
+    return info.nPos>=info.nMax-(int)info.nPage;
+}
+static void latest(void)
+{
+    followchat(1);
+    SendMessageW(app.transcript,EM_SETSEL,(WPARAM)-1,-1);
+    SendMessageW(app.transcript,EM_SCROLLCARET,0,0);
+}
+static void reservethinking(void)
+{
+    size_t count=app.chat.conversation.count/2+1;
+    ThinkingSection *sections;
+    unsigned char *closed;
+    if(count<=app.thinking_capacity) return;
+    sections=realloc(app.sections,count*sizeof(*sections));
+    if(!sections) return;
+    app.sections=sections;
+    closed=realloc(app.thinking_closed,count);
+    if(!closed) return;
+    memset(closed+app.thinking_capacity,1,count-app.thinking_capacity);
+    app.thinking_closed=closed; app.thinking_capacity=count;
+}
+static void appendthinking(const char *trace,size_t turn)
+{
+    CHARRANGE caret;
+    LONG start;
+    int closed=turn<app.thinking_capacity && app.thinking_closed[turn];
+    if(!trace || !trace[0]) return;
+    SendMessageW(app.transcript,EM_EXGETSEL,0,(LPARAM)&caret); start=caret.cpMax;
+    paragraph(8);
+    appendstyle(closed?L"[+] Thinking\r\n":L"[-] Thinking\r\n",ThinkingInk,1,9);
+    SendMessageW(app.transcript,EM_EXGETSEL,0,(LPARAM)&caret);
+    if(app.nsections<app.thinking_capacity) {
+        ThinkingSection *section=&app.sections[app.nsections++];
+        section->start=start; section->end=caret.cpMax; section->turn=turn;
+    }
+    if(!closed) {
+        appendmessage(trace,1,1);
+        appendstyle(L"\r\n\r\n",ThinkingInk,0,9);
+    }
 }
 
 static void
@@ -618,25 +711,20 @@ render(void)
 	Conversation *c = &app.chat.conversation;
 	wchar_t *text;
 	size_t i;
+    POINT scroll;
+    CHARRANGE selection;
+    SendMessageW(app.transcript,EM_GETSCROLLPOS,0,(LPARAM)&scroll);
+    SendMessageW(app.transcript,EM_EXGETSEL,0,(LPARAM)&selection);
+    SendMessageW(app.transcript,WM_SETREDRAW,FALSE,0);
+    reservethinking(); app.nsections=0;
 	SendMessageW(app.exchange,CB_RESETCONTENT,0,0);
 	SetWindowText(app.transcript, L"");
 	if(!app.ntabs) {
-		SetWindowTextW(app.thinking,L"No thinking trace received for this exchange.");
-		appendstyle(L"Choose a conversation or select New.\r\n",Muted,0,10);
-		refreshcontrols(); return;
-	}
-	if(app.budget.omitted_messages) {
-		wchar_t summary[192];
-		swprintf(summary,192,L"Last request: %zu older exchanges were outside the model's context. All remain saved below.\r\n\r\n",app.budget.omitted_messages/2);
-		appendstyle(summary,Muted,0,9);
-	}
-	if(c->count == 0) {
-		appendstyle(L"New conversation\r\n\r\n", BlueInk, 1, 10);
-		appendstyle(app.health==EngineReady?L"Ready. Enter a message below.\r\n\r\n":L"Select a local model, then choose Load.\r\n\r\n", Muted, 0, 9);
-		appendstyle(L"Chats and drafts are saved locally.\r\n", Muted, 0, 9);
+		refreshcontrols();
+        SendMessageW(app.transcript,WM_SETREDRAW,TRUE,0);
+        InvalidateRect(app.transcript,NULL,FALSE); return;
 	}
 	for(i = 0; i < c->count; i++) {
-		wchar_t heading[128];
 		if(i%2==0) {
 			wchar_t item[128];
 			CHARRANGE caret;
@@ -649,30 +737,34 @@ render(void)
 			row=SendMessageW(app.exchange,CB_ADDSTRING,0,(LPARAM)item);
 			SendMessageW(app.transcript,EM_EXGETSEL,0,(LPARAM)&caret);
 			if(row>=0) SendMessageW(app.exchange,CB_SETITEMDATA,(WPARAM)row,caret.cpMax);
-			swprintf(heading,128,L"You - exchange %zu\r\n",i/2+1);
-		} else {
-			static const wchar_t *statuses[]={L"Status not recorded",L"Completed",L"Stopped",L"Response limit",L"Interrupted",L"Ended"};
-			int status=c->messages[i].status;
-			if(status<AnswerUnknown || status>AnswerOther) status=AnswerUnknown;
-			swprintf(heading,128,L"Assistant - %ls\r\n",statuses[status]);
 		}
-		appendstyle(heading,i%2==0?Muted:BlueInk,1,9);
-		text = wide(c->messages[i].text);
-		if(text != NULL) {
-			if(i%2) markdown_render(text,markdownspan,NULL);
-			else appendstyle(text,Ink,0,10);
-			free(text);
-		}
-		appendstyle(L"\r\n\r\n", Ink, 0, 10);
+        appendspeaker((int)(i%2));
+        if(i%2 && c->messages[i].reasoning && c->messages[i].reasoning[0]) {
+            appendthinking(c->messages[i].reasoning,i/2);
+        }
+        appendmessage(c->messages[i].text,(int)(i%2),0);
+        if(i%2) {
+            const wchar_t *state=c->messages[i].status==AnswerStopped?L"Stopped":
+                c->messages[i].status==AnswerLength?L"Response limit reached":
+                c->messages[i].status==AnswerError && !c->messages[i].error[0]?L"Interrupted":NULL;
+            if(state) { appendstyle(L"\r\n",Muted,0,9); appendstyle(state,Muted,0,9); }
+        }
 		if(i%2 && c->messages[i].error[0]) {
 			text=wide(c->messages[i].error);
-			if(text) { appendstyle(text,Muted,0,9); appendstyle(L"\r\n\r\n",Muted,0,9); free(text); }
+			if(text) { appendstyle(L"\r\n",Muted,0,9); appendstyle(text,Muted,0,9); free(text); }
 		}
+        appendstyle(L"\r\n\r\n",Ink,0,10);
 	}
 	SendMessageW(app.exchange,CB_SETCURSEL,app.turn,0);
-    if(!app.busy) showthinking();
+    if(app.busy && app.work) render_pending();
 	refreshcontrols();
-	SendMessage(app.transcript, EM_SCROLLCARET, 0, 0);
+    if(app.followchat) SendMessageW(app.transcript,EM_SCROLLCARET,0,0);
+    else {
+        SendMessageW(app.transcript,EM_EXSETSEL,0,(LPARAM)&selection);
+        SendMessageW(app.transcript,EM_SETSCROLLPOS,0,(LPARAM)&scroll);
+    }
+    SendMessageW(app.transcript,WM_SETREDRAW,TRUE,0);
+    InvalidateRect(app.transcript,NULL,FALSE);
 	InvalidateRect(app.window, NULL, FALSE);
 	InvalidateRect(app.modules, NULL, FALSE);
 }
@@ -719,6 +811,7 @@ refreshcontrols(void)
     EnableWindow(app.chattabs,!app.busy); EnableWindow(app.closetab,app.ntabs && !app.busy);
     EnableWindow(app.generation,!app.busy && !app.settings_pending);
 	EnableWindow(app.modules, !app.busy);
+    EnableWindow(app.chatsearch,!app.busy); EnableWindow(app.sidebarmenu,!app.busy);
 	EnableWindow(app.workspace, !app.busy);
 	EnableWindow(app.newworkspace, !app.busy);
 	EnableWindow(app.editworkspace, !app.busy);
@@ -752,24 +845,55 @@ workfree(Work *w)
 	free(w);
 }
 
-static void streamupdate(const char *text,void *context)
-{
-    Work *w=context;
-    char *copy=malloc(strlen(text)+1);
-    if(!copy) return;
-    strcpy(copy,text);
-    if(!PostMessageW(w->target,StreamReady,0,(LPARAM)copy)) free(copy);
-}
-typedef struct StreamSnapshot {
+struct StreamSnapshot {
     Work *source;
     int total,processed,cached,content;
+    size_t tracebytes;
+    GenerationTimings timings;
     char trace[];
-} StreamSnapshot;
+};
+static void render_stream(void)
+{
+    POINT scroll;
+    CHARRANGE selection;
+    const char *answer;
+    size_t i=0;
+    if(!app.live) return;
+    SendMessageW(app.transcript,EM_GETSCROLLPOS,0,(LPARAM)&scroll);
+    SendMessageW(app.transcript,EM_EXGETSEL,0,(LPARAM)&selection);
+    SendMessageW(app.transcript,WM_SETREDRAW,FALSE,0);
+    SendMessageW(app.transcript,EM_SETSEL,(WPARAM)app.answerstart,-1);
+    SendMessageW(app.transcript,EM_REPLACESEL,FALSE,(LPARAM)L"");
+    while(i<app.nsections && app.sections[i].start<app.answerstart) i++;
+    app.nsections=i;
+    appendthinking(app.live->trace,app.chat.conversation.count/2);
+    answer=app.live->trace+app.live->tracebytes;
+    appendmessage(answer,1,0);
+    if(app.followchat) SendMessageW(app.transcript,EM_SCROLLCARET,0,0);
+    else {
+        SendMessageW(app.transcript,EM_EXSETSEL,0,(LPARAM)&selection);
+        SendMessageW(app.transcript,EM_SETSCROLLPOS,0,(LPARAM)&scroll);
+    }
+    SendMessageW(app.transcript,WM_SETREDRAW,TRUE,0);
+    InvalidateRect(app.transcript,NULL,FALSE);
+}
+static void render_pending(void)
+{
+    CHARRANGE caret;
+    if(!app.chat.conversation.count) SetWindowTextW(app.transcript,L"");
+    appendspeaker(0);
+    appendmessage(app.work->prompt,0,0);
+    appendstyle(L"\r\n\r\n",Ink,0,10);
+    appendspeaker(1);
+    SendMessageW(app.transcript,EM_EXGETSEL,0,(LPARAM)&caret); app.answerstart=caret.cpMax;
+    if(app.live) render_stream();
+    else appendstyle(L"...",Muted,0,9);
+}
 static void streamobserve(const StreamReply *state,void *context)
 {
     Work *w=context;
     size_t size=state->reasoning_used+1;
-    StreamSnapshot *snapshot=malloc(sizeof(*snapshot)+size);
+    StreamSnapshot *snapshot=malloc(sizeof(*snapshot)+size+state->used+1);
     if(state->reasoning_used) {
         char *trace=malloc(size);
         if(trace) { memcpy(trace,state->reasoning,size); free(w->reasoning); w->reasoning=trace; }
@@ -778,6 +902,8 @@ static void streamobserve(const StreamReply *state,void *context)
     snapshot->source=w; snapshot->total=state->progress_total;
     snapshot->processed=state->progress_processed; snapshot->cached=state->progress_cached;
     snapshot->content=state->used!=0; memcpy(snapshot->trace,state->reasoning,size);
+    snapshot->tracebytes=size; snapshot->timings=state->timings;
+    memcpy(snapshot->trace+size,state->text,state->used+1);
     if(!PostMessageW(w->target,TelemetryReady,0,(LPARAM)snapshot)) free(snapshot);
 }
 static DWORD WINAPI
@@ -788,7 +914,7 @@ complete(void *arg)
     if(local_prepare(w->port,w->modelpath,w->conversation,&module,w->prompt,&w->settings,
         w->cancel,&w->request,&w->budget,w->error,sizeof(w->error))) {
         PostMessageW(w->target,BudgetReady,0,(LPARAM)w);
-        w->ok=local_stream_observe(w->port,w->request,w->cancel,streamupdate,streamobserve,w,&w->answer,&w->report,w->error,sizeof(w->error));
+        w->ok=local_stream_observe(w->port,w->request,w->cancel,NULL,streamobserve,w,&w->answer,&w->report,w->error,sizeof(w->error));
     }
     if(WaitForSingleObject(w->cancel,0)==WAIT_OBJECT_0) w->ok=2;
     if(!PostMessageW(w->target,ReplyReady,0,(LPARAM)w)) workfree(w);
@@ -844,21 +970,15 @@ submit(void)
 	w->cancel=CreateEventW(NULL,TRUE,FALSE,NULL);
     if(!w->cancel) { workfree(w); note(L"Cannot create request."); return; }
     app.cancel=w->cancel; app.work=w; app.firstseconds=0;
+    free(app.live); app.live=NULL;
+    followchat(1);
+    SetWindowTextW(app.speed,L"");
     app.started = GetTickCount64();
 	busy(1);
-	note(L"Checking the model and counting conversation tokens...");
+	note(L"Connecting...");
 	render();
-	if(app.chat.conversation.count == 0) SetWindowTextW(app.transcript,L"");
-	appendstyle(L"You\r\n",Muted,1,9);
-	input=wide(w->prompt);
-	if(input) { appendstyle(input,Ink,0,10); free(input); }
-	appendstyle(L"\r\n\r\nAssistant\r\n",BlueInk,1,9);
-    { CHARRANGE caret; SendMessageW(app.transcript,EM_EXGETSEL,0,(LPARAM)&caret); app.answerstart=caret.cpMax; }
-    app.streamchars=0;
-    wcscpy(app.phase,L"Preparing message");
-    SetWindowTextW(app.thinking,L"Waiting for the model’s thinking trace.");
-    SetWindowTextW(app.progress,L"Preparing message");
-    appendstyle(L"Waiting for reply...",Muted,0,9);
+    wcscpy(app.phase,L"Connecting...");
+    SetWindowTextW(app.progress,app.phase);
 	SendMessageW(app.transcript,EM_SCROLLCARET,0,0);
 	thread = CreateThread(NULL, 0, complete, w, 0, NULL);
 	if(thread == NULL) {
@@ -886,6 +1006,7 @@ received(Work *w)
 	wchar_t *error;
 	size_t before = c->count, bytes = c->bytes;
 	app.cancel=NULL; app.work=NULL; busy(0);
+    free(app.live); app.live=NULL;
     SetWindowTextW(app.progress,w->ok==2?L"Stopped":!w->ok?L"Generation failed":L"Completed");
 	if(answer != NULL && conversation_add(c, "user", w->prompt) &&
 	    conversation_add(c, "assistant", w->answer)) {
@@ -897,6 +1018,10 @@ received(Work *w)
 		app.turn=c->count/2-1;
 		app.lastseconds = (double)(GetTickCount64()-app.started)/1000.0;
 		swprintf(summary, 128, L"%ls in %.2f s. %d tokens. First text: %.2f s.", w->ok==2?L"Stopped; partial reply retained":!w->ok?L"Interrupted; partial reply retained":w->report.finish==FinishLength?L"Response limit reached":L"Reply received", app.lastseconds, w->report.tokens, app.firstseconds);
+        if(w->report.timings.tokens_per_second>0) {
+            wchar_t speed[64]; swprintf(speed,64,L"%.1f tok/s",w->report.timings.tokens_per_second);
+            SetWindowTextW(app.speed,speed);
+        } else SetWindowTextW(app.speed,L"");
 		note(summary);
 		SetWindowText(app.prompt, L"");
 		if(before==0 && !strcmp(app.chat.info.title,"New chat")) {
@@ -920,7 +1045,7 @@ received(Work *w)
 	}
 	free(answer);
 	workfree(w);
-	SetFocus(app.prompt);
+    if(app.followchat) SetFocus(app.prompt);
 }
 
 static void
@@ -977,16 +1102,28 @@ static void tooltips(void)
 {
     HWND tips=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,NULL,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,
         CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,app.window,NULL,GetModuleHandleW(NULL),NULL);
-    HWND buttons[]={app.fresh,app.load,app.unload,app.engine,app.browse,app.stop,app.closetab,app.newworkspace,app.editworkspace,app.exchange,app.retry,app.resend};
+    HWND buttons[]={app.fresh,app.load,app.unload,app.engine,app.browse,app.stop,app.closetab,app.newworkspace,app.editworkspace,app.exchange,app.retry,app.resend,
+        app.latest,app.explorertoggle,app.chatstoggle,app.speed};
     const wchar_t *texts[]={L"New conversation (Ctrl+N)",L"Load the selected local model",L"Unload the model from memory",
         L"Choose the local llama.cpp engine",L"Choose an existing GGUF file",L"Stop generation (Escape)",
         L"Close this tab; saved chat is retained (Ctrl+W)",L"Create a workspace",L"Edit workspace name and system instructions",
         L"Select an exchange to view or retry",L"Try this exchange again in a new conversation",
-        L"Edit this message and continue in a new conversation"};
+        L"Edit this message and continue in a new conversation",
+        L"Resume following the response (End)",L"Collapse or expand Chats",
+        L"Collapse or expand open chat tabs",L"Native llama.cpp generation speed, including thinking and answer tokens"};
     size_t i;
     for(i=0;tips && i<sizeof(buttons)/sizeof(buttons[0]);i++) {
         TOOLINFOW tool={0}; tool.cbSize=sizeof(tool); tool.uFlags=TTF_IDISHWND|TTF_SUBCLASS;
         tool.hwnd=app.window; tool.uId=(UINT_PTR)buttons[i]; tool.lpszText=(wchar_t *)texts[i];
+        SendMessageW(tips,TTM_ADDTOOLW,0,(LPARAM)&tool);
+    }
+    if(tips) {
+        TOOLINFOW tool={0}; tool.cbSize=sizeof(tool); tool.uFlags=TTF_IDISHWND|TTF_SUBCLASS;
+        tool.hwnd=app.window; tool.uId=(UINT_PTR)app.modules; tool.lpszText=LPSTR_TEXTCALLBACKW;
+        SendMessageW(tips,TTM_ADDTOOLW,0,(LPARAM)&tool);
+        tool.uId=(UINT_PTR)app.sidebarmenu; tool.lpszText=L"Chat and workspace options";
+        SendMessageW(tips,TTM_ADDTOOLW,0,(LPARAM)&tool);
+        tool.uId=(UINT_PTR)app.chatsearch; tool.lpszText=L"Search chat titles and workspace names";
         SendMessageW(tips,TTM_ADDTOOLW,0,(LPARAM)&tool);
     }
 }
@@ -1051,17 +1188,21 @@ paint(HDC dc)
     wchar_t text[256];
     fill(dc,rect(0,0,w,h),Face);
     classic_edge(dc,rect(2,1,w-4,31),1);
-    line(dc,88,5,88,26,Shadow); line(dc,271,5,271,26,Shadow);
+    line(dc,182,5,182,26,Shadow);
     label(dc,rect(w-96,3,82,23),L"lcb-ai",BlueInk,app.heading,DT_RIGHT);
     if(!app.hideleft) {
-        panel(dc,4,36,p.left-4,p.bottom-41,L"Workspace Explorer",app.activepane==0,ClassicFolder);
+        panel(dc,4,36,p.left-4,p.bottom-41,L"Chats",app.activepane==0,ClassicFolder);
         label(dc,rect(12,p.bottom-27,p.left-20,18),app.dirty?L"Unsaved changes":L"Saved locally",Muted,app.normal,DT_LEFT);
     }
-    panel(dc,x,36,cw,p.bottom-41,L"Conversations",app.activepane==1,ClassicDocument);
+    {
+        wchar_t title[300],*name=wide(app.chat.info.title);
+        swprintf(title,300,L"Conversations%ls%ls",app.hidechats?L" · ":L"",app.hidechats && name?name:L"");
+        panel(dc,x,36,cw,p.bottom-41,title,app.activepane==1,ClassicDocument);
+        free(name);
+    }
     fill(dc,rect(x+2,p.composer,cw-4,21),Face);
     line(dc,x+2,p.composer,x+cw-2,p.composer,Shadow);
-    label(dc,rect(x+8,p.composer+1,100,19),L"Message",Ink,app.normal,DT_LEFT);
-    label(dc,rect(x+cw-181,p.composer+1,174,19),L"Ctrl+Enter to send",Muted,app.normal,DT_RIGHT);
+    label(dc,rect(x+8,p.composer+1,cw-240,19),L"Message · Ctrl+Enter to send",Ink,app.normal,DT_LEFT);
     if(!app.hideright) {
         panel(dc,p.rightx,36,p.right,p.bottom-41,L"Properties and Models",app.activepane==2,ClassicSettings);
         if(tab==0) {
@@ -1071,30 +1212,32 @@ paint(HDC dc)
     }
     if(!app.hideoutput) {
         panel(dc,4,p.bottom,w-8,h-p.bottom-29,L"Output",app.activepane==3,ClassicOutput);
-        if(app.health==EngineLoading) {
-            int i,step=(int)((GetTickCount64()/125)%24);
-            RECT bar=rect(w-184,p.bottom+4,172,14);
-            fill(dc,bar,Paper); classic_edge(dc,bar,0);
-            for(i=0;i<20;i++) if((i-step+24)%24<5)
-                fill(dc,rect(w-181+i*8,p.bottom+7,6,8),RGB(38,116,61));
-            if(app.loadstarted && app.process.process)
-                swprintf(text,256,L"Loading model... %.1f s",(double)(GetTickCount64()-app.loadstarted)/1000.0);
-            else wcscpy(text,L"Loading model...");
-            label(dc,rect(w-414,p.bottom+2,218,18),text,app.activepane==3?Paper:Ink,app.normal,DT_RIGHT);
-        }
     }
     classic_edge(dc,rect(4,h-22,206,20),0);
     classic_edge(dc,rect(213,h-22,260,20),0);
     classic_edge(dc,rect(476,h-22,w-480,20),0);
     label(dc,rect(12,h-22,190,20),app.busy?app.phase:app.health==EngineReady?L"Engine ready":app.health==EngineLoading?L"Loading model...":L"Engine offline",Ink,app.normal,DT_LEFT);
-    if(app.busy) swprintf(text,256,L"Elapsed: %.1f s",(double)(GetTickCount64()-app.started)/1000.0);
-    else swprintf(text,256,L"Last reply: %.2f s",app.lastseconds);
-    label(dc,rect(221,h-22,244,20),text,Muted,app.normal,DT_LEFT);
+    if(app.health==EngineLoading) {
+        int i,step=(int)((GetTickCount64()/125)%16);
+        RECT bar=rect(219,h-18,140,12);
+        fill(dc,bar,Paper); classic_edge(dc,bar,0);
+        for(i=0;i<16;i++) if((i-step+16)%16<5)
+            fill(dc,rect(222+i*8,h-15,6,6),RGB(38,116,61));
+        if(app.loadstarted && app.process.process)
+            swprintf(text,256,L"%.1f s",(double)(GetTickCount64()-app.loadstarted)/1000.0);
+        else wcscpy(text,L"Loading");
+        label(dc,rect(367,h-22,97,20),text,Muted,app.normal,DT_RIGHT);
+    } else {
+        if(app.busy) swprintf(text,256,L"Elapsed: %.1f s",(double)(GetTickCount64()-app.started)/1000.0);
+        else if(app.lastseconds>0) swprintf(text,256,L"Last reply: %.2f s",app.lastseconds);
+        else text[0]=0;
+        label(dc,rect(221,h-22,244,20),text,Muted,app.normal,DT_LEFT);
+    }
     if(app.budget.context_tokens)
         swprintf(text,256,L"%zu saved exchanges | Context: %d + %d reply / %d | %zu older excluded",
             app.chat.conversation.count/2,app.budget.prompt_tokens,app.budget.response_tokens,
             app.budget.context_tokens,app.budget.omitted_messages/2);
-    else swprintf(text,256,L"127.0.0.1:%u   |   %zu saved exchanges   |   Context counted before sending",getport(),app.chat.conversation.count/2);
+    else swprintf(text,256,L"127.0.0.1:%u   |   %zu saved exchanges",getport(),app.chat.conversation.count/2);
     label(dc,rect(485,h-22,w-498,20),text,Muted,app.normal,DT_LEFT);
 }
 
@@ -1110,7 +1253,7 @@ drawbutton(DRAWITEMSTRUCT *d)
 	classic_edge(d->hDC,r,!pressed);
 	GetWindowTextW(d->hwndItem,text,96);
 	switch(d->CtlID) {
-	case IdNew: icon=ClassicDocument; break;
+	case IdNew: break;
 	case IdLoad: case IdSend: icon=ClassicRun; break;
 	case IdStop: case IdUnload: icon=ClassicStop; break;
 	case IdEngine: icon=ClassicEngine; break;
@@ -1123,6 +1266,11 @@ drawbutton(DRAWITEMSTRUCT *d)
 		t.left+=px(23); t.right-=px(4);
 	}
 	if(pressed) OffsetRect(&t,1,1);
+	if(d->CtlID==IdNew) {
+        int x=MulDiv(t.left+t.right,96,app.dpi)/2,y=MulDiv(t.top+t.bottom,96,app.dpi)/2;
+        line(d->hDC,x-5,y,x+6,y,disabled?Muted:Ink);
+        line(d->hDC,x,y-5,x,y+6,disabled?Muted:Ink);
+    } else
 	{
 		HFONT old=SelectObject(d->hDC,app.normal);
 		SetBkMode(d->hDC,TRANSPARENT); SetTextColor(d->hDC,disabled?Muted:Ink);
@@ -1151,14 +1299,132 @@ drawtab(DRAWITEMSTRUCT *d)
 	if(d->itemState&ODS_FOCUS) { InflateRect(&t,-2,-2); DrawFocusRect(d->hDC,&t); }
 }
 
+static void drawsidebar(DRAWITEMSTRUCT *d)
+{
+    SidebarRow *row=(SidebarRow *)d->itemData;
+    RECT r=d->rcItem,t=r;
+    wchar_t text[StoreName];
+    int active=0,hover=(int)d->itemID==app.sidebarhover,inset=9;
+    if(d->itemID==(UINT)-1 || !row) { fill(d->hDC,r,Light); return; }
+    if(row->kind==SidebarChat && (size_t)row->index<app.store.nchats)
+        active=app.ntabs && !strcmp(app.store.chats[row->index].id,app.chat.info.id);
+    fill(d->hDC,r,active?RGB(76,112,157):
+        row->kind==SidebarWorkspace && (size_t)row->index==app.selected?Blue:hover?Face:Light);
+    if(active) {
+        RECT stripe=r; stripe.bottom=stripe.top+px(1);
+        fill(d->hDC,stripe,RGB(145,175,205));
+    }
+    if(row->kind==SidebarWorkspace) {
+        int x=MulDiv(r.left,96,app.dpi),y=MulDiv(r.top,96,app.dpi);
+        if(row->expanded) {
+            line(d->hDC,x+8,y+12,x+11,y+15,BlueInk);
+            line(d->hDC,x+11,y+15,x+14,y+12,BlueInk);
+        } else {
+            line(d->hDC,x+9,y+10,x+12,y+13,BlueInk);
+            line(d->hDC,x+12,y+13,x+9,y+16,BlueInk);
+        }
+        if(app.icons) ImageList_Draw(app.icons,ClassicFolder,d->hDC,r.left+px(20),r.top+px(6),ILD_TRANSPARENT);
+        inset=40;
+    } else if(row->indented) inset=30;
+    t.left+=px(inset); t.right-=px(hover && row->kind!=SidebarSection && row->kind!=SidebarEmpty?30:8);
+    SendMessageW(app.modules,LB_GETTEXT,d->itemID,(LPARAM)text);
+    label(d->hDC,t,text,active?Paper:row->kind==SidebarSection || row->kind==SidebarEmpty?Muted:Ink,
+        row->kind==SidebarSection?app.heading:app.normal,DT_LEFT);
+    if(hover && (row->kind==SidebarChat || row->kind==SidebarWorkspace)) {
+        t=r; t.left=t.right-px(26);
+        label(d->hDC,t,L"...",active?Paper:Muted,app.normal,DT_CENTER);
+    }
+    if((d->itemState&ODS_FOCUS) && GetFocus()==app.modules) {
+        t=r; InflateRect(&t,-px(2),-px(2)); DrawFocusRect(d->hDC,&t);
+    }
+}
+
 static LRESULT CALLBACK
 classiccontrol(HWND window,UINT message,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR data)
 {
 	(void)data;
+    if(window==app.modules) {
+        if(message==WM_MOUSEMOVE || message==WM_LBUTTONDOWN) {
+            POINT point={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+            RECT r,client;
+            LRESULT hit=SendMessageW(window,LB_ITEMFROMPOINT,0,lp);
+            int row=HIWORD(hit)?-1:LOWORD(hit);
+            if(row>=app.nsidebar || row<0 || SendMessageW(window,LB_GETITEMRECT,row,(LPARAM)&r)==LB_ERR || !PtInRect(&r,point)) row=-1;
+            if(message==WM_MOUSEMOVE && row!=app.sidebarhover) {
+                TRACKMOUSEEVENT track={sizeof(track),TME_LEAVE,window,0};
+                app.sidebarhover=row; TrackMouseEvent(&track); InvalidateRect(window,NULL,FALSE);
+            } else if(message==WM_LBUTTONDOWN && row>=0) {
+                if(app.sidebar[row].kind!=SidebarChat && app.sidebar[row].kind!=SidebarWorkspace) return 0;
+                SetFocus(window); SendMessageW(window,LB_SETCURSEL,row,0);
+                GetClientRect(window,&client);
+                sidebaractivate(row,point.x>client.right-px(28));
+                return 0;
+            }
+        } else if(message==WM_MOUSELEAVE) {
+            app.sidebarhover=-1; InvalidateRect(window,NULL,FALSE);
+        } else if(message==WM_KEYDOWN) {
+            int row=(int)SendMessageW(window,LB_GETCURSEL,0,0);
+            if(wp==VK_UP || wp==VK_DOWN) {
+                int step=wp==VK_UP?-1:1;
+                for(int next=row+step;next>=0 && next<app.nsidebar;next+=step)
+                    if(app.sidebar[next].kind==SidebarChat || app.sidebar[next].kind==SidebarWorkspace) {
+                        SendMessageW(window,LB_SETCURSEL,next,0); return 0;
+                    }
+                return 0;
+            }
+            if(row>=0 && row<app.nsidebar) {
+                SidebarRow item=app.sidebar[row];
+                if(wp==VK_RETURN || (item.kind==SidebarWorkspace &&
+                    ((wp==VK_RIGHT && !item.expanded) || (wp==VK_LEFT && item.expanded)))) {
+                    sidebaractivate(row,0); return 0;
+                }
+            }
+        }
+    }
+    if(message==WM_MOUSEWHEEL || message==WM_MOUSEHWHEEL) {
+        POINT point; HWND target;
+        GetCursorPos(&point); target=WindowFromPoint(point);
+        if(target!=window && target!=app.window && IsChild(app.window,target)) {
+            SendMessageW(target,message,wp,lp);
+            return 0;
+        }
+        if(target!=window) return 0;
+        if(window==app.transcript) {
+            DefSubclassProc(window,message,wp,lp);
+            if(message==WM_MOUSEWHEEL)
+                followchat(GET_WHEEL_DELTA_WPARAM(wp)<0 && chatbottom());
+            return 0;
+        }
+    }
+    if(window==app.transcript) {
+        if(message==WM_LBUTTONDOWN) {
+            POINTL point={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+            LONG position=(LONG)SendMessageW(window,EM_CHARFROMPOS,0,(LPARAM)&point);
+            size_t i;
+            followchat(0);
+            for(i=0;i<app.nsections;i++) {
+                ThinkingSection section=app.sections[i];
+                if(position>=section.start && position<section.end && section.turn<app.thinking_capacity) {
+                    app.thinking_closed[section.turn]=!app.thinking_closed[section.turn];
+                    if(app.busy && section.turn==app.chat.conversation.count/2) render_stream();
+                    else render();
+                    return 0;
+                }
+            }
+        } else if(message==WM_VSCROLL || message==WM_KEYDOWN) {
+            if(message==WM_KEYDOWN && wp==VK_END) { latest(); return 0; }
+            if(message==WM_VSCROLL || wp==VK_PRIOR || wp==VK_NEXT ||
+                wp==VK_HOME || wp==VK_UP || wp==VK_DOWN) {
+                LRESULT result=DefSubclassProc(window,message,wp,lp);
+                followchat(chatbottom());
+                return result;
+            }
+        }
+    }
 	if(message==WM_MOUSEMOVE && (GetWindowLongPtrW(window,GWL_STYLE)&BS_TYPEMASK)==BS_OWNERDRAW &&
 	    (window==app.fresh || window==app.load || window==app.unload || window==app.engine ||
 	    window==app.browse || window==app.send || window==app.scan ||
-	    window==app.newworkspace || window==app.editworkspace || window==app.stop || window==app.closetab || window==app.retry || window==app.resend)) {
+	    window==app.newworkspace || window==app.editworkspace || window==app.sidebarmenu || window==app.stop || window==app.closetab || window==app.retry || window==app.resend)) {
 		if(app.hotbutton!=window) {
 			TRACKMOUSEEVENT track={sizeof(track),TME_LEAVE,window,0};
 			HWND previous=app.hotbutton;
@@ -1170,7 +1436,7 @@ classiccontrol(HWND window,UINT message,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PT
 		app.hotbutton=NULL; InvalidateRect(window,NULL,FALSE);
 	} else if(message==WM_SETFOCUS) {
 		int pane=app.activepane;
-		if(window==app.workspace || window==app.modules || window==app.newworkspace || window==app.editworkspace) pane=0;
+		if(window==app.workspace || window==app.modules || window==app.chatsearch || window==app.sidebarmenu || window==app.fresh || window==app.newworkspace || window==app.editworkspace) pane=0;
 		else if(window==app.transcript || window==app.prompt || window==app.master || window==app.chattabs || window==app.send || window==app.exchange || window==app.retry || window==app.resend) pane=1;
 		else if(window==app.models || window==app.details || window==app.librarytabs || window==app.folder || window==app.recursive || window==app.scan || window==app.generation || window==app.value) pane=2;
 		else if(window==app.activity) pane=3;
@@ -1193,20 +1459,35 @@ layout(void)
     p=workbench_layout(w,h,app.hideleft?0:app.leftsize,app.hideright?0:app.rightsize,app.hideoutput?0:app.outputsize);
     x=p.left+5; cw=p.center; tab=TabCtrl_GetCurSel(app.librarytabs);
     left=!app.hideleft; right=!app.hideright; out=!app.hideoutput;
-    place(app.fresh,6,4,76,23); place(app.load,95,4,79,23); place(app.unload,178,4,85,23);
-    place(app.engine,279,4,78,23); place(app.browse,362,4,84,23);
-    place(app.model,453,5,w-645,21); place(app.port,w-185,5,62,21);
+    place(app.load,6,4,79,23); place(app.unload,89,4,85,23);
+    place(app.engine,190,4,78,23); place(app.browse,273,4,84,23);
+    place(app.model,364,5,w-556,21); place(app.port,w-185,5,62,21);
     ShowWindow(app.workspace,SW_HIDE); ShowWindow(app.master,SW_HIDE);
-    place(app.newworkspace,10,61,87,23); place(app.editworkspace,101,61,p.left-109,23);
-    place(app.modules,9,89,p.left-14,p.bottom-122);
-    ShowWindow(app.modules,left?SW_SHOW:SW_HIDE); ShowWindow(app.newworkspace,left?SW_SHOW:SW_HIDE);
-    ShowWindow(app.editworkspace,left?SW_SHOW:SW_HIDE);
+    place(app.fresh,left?p.left-76:7,left?38:64,22,20);
+    place(app.sidebarmenu,p.left-51,38,22,20);
+    place(app.chatsearch,10,65,p.left-16,26);
+    place(app.modules,9,97,p.left-14,p.bottom-130);
+    ShowWindow(app.modules,left?SW_SHOW:SW_HIDE);
+    ShowWindow(app.fresh,left?SW_SHOW:SW_HIDE);
+    ShowWindow(app.chatsearch,left?SW_SHOW:SW_HIDE);
+    ShowWindow(app.sidebarmenu,left?SW_SHOW:SW_HIDE);
+    ShowWindow(app.newworkspace,SW_HIDE); ShowWindow(app.editworkspace,SW_HIDE);
+    place(app.explorertoggle,left?p.left-26:x+3,38,22,20);
+    SetWindowTextW(app.explorertoggle,left?L"<":L">");
+    place(app.chatstoggle,x+cw-25,38,22,20);
+    SetWindowTextW(app.chatstoggle,app.hidechats?L"+":L"-");
     place(app.chattabs,x+2,57,cw-29,25); place(app.closetab,x+cw-25,58,22,22);
-    place(app.exchange,x+7,85,cw-212,260);
-    place(app.retry,x+cw-200,85,62,23);
-    place(app.resend,x+cw-134,85,127,23);
-    place(app.transcript,x+3,112,cw-6,p.composer-114);
-    GetClientRect(app.transcript,&margin); InflateRect(&margin,-px(10),-px(10));
+    ShowWindow(app.chattabs,app.hidechats?SW_HIDE:SW_SHOW);
+    ShowWindow(app.closetab,app.hidechats?SW_HIDE:SW_SHOW);
+    place(app.exchange,x+7,app.hidechats?60:85,cw-212,260);
+    place(app.retry,x+cw-200,app.hidechats?60:85,62,23);
+    place(app.resend,x+cw-134,app.hidechats?60:85,127,23);
+    place(app.transcript,x+3,app.hidechats?87:112,cw-6,p.composer-(app.hidechats?89:114));
+    place(app.speed,x+cw-224,p.composer+1,136,19);
+    place(app.latest,x+cw-83,p.composer+1,80,20);
+    ShowWindow(app.latest,!app.followchat && app.ntabs?SW_SHOW:SW_HIDE);
+    GetClientRect(app.transcript,&margin); InflateRect(&margin,-px(12),-px(8));
+    if(margin.right>margin.left+px(720)) margin.right=margin.left+px(720);
     SendMessageW(app.transcript,EM_SETRECT,0,(LPARAM)&margin);
     place(app.prompt,x+7,p.composer+25,cw-88,69);
     place(app.send,x+cw-74,p.composer+25,66,24);
@@ -1230,12 +1511,11 @@ layout(void)
     place(app.outputtabs,9,p.bottom+24,270,24);
     place(app.progress,290,p.bottom+25,w-308,22);
     place(app.activity,9,p.bottom+51,w-18,h-p.bottom-86);
-    place(app.thinking,9,p.bottom+51,w-18,h-p.bottom-86);
     ShowWindow(app.outputtabs,out?SW_SHOW:SW_HIDE);
     ShowWindow(app.progress,out?SW_SHOW:SW_HIDE);
-    ShowWindow(app.activity,out && TabCtrl_GetCurSel(app.outputtabs)!=1?SW_SHOW:SW_HIDE);
-    ShowWindow(app.thinking,out && TabCtrl_GetCurSel(app.outputtabs)==1?SW_SHOW:SW_HIDE); ShowWindow(app.status,SW_HIDE);
+    ShowWindow(app.activity,out?SW_SHOW:SW_HIDE); ShowWindow(app.status,SW_HIDE);
     ShowWindow(app.value,SW_HIDE); app.property=-1;
+    if(app.followchat) SendMessageW(app.transcript,EM_SCROLLCARET,0,0);
     InvalidateRect(app.window,NULL,FALSE);
 }
 
@@ -1269,40 +1549,118 @@ listworkspaces(void)
 	SendMessageW(app.workspace,CB_SETCURSEL,app.selected,0);
 }
 
+static int recentcompare(const void *a,const void *b)
+{
+    const RecentChat *x=a,*y=b;
+    if(x->modified!=y->modified) return x->modified>y->modified?-1:1;
+    return strcmp(app.store.chats[x->index].id,app.store.chats[y->index].id);
+}
+
+static int workspacecompare(const void *a,const void *b)
+{
+    size_t x=*(const size_t *)a,y=*(const size_t *)b;
+    wchar_t *first=wide(app.store.workspaces[x].name),*second=wide(app.store.workspaces[y].name);
+    int result=first && second?CompareStringOrdinal(first,-1,second,-1,TRUE)-CSTR_EQUAL:0;
+    free(first); free(second);
+    return result?result:strcmp(app.store.workspaces[x].id,app.store.workspaces[y].id);
+}
+
+static void sidebarrow(int kind,int index,int indented,int expanded,const wchar_t *text)
+{
+    LRESULT item;
+    SidebarRow *row;
+    wchar_t title[StoreName]; size_t i=0,j=0;
+    if(app.nsidebar>=(int)(sizeof(app.sidebar)/sizeof(app.sidebar[0]))) return;
+    row=&app.sidebar[app.nsidebar++];
+    row->kind=kind; row->index=index; row->indented=indented; row->expanded=expanded;
+    while(text[i] && j<StoreName-1) {
+        wchar_t c=text[i++];
+        if(c==L'\r') continue;
+        title[j++]=c==L'\n' || c==L'\t'?L' ':c;
+    }
+    title[j]=0;
+    item=SendMessageW(app.modules,LB_ADDSTRING,0,(LPARAM)title);
+    if(item!=LB_ERR && item!=LB_ERRSPACE) SendMessageW(app.modules,LB_SETITEMDATA,(WPARAM)item,(LPARAM)row);
+}
+
+static int sidebarmatches(const char *text,const wchar_t *query)
+{
+    wchar_t *value=wide(text);
+    int result=value && FindStringOrdinal(FIND_FROMSTART,value,-1,query,-1,TRUE)>=0;
+    free(value); return !query[0] || result;
+}
+
 static void
 listchats(void)
 {
     size_t i,j;
-    TVINSERTSTRUCTW item={0};
-    HTREEITEM parent,selected=NULL;
-    wchar_t *name;
-    app.treebusy=1;
-    SendMessageW(app.modules,WM_SETREDRAW,FALSE,0); TreeView_DeleteAllItems(app.modules);
-    item.hInsertAfter=TVI_LAST;
-    item.item.mask=TVIF_TEXT|TVIF_PARAM|TVIF_IMAGE|TVIF_SELECTEDIMAGE;
-    for(i=0;i<app.store.nworkspaces;i++) {
-        name=wide(app.store.workspaces[i].name); item.hParent=TVI_ROOT;
-        item.item.pszText=name?name:L"Workspace"; item.item.lParam=-(LPARAM)(i+1);
-        item.item.iImage=item.item.iSelectedImage=ClassicFolder;
-        parent=TreeView_InsertItem(app.modules,&item); free(name);
-        for(j=0;j<app.store.nchats;j++) if(!strcmp(app.store.chats[j].workspace,app.store.workspaces[i].id)) {
-            HTREEITEM child;
-            name=wide(app.store.chats[j].title); item.hParent=parent;
-            item.item.pszText=name?name:L"Chat"; item.item.lParam=(LPARAM)(j+1);
-            item.item.iImage=item.item.iSelectedImage=ClassicDocument;
-            child=TreeView_InsertItem(app.modules,&item); free(name);
-            if(!strcmp(app.store.chats[j].id,app.chat.info.id)) selected=child;
-        }
-        TreeView_Expand(app.modules,parent,TVE_EXPAND);
+    int selected=-1,top=(int)SendMessageW(app.modules,LB_GETTOPINDEX,0,0),count=0;
+    int cursor=(int)SendMessageW(app.modules,LB_GETCURSEL,0,0),focused_group=-1;
+    wchar_t query[StoreName],*name;
+    RecentChat recent[StoreChats];
+    if(GetFocus()==app.modules && cursor>=0 && cursor<app.nsidebar && app.sidebar[cursor].kind==SidebarWorkspace)
+        focused_group=app.sidebar[cursor].index;
+    GetWindowTextW(app.chatsearch,query,StoreName);
+    for(i=0;i<app.store.nchats;i++) {
+        wchar_t path[MAX_PATH]; WIN32_FILE_ATTRIBUTE_DATA info;
+        recent[i].index=i; recent[i].modified=0;
+        swprintf(path,MAX_PATH,L"%ls\\chats\\%hs.json",app.store.root,app.store.chats[i].id);
+        if(GetFileAttributesExW(path,GetFileExInfoStandard,&info))
+            recent[i].modified=((ULONGLONG)info.ftLastWriteTime.dwHighDateTime<<32)|info.ftLastWriteTime.dwLowDateTime;
     }
-    if(selected) TreeView_SelectItem(app.modules,selected);
+    qsort(recent,app.store.nchats,sizeof(*recent),recentcompare);
+    app.sidebarbusy=1; app.sidebarhover=-1;
+    SendMessageW(app.modules,WM_SETREDRAW,FALSE,0);
+    SendMessageW(app.modules,LB_RESETCONTENT,0,0); app.nsidebar=0;
+    if(!query[0]) {
+        size_t groups[StoreWorkspaces],group;
+        for(i=0;i<app.store.nworkspaces;i++) groups[i]=i;
+        qsort(groups,app.store.nworkspaces,sizeof(*groups),workspacecompare);
+        sidebarrow(SidebarSection,0,0,0,L"Workspaces");
+        for(group=0;group<app.store.nworkspaces;group++) {
+            wchar_t key[33]; int expanded,children=0;
+            i=groups[group];
+            swprintf(key,33,L"%hs",app.store.workspaces[i].id);
+            expanded=GetPrivateProfileIntW(L"workspace-layout",key,0,app.config)!=0;
+            name=wide(app.store.workspaces[i].name);
+            sidebarrow(SidebarWorkspace,(int)i,0,expanded,name?name:L"Workspace"); free(name);
+            if(expanded) {
+                for(j=0;j<app.store.nchats;j++) {
+                    size_t chat=recent[j].index;
+                    if(strcmp(app.store.chats[chat].workspace,app.store.workspaces[i].id)) continue;
+                    name=wide(app.store.chats[chat].title);
+                    sidebarrow(SidebarChat,(int)chat,1,0,name?name:L"Chat"); free(name); children++;
+                    if(!strcmp(app.store.chats[chat].id,app.chat.info.id)) selected=app.nsidebar-1;
+                }
+                if(!children) sidebarrow(SidebarEmpty,0,1,0,L"No chats yet");
+            }
+        }
+    }
+    sidebarrow(SidebarSection,0,0,0,query[0]?L"Search results":L"Recent chats");
+    for(j=0;j<app.store.nchats;j++) {
+        size_t chat=recent[j].index;
+        Workspace *ws=store_find_workspace(&app.store,app.store.chats[chat].workspace);
+        if(!sidebarmatches(app.store.chats[chat].title,query) && !(ws && sidebarmatches(ws->name,query))) continue;
+        name=wide(app.store.chats[chat].title);
+        sidebarrow(SidebarChat,(int)chat,0,0,name?name:L"Chat"); free(name); count++;
+        if(!strcmp(app.store.chats[chat].id,app.chat.info.id) && selected<0) selected=app.nsidebar-1;
+    }
+    if(!count) sidebarrow(SidebarEmpty,0,0,0,query[0]?L"No matching chats":L"No chats yet");
+    if(focused_group>=0)
+        for(i=0;i<(size_t)app.nsidebar;i++)
+            if(app.sidebar[i].kind==SidebarWorkspace && app.sidebar[i].index==focused_group) { selected=(int)i; break; }
+    SendMessageW(app.modules,LB_SETCURSEL,selected,0);
+    SendMessageW(app.modules,LB_SETTOPINDEX,top,0);
     SendMessageW(app.modules,WM_SETREDRAW,TRUE,0); InvalidateRect(app.modules,NULL,TRUE);
-    app.treebusy=0;
+    app.sidebarbusy=0;
 }
 
 static void
 showchat(void)
 {
+    followchat(1);
+    SetWindowTextW(app.speed,L"");
+    if(app.thinking_capacity) memset(app.thinking_closed,1,app.thinking_capacity);
     memset(&app.budget,0,sizeof(app.budget));
 	app.turn=app.chat.conversation.count ? app.chat.conversation.count/2-1 : 0;
 	wchar_t *draft=wide(app.chat.draft), id[33];
@@ -1414,6 +1772,7 @@ static void savelayout(void)
     saveint(L"layout",L"output",app.outputsize);
     saveint(L"layout",L"hide_left",app.hideleft); saveint(L"layout",L"hide_right",app.hideright);
     saveint(L"layout",L"hide_output",app.hideoutput);
+    saveint(L"layout",L"hide_chats",app.hidechats);
 }
 static void synctabs(void)
 {
@@ -1449,7 +1808,7 @@ static void closetab(void)
     if(app.busy || index<0 || !savechat()) return;
     if(app.ntabs==1) {
         app.ntabs=0; synctabs();
-        app.treebusy=1; TreeView_SelectItem(app.modules,NULL); app.treebusy=0;
+        app.sidebarbusy=1; SendMessageW(app.modules,LB_SETCURSEL,(WPARAM)-1,0); app.sidebarbusy=0;
         app.restoring=1; SetWindowTextW(app.prompt,L""); app.restoring=0;
         memset(&app.budget,0,sizeof(app.budget)); render(); return;
     }
@@ -1511,41 +1870,98 @@ static void confirmdelete(const char *id)
         deletechat(target);
 }
 
-static int treechat(HTREEITEM treeitem,char id[33])
+static int sidebarchat(int row,char id[33])
 {
-    TVITEMW item={0}; item.mask=TVIF_PARAM; item.hItem=treeitem;
-    if(!treeitem || !TreeView_GetItem(app.modules,&item) || item.lParam<=0 || (size_t)item.lParam>app.store.nchats) return 0;
-    strcpy(id,app.store.chats[item.lParam-1].id); return 1;
+    SidebarRow item;
+    if(row<0 || row>=app.nsidebar) return 0;
+    item=app.sidebar[row];
+    if(item.kind!=SidebarChat || item.index<0 || (size_t)item.index>=app.store.nchats) return 0;
+    strcpy(id,app.store.chats[item.index].id); return 1;
+}
+
+static void sidebaroptions(void)
+{
+    HMENU menu=CreatePopupMenu(); RECT r; int command;
+    if(!menu || app.busy) { if(menu) DestroyMenu(menu); return; }
+    AppendMenuW(menu,MF_STRING,IdNewWorkspace,L"New workspace...");
+    AppendMenuW(menu,MF_STRING,IdEditWorkspace,L"Workspace settings...");
+    AppendMenuW(menu,MF_SEPARATOR,0,NULL);
+    AppendMenuW(menu,MF_STRING,IdNew,L"New chat");
+    GetWindowRect(app.sidebarmenu,&r);
+    command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,r.left,r.bottom,0,app.window,NULL);
+    DestroyMenu(menu);
+    if(command) SendMessageW(app.window,WM_COMMAND,command,0);
+}
+
+static void sidebaractivate(int row,int options)
+{
+    SidebarRow item;
+    if(app.busy || row<0 || row>=app.nsidebar) return;
+    item=app.sidebar[row];
+    if(item.kind==SidebarChat) {
+        if(options) {
+            RECT r; POINT p;
+            SendMessageW(app.modules,LB_GETITEMRECT,row,(LPARAM)&r);
+            p.x=r.right-px(24); p.y=r.bottom-1; ClientToScreen(app.modules,&p);
+            SendMessageW(app.window,WM_CONTEXTMENU,(WPARAM)app.modules,MAKELPARAM(p.x,p.y));
+        } else if(item.index>=0 && (size_t)item.index<app.store.nchats) activatechat(app.store.chats[item.index].id);
+    } else if(item.kind==SidebarWorkspace && item.index>=0 && (size_t)item.index<app.store.nworkspaces) {
+        wchar_t key[33];
+        swprintf(key,33,L"%hs",app.store.workspaces[item.index].id);
+        if(options) {
+            HMENU menu=CreatePopupMenu(); POINT point; int command;
+            size_t previous=app.selected;
+            if(!menu) return;
+            AppendMenuW(menu,MF_STRING,IdNew,L"New chat");
+            AppendMenuW(menu,MF_STRING,IdEditWorkspace,L"Workspace settings...");
+            GetCursorPos(&point);
+            command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,app.window,NULL);
+            DestroyMenu(menu);
+            if(command==IdNew && savechat()) {
+                if(store_new(&app.store,app.store.workspaces[item.index].id,&app.chat)) {
+                    app.selected=(size_t)item.index; saveint(L"workspace-layout",key,1);
+                    listworkspaces(); showchat();
+                } else note(app.store.error);
+            } else if(command==IdEditWorkspace) {
+                app.selected=(size_t)item.index; workspaceedit(0);
+                app.selected=previous; listworkspaces(); showchat();
+            }
+        } else {
+            saveint(L"workspace-layout",key,!item.expanded); listchats();
+        }
+    }
 }
 
 static void chatmenu(LPARAM position)
 {
     POINT point={GET_X_LPARAM(position),GET_Y_LPARAM(position)};
-    HTREEITEM item;
+    int item;
     HMENU menu;
     char id[33];
     int command, i;
     if(app.busy) return;
     if(point.x==-1 && point.y==-1) {
         RECT r;
-        item=TreeView_GetSelection(app.modules);
-        if(!item || !TreeView_GetItemRect(app.modules,item,&r,TRUE)) return;
+        item=(int)SendMessageW(app.modules,LB_GETCURSEL,0,0);
+        if(item<0 || SendMessageW(app.modules,LB_GETITEMRECT,item,(LPARAM)&r)==LB_ERR) return;
         point.x=r.left; point.y=r.bottom; ClientToScreen(app.modules,&point);
     } else {
-        TVHITTESTINFO hit={0}; hit.pt=point; ScreenToClient(app.modules,&hit.pt);
-        item=TreeView_HitTest(app.modules,&hit);
-        if(!(hit.flags&TVHT_ONITEM)) return;
+        LRESULT hit; POINT local=point; RECT r;
+        ScreenToClient(app.modules,&local);
+        hit=SendMessageW(app.modules,LB_ITEMFROMPOINT,0,MAKELPARAM(local.x,local.y));
+        item=LOWORD(hit);
+        if(HIWORD(hit) || item>=app.nsidebar || SendMessageW(app.modules,LB_GETITEMRECT,item,(LPARAM)&r)==LB_ERR || !PtInRect(&r,local)) return;
     }
-    if(!treechat(item,id)) return;
+    if(!sidebarchat(item,id)) { sidebaractivate(item,1); return; }
     for(i=0;i<app.ntabs;i++) if(!strcmp(app.tabs[i],id)) break;
     menu=CreatePopupMenu(); if(!menu) return;
     AppendMenuW(menu,MF_STRING,IdOpenChat,L"&Open");
     AppendMenuW(menu,MF_STRING|(i<app.ntabs?0:MF_GRAYED),IdCloseTab,L"&Close tab");
     AppendMenuW(menu,MF_SEPARATOR,0,NULL);
     AppendMenuW(menu,MF_STRING,IdDeleteChat,L"&Delete conversation...");
-    TreeView_SelectDropTarget(app.modules,item);
+    SendMessageW(app.modules,LB_SETCURSEL,item,0);
     command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,app.window,NULL);
-    TreeView_SelectDropTarget(app.modules,NULL); DestroyMenu(menu);
+    DestroyMenu(menu);
     if(command==IdOpenChat) activatechat(id);
     else if(command==IdDeleteChat) confirmdelete(id);
     else if(command==IdCloseTab && i<app.ntabs) {
@@ -1713,24 +2129,27 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 		paint(dc); EndPaint(window,&ps); return 0;
 	}
 	case WM_ERASEBKGND: return 1;
+    case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL: return 0;
 	case WM_CTLCOLORSTATIC:
 	case WM_CTLCOLOREDIT:
 	case WM_CTLCOLORLISTBOX: {
 		HDC dc=(HDC)wp;
 		int ispaper=(HWND)lp==app.prompt || (HWND)lp==app.model || (HWND)lp==app.port ||
-		    (HWND)lp==app.activity || (HWND)lp==app.modules || (HWND)lp==app.folder || (HWND)lp==app.master;
+		    (HWND)lp==app.activity || (HWND)lp==app.chatsearch || (HWND)lp==app.folder || (HWND)lp==app.master;
 		SetTextColor(dc,(HWND)lp==app.status?Muted:Ink);
-		SetBkColor(dc,ispaper?Paper:Face);
-		return (LRESULT)(ispaper?app.paper:app.face);
+        if((HWND)lp==app.modules) { SetBkColor(dc,Light); SetDCBrushColor(dc,Light); return (LRESULT)GetStockObject(DC_BRUSH); }
+        SetBkColor(dc,ispaper?Paper:Face);
+        return (LRESULT)(ispaper?app.paper:app.face);
 	}
 	case WM_DRAWITEM: {
 		DRAWITEMSTRUCT *d=(DRAWITEMSTRUCT *)lp;
 		if(d->CtlType==ODT_BUTTON) { drawbutton(d); return TRUE; }
 		if(d->CtlType==ODT_TAB) { drawtab(d); return TRUE; }
+        if(d->CtlType==ODT_LISTBOX && d->CtlID==IdModules) { drawsidebar(d); return TRUE; }
 		break;
 	}
 	case WM_MEASUREITEM:
-		((MEASUREITEMSTRUCT *)lp)->itemHeight=(UINT)px(22); return TRUE;
+		((MEASUREITEMSTRUCT *)lp)->itemHeight=(UINT)px(((MEASUREITEMSTRUCT *)lp)->CtlID==IdModules?28:22); return TRUE;
 	case WM_GETMINMAXINFO:
 		((MINMAXINFO *)lp)->ptMinTrackSize.x=px(1000);
 		((MINMAXINFO *)lp)->ptMinTrackSize.y=px(680);
@@ -1740,10 +2159,6 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 		else if(wp==3) { KillTimer(window,3); savechat(); }
 		else if(wp==2 && (app.busy || app.health==EngineLoading)) {
 			RECT r=rect(0,app.height-24,app.width,24); InvalidateRect(window,&r,FALSE);
-			if(!app.hideoutput && app.health==EngineLoading) {
-				PaneLayout p=workbench_layout(app.width,app.height,app.hideleft?0:app.leftsize,app.hideright?0:app.rightsize,app.outputsize);
-				r=rect(app.width-414,p.bottom+2,404,18); InvalidateRect(window,&r,FALSE);
-			}
 		}
 		return 0;
 	case HealthReady: {
@@ -1765,13 +2180,15 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 	case LibraryReady: modellist((ScanJob *)lp); return 0;
 	case WM_NOTIFY: {
 		NMHDR *n=(NMHDR *)lp;
-        if(n->idFrom==IdModules && n->code==TVN_SELCHANGEDW && !app.treebusy && !app.busy) {
-            LPARAM item=((NMTREEVIEWW *)lp)->itemNew.lParam;
-            if(item>0 && (size_t)item<=app.store.nchats) activatechat(app.store.chats[item-1].id);
-            else if(item<0 && (size_t)(-item)<=app.store.nworkspaces) {
-                SendMessageW(app.workspace,CB_SETCURSEL,(WPARAM)(-item-1),0); switchworkspace();
+        if(n->code==TTN_GETDISPINFOW && ((NMTTDISPINFOW *)lp)->hdr.idFrom==(UINT_PTR)app.modules) {
+            NMTTDISPINFOW *tip=(NMTTDISPINFOW *)lp;
+            if(app.sidebarhover>=0 && app.sidebarhover<app.nsidebar) {
+                SendMessageW(app.modules,LB_GETTEXT,app.sidebarhover,(LPARAM)app.sidebartip);
+                tip->lpszText=app.sidebartip;
             }
-        } else if(n->idFrom==IdGeneration && (n->code==NM_DBLCLK || n->code==NM_RETURN)) editproperty();
+            return 0;
+        }
+        if(n->idFrom==IdGeneration && (n->code==NM_DBLCLK || n->code==NM_RETURN)) editproperty();
         else if(n->idFrom==IdChatTabs && n->code==TCN_SELCHANGE) {
             int index=TabCtrl_GetCurSel(app.chattabs);
             if(index>=0 && index<app.ntabs) activatechat(app.tabs[index]);
@@ -1825,11 +2242,13 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
         case IdDeleteChat: if(app.ntabs) confirmdelete(app.chat.info.id); break;
         case IdValue: if(HIWORD(wp)==EN_KILLFOCUS) commitproperty(); break;
         case IdViewLeft: commitproperty(); app.hideleft=!app.hideleft; layout(); savelayout(); break;
+        case IdViewChats: app.hidechats=!app.hidechats; layout(); savelayout(); break;
+        case IdLatest: latest(); break;
         case IdViewRight: commitproperty(); app.hideright=!app.hideright; layout(); savelayout(); break;
         case IdViewOutput: app.hideoutput=!app.hideoutput; layout(); savelayout(); break;
         case IdResetLayout:
             commitproperty(); app.hideleft=app.hideright=app.hideoutput=0;
-            app.leftsize=210; app.rightsize=280; app.outputsize=128; layout(); savelayout(); break;
+            app.hidechats=0; app.leftsize=244; app.rightsize=280; app.outputsize=128; layout(); savelayout(); break;
         case IdGeneration:
             app.hideright=0; TabCtrl_SetCurSel(app.librarytabs,1); layout(); SetFocus(app.generation); break;
         case IdSend: submit(); break;
@@ -1840,7 +2259,7 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 				LRESULT row=SendMessageW(app.exchange,CB_GETCURSEL,0,0);
 				if(row>=0) {
 					CHARRANGE caret;
-					app.turn=(size_t)row; showthinking();
+					app.turn=(size_t)row; followchat(0);
 					caret.cpMin=caret.cpMax=(LONG)SendMessageW(app.exchange,CB_GETITEMDATA,(WPARAM)row,0);
 					SendMessageW(app.transcript,EM_EXSETSEL,0,(LPARAM)&caret);
 					SendMessageW(app.transcript,EM_SCROLLCARET,0,0);
@@ -1862,7 +2281,11 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 			}
 			break;
 
-		case IdWorkspace: if(HIWORD(wp)==CBN_SELCHANGE) switchworkspace(); break;
+        case IdChatSearch:
+            if(HIWORD(wp)==EN_CHANGE && app.modules) { SendMessageW(app.modules,LB_SETTOPINDEX,0,0); listchats(); }
+            break;
+        case IdSidebarMenu: sidebaroptions(); break;
+        case IdWorkspace: if(HIWORD(wp)==CBN_SELCHANGE) switchworkspace(); break;
 		case IdNewWorkspace: workspaceedit(1); break;
 		case IdEditWorkspace: workspaceedit(0); break;
 		case IdLibrary: app.hideright=0; TabCtrl_SetCurSel(app.librarytabs,2); layout(); SetFocus(app.folder); break;
@@ -1885,45 +2308,31 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
     case TelemetryReady: {
         StreamSnapshot *snapshot=(StreamSnapshot *)lp;
         if(app.busy && app.work==snapshot->source) {
-            wchar_t *trace=wide(snapshot->trace);
-            if(trace) { SetWindowTextW(app.thinking,trace); free(trace); }
-            if(snapshot->content) wcscpy(app.phase,L"Writing answer");
+            free(app.live); app.live=snapshot;
+            if((snapshot->content || snapshot->trace[0]) && !app.firstseconds)
+                app.firstseconds=(double)(GetTickCount64()-app.started)/1000.0;
+            if(snapshot->content) wcscpy(app.phase,L"Replying");
             else if(snapshot->trace[0]) wcscpy(app.phase,L"Thinking");
             else if(snapshot->total>0) swprintf(app.phase,160,L"Reading prompt: %d / %d (%d cached)",
                 snapshot->processed,snapshot->total,snapshot->cached);
             else wcscpy(app.phase,L"Waiting for model");
             SetWindowTextW(app.progress,app.phase);
+            if(snapshot->timings.tokens_per_second>0) {
+                wchar_t speed[64]; swprintf(speed,64,L"%.1f tok/s",snapshot->timings.tokens_per_second);
+                SetWindowTextW(app.speed,speed);
+            }
+            render_stream();
             InvalidateRect(app.window,NULL,FALSE);
+            return 0;
         }
         free(snapshot); return 0;
-    }
-    case StreamReady: {
-        char *part=(char *)lp;
-        if(app.busy && app.work) {
-            wchar_t *text=wide(part);
-            if(text) {
-                size_t count=wcslen(text);
-                if(!app.firstseconds) app.firstseconds=(double)(GetTickCount64()-app.started)/1000.0;
-                SendMessageW(app.transcript,WM_SETREDRAW,FALSE,0);
-                SendMessageW(app.transcript,EM_SETSEL,(WPARAM)app.answerstart,-1);
-                SendMessageW(app.transcript,EM_REPLACESEL,FALSE,(LPARAM)L"");
-                markdown_render(text,markdownspan,NULL);
-                app.streamchars=count;
-                SendMessageW(app.transcript,WM_SETREDRAW,TRUE,0);
-                InvalidateRect(app.transcript,NULL,FALSE);
-                SendMessageW(app.transcript,EM_SCROLLCARET,0,0);
-            }
-            free(text);
-        }
-        free(part); return 0;
     }
     case BudgetReady: {
         Work *w=(Work *)lp;
         wchar_t summary[320];
         app.budget=w->budget;
-        swprintf(summary,320,L"Context: %d prompt + %d reserved reply + 32 safety / %d tokens. %zu older exchanges excluded; all remain saved. Reasoning effort control: %ls.",
-            w->budget.prompt_tokens,w->budget.response_tokens,w->budget.context_tokens,w->budget.omitted_messages/2,
-            w->budget.reasoning_effort_supported?L"advertised":L"not reported (Auto remains available)");
+        swprintf(summary,320,L"Context: %d + %d reply / %d | %zu older excluded",
+            w->budget.prompt_tokens,w->budget.response_tokens,w->budget.context_tokens,w->budget.omitted_messages/2);
         note(summary);
         return 0;
     }
@@ -1934,7 +2343,11 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 		if(!savechat()) { MessageBoxW(window,L"The current chat could not be saved. The window will stay open.",L"lcb-ai",MB_OK|MB_ICONERROR); return 0; }
 		InterlockedExchange(&app.scancancel,1);
 		engine_stop(&app.process); DestroyWindow(window); return 0;
-	case WM_DESTROY: KillTimer(window,1); KillTimer(window,2); PostQuitMessage(0); return 0;
+	case WM_DESTROY:
+        free(app.live); app.live=NULL;
+        free(app.sections); app.sections=NULL;
+        free(app.thinking_closed); app.thinking_closed=NULL; app.thinking_capacity=0;
+        KillTimer(window,1); KillTimer(window,2); PostQuitMessage(0); return 0;
 	}
 	return DefWindowProcW(window,message,wp,lp);
 }
@@ -1996,7 +2409,8 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	AppendMenuW(file,MF_STRING,IdNewWorkspace,L"New &workspace...");
 	AppendMenuW(file,MF_STRING,IdEditWorkspace,L"Workspace &settings...");
 	AppendMenuW(file,MF_SEPARATOR,0,NULL); AppendMenuW(file,MF_STRING,IdExit,L"E&xit");
-    AppendMenuW(view,MF_STRING,IdViewLeft,L"Show / hide &Workspace Explorer");
+    AppendMenuW(view,MF_STRING,IdViewLeft,L"Show / hide &Chats sidebar");
+    AppendMenuW(view,MF_STRING,IdViewChats,L"Show / hide chat &tabs");
     AppendMenuW(view,MF_STRING,IdViewRight,L"Show / hide &Properties");
     AppendMenuW(view,MF_STRING,IdViewOutput,L"Show / hide &Output");
     AppendMenuW(view,MF_SEPARATOR,0,NULL);
@@ -2029,18 +2443,22 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	DwmSetWindowAttribute(app.window,33,&corner,sizeof(corner));
 	DwmSetWindowAttribute(app.window,35,&caption,sizeof(caption));
 	DwmSetWindowAttribute(app.window,36,&text,sizeof(text));
-	app.fresh=control(L"BUTTON",L"&New",WS_TABSTOP|BS_OWNERDRAW,IdNew);
+	app.fresh=control(L"BUTTON",L"+",WS_TABSTOP|BS_OWNERDRAW,IdNew);
 	app.load=control(L"BUTTON",L"&Load",WS_TABSTOP|BS_OWNERDRAW,IdLoad);
 	app.unload=control(L"BUTTON",L"&Unload",WS_TABSTOP|BS_OWNERDRAW,IdUnload);
 	app.engine=control(L"BUTTON",L"&Engine...",WS_TABSTOP|BS_OWNERDRAW,IdEngine);
-	app.status=control(L"STATIC",L"Select a model to begin.",SS_LEFT,0);
+	app.status=control(L"STATIC",L"Ready",SS_LEFT,0);
 	app.workspace=control(L"COMBOBOX",L"Workspace",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,IdWorkspace);
 	app.newworkspace=control(L"BUTTON",L"New...",WS_TABSTOP|BS_OWNERDRAW,IdNewWorkspace);
 	app.editworkspace=control(L"BUTTON",L"Edit...",WS_TABSTOP|BS_OWNERDRAW,IdEditWorkspace);
-	app.modules=control(WC_TREEVIEWW,L"Workspace Explorer",WS_TABSTOP|TVS_HASBUTTONS|TVS_HASLINES|TVS_LINESATROOT|TVS_SHOWSELALWAYS,IdModules);
-    TreeView_SetImageList(app.modules,app.icons,TVSIL_NORMAL);
-    TreeView_SetBkColor(app.modules,Paper); TreeView_SetTextColor(app.modules,Ink);
-    TreeView_SetItemHeight(app.modules,px(21));
+	app.chatsearch=control(L"EDIT",L"",WS_TABSTOP|ES_AUTOHSCROLL,IdChatSearch);
+    SendMessageW(app.chatsearch,EM_SETCUEBANNER,FALSE,(LPARAM)L"Search chats");
+    SendMessageW(app.chatsearch,EM_SETLIMITTEXT,StoreName-1,0);
+    SendMessageW(app.chatsearch,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,MAKELPARAM(px(7),px(7)));
+    app.sidebarmenu=control(L"BUTTON",L"...",WS_TABSTOP|BS_OWNERDRAW,IdSidebarMenu);
+    app.modules=control(L"LISTBOX",L"Chats",WS_TABSTOP|WS_VSCROLL|LBS_NOTIFY|LBS_OWNERDRAWFIXED|LBS_HASSTRINGS|LBS_NOINTEGRALHEIGHT,IdModules);
+    SendMessageW(app.modules,LB_SETITEMHEIGHT,0,px(28));
+    app.sidebarhover=-1;
 	app.transcript=control(MSFTEDIT_CLASS,L"",WS_TABSTOP|WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL,0);
 	SendMessageW(app.transcript,EM_SETBKGNDCOLOR,0,Paper);
 	SendMessageW(app.transcript,EM_EXLIMITTEXT,0,0x7ffffffe);
@@ -2063,11 +2481,10 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	SendMessageW(app.activity,WM_SETFONT,(WPARAM)app.fixed,TRUE);
     app.outputtabs=control(WC_TABCONTROLW,L"Output views",WS_TABSTOP,IdOutputTabs);
     tab.mask=TCIF_TEXT; tab.pszText=L"Session activity"; TabCtrl_InsertItem(app.outputtabs,0,&tab);
-    tab.pszText=L"Thinking"; TabCtrl_InsertItem(app.outputtabs,1,&tab);
-    app.thinking=control(L"EDIT",L"No thinking trace received for this exchange.",
-        WS_TABSTOP|WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL,0);
-    SendMessageW(app.thinking,EM_SETLIMITTEXT,LcbMaxReply,0);
-    SendMessageW(app.thinking,WM_SETFONT,(WPARAM)app.fixed,TRUE);
+    app.latest=control(L"BUTTON",L"Latest",WS_TABSTOP|BS_OWNERDRAW,IdLatest);
+    app.explorertoggle=control(L"BUTTON",L"<",WS_TABSTOP|BS_OWNERDRAW,IdViewLeft);
+    app.chatstoggle=control(L"BUTTON",L"-",WS_TABSTOP|BS_OWNERDRAW,IdViewChats);
+    app.speed=control(L"STATIC",L"",SS_RIGHT,0);
     app.progress=control(L"STATIC",L"Ready",SS_LEFT,0);
 	app.chattabs=control(WC_TABCONTROLW,L"Conversation views",WS_TABSTOP|TCS_OWNERDRAWFIXED|TCS_FIXEDWIDTH,IdChatTabs);
 	TabCtrl_SetPadding(app.chattabs,px(8),px(3));
@@ -2107,9 +2524,9 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	SendMessageW(app.recursive,BM_SETCHECK,app.recursivevalue?BST_CHECKED:BST_UNCHECKED,0);
 	app.scan=control(L"BUTTON",L"Save and scan",WS_TABSTOP|BS_OWNERDRAW,IdScan);
 	if(!app.modules||!app.transcript||!app.prompt||!app.send||!app.port||!app.activity) return 1;
-	tooltips(); layout(); listworkspaces(); showchat(); loadsettings(); refreshcontrols(); note(L"Workspace ready. Select a model, then Load.");
+	tooltips(); layout(); listworkspaces(); showchat(); loadsettings(); refreshcontrols(); note(L"Ready");
 	if(app.store.skipped) note(L"Some saved files could not be loaded. They were left unchanged in the application data folder.");
-	SetTimer(app.window,1,2000,NULL); SetTimer(app.window,2,250,NULL);
+	SetTimer(app.window,1,2000,NULL); SetTimer(app.window,2,125,NULL);
 	ShowWindow(app.window,show); UpdateWindow(app.window); SetFocus(app.prompt);
 	QueryPerformanceCounter(&finish);
 	swprintf(timing,128,L"Interface ready in %.1f ms.",1000.0*(double)(finish.QuadPart-start.QuadPart)/(double)frequency.QuadPart);
@@ -2120,7 +2537,7 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	while(GetMessageW(&msg,NULL,0,0)>0) {
         if(msg.message==WM_KEYDOWN && msg.wParam==VK_DELETE && GetFocus()==app.modules) {
             char id[33];
-            if(treechat(TreeView_GetSelection(app.modules),id)) confirmdelete(id);
+            if(sidebarchat((int)SendMessageW(app.modules,LB_GETCURSEL,0,0),id)) confirmdelete(id);
             continue;
         }
         if(msg.message==WM_KEYDOWN && GetFocus()==app.value) {

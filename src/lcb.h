@@ -67,6 +67,10 @@ double generation_value(const Generation *g, int field);
 int generation_set(Generation *g, int field, double value);
 /* A borrowed suffix of a saved conversation; never free it. */
 Conversation conversation_suffix(const Conversation *c, size_t first);
+typedef struct GenerationTimings {
+    int generated_tokens, prompt_tokens;
+    double generated_ms, prompt_ms, tokens_per_second, prompt_per_second;
+} GenerationTimings;
 typedef struct StreamReply {
 	char line[LcbMaxReply + 1024], text[LcbMaxReply + 1];
 	size_t line_used, used, wire;
@@ -75,9 +79,13 @@ typedef struct StreamReply {
     size_t reasoning_used;
     int progress_total, progress_processed, progress_cached;
     double progress_ms;
+    GenerationTimings timings;
 } StreamReply;
 enum { FinishUnknown, FinishStop, FinishLength, FinishOther };
-typedef struct ReplyReport { int prompt_tokens, tokens, finish, saw_reasoning; } ReplyReport;
+typedef struct ReplyReport {
+    int prompt_tokens, tokens, finish, saw_reasoning;
+    GenerationTimings timings;
+} ReplyReport;
 /* Feed arbitrary network fragments; UTF-8 and JSON may span multiple fragments. */
 int stream_feed(StreamReply *s, const char *data, size_t size);
 char *conversation_generate(const Conversation *c, const Module *module,

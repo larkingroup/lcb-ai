@@ -180,6 +180,7 @@ request_with_settings(const Conversation *c, const Module *module, const char *p
 	    cJSON_AddBoolToObject(root, "stream", g != NULL) == NULL ||
 	    cJSON_AddStringToObject(root, "reasoning_format", "deepseek") == NULL ||
 	    cJSON_AddBoolToObject(root, "return_progress", 1) == NULL ||
+	    cJSON_AddBoolToObject(root, "timings_per_token", 1) == NULL ||
 	    cJSON_AddNumberToObject(root, "sse_ping_interval", 5) == NULL ||
 	    cJSON_AddNumberToObject(root, "max_tokens", g ? g->max_tokens : 1024) == NULL ||
 	    !addmessage(messages, "system", module->instruction))
@@ -240,6 +241,25 @@ char *conversation_generate(const Conversation *c, const Module *module, const c
     if(!generation_valid(g)) return NULL;
     return request_with_settings(c,module,prompt,g,0);
 }
+static void stream_timings(StreamReply *s, const cJSON *root)
+{
+    const cJSON *timings=cJSON_GetObjectItemCaseSensitive(root,"timings"), *value;
+    double *fields[]={&s->timings.generated_ms,&s->timings.prompt_ms,
+        &s->timings.tokens_per_second,&s->timings.prompt_per_second};
+    const char *names[]={"predicted_ms","prompt_ms","predicted_per_second","prompt_per_second"};
+    size_t i;
+    for(i=0;i<4;i++) {
+        value=cJSON_GetObjectItemCaseSensitive(timings,names[i]);
+        if(cJSON_IsNumber(value) && value->valuedouble>=0 && value->valuedouble<1e12)
+            *fields[i]=value->valuedouble;
+    }
+    value=cJSON_GetObjectItemCaseSensitive(timings,"predicted_n");
+    if(cJSON_IsNumber(value) && value->valuedouble>=0 && value->valuedouble<=2147483647.0)
+        s->timings.generated_tokens=value->valueint;
+    value=cJSON_GetObjectItemCaseSensitive(timings,"prompt_n");
+    if(cJSON_IsNumber(value) && value->valuedouble>=0 && value->valuedouble<=2147483647.0)
+        s->timings.prompt_tokens=value->valueint;
+}
 static int stream_line(StreamReply *s)
 {
     cJSON *root, *choices, *delta, *content, *usage, *tokens, *reason;
@@ -292,6 +312,8 @@ static int stream_line(StreamReply *s)
     if(cJSON_IsNumber(tokens) && tokens->valueint>0) s->tokens=tokens->valueint;
     tokens=cJSON_GetObjectItemCaseSensitive(usage,"prompt_tokens");
     if(cJSON_IsNumber(tokens) && tokens->valueint>0) s->prompt_tokens=tokens->valueint;
+    stream_timings(s,root);
+    if(s->timings.generated_tokens>s->tokens) s->tokens=s->timings.generated_tokens;
     cJSON_Delete(root); return 1;
 }
 int stream_feed(StreamReply *s, const char *data, size_t size)

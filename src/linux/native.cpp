@@ -1046,6 +1046,7 @@ Reply Transport::generate(
   reply.reasoning = state->reasoning;
   reply.tokens = state->tokens;
   reply.prompt_tokens = state->prompt_tokens;
+  reply.timings = state->timings;
   if (result == 1 && reply.content.empty() && reply.reasoning.empty()) {
     result = 0;
     reply.error =

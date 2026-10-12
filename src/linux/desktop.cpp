@@ -10,10 +10,10 @@
 #include <FL/Fl_Input.H>
 #include <FL/Fl_Int_Input.H>
 #include <FL/Fl_Menu_Bar.H>
+#include <FL/Fl_Scrollbar.H>
 #include <FL/Fl_Table_Row.H>
 #include <FL/Fl_Tabs.H>
 #include <FL/Fl_Text_Editor.H>
-#include <FL/Fl_Tree.H>
 #include <FL/Fl_Value_Input.H>
 #include <FL/fl_ask.H>
 #include <FL/fl_draw.H>
@@ -24,6 +24,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <cwctype>
 #include <deque>
 #include <fstream>
 #include <iomanip>
@@ -40,9 +41,11 @@ const Fl_Color Face = fl_rgb_color(236, 233, 216),
                Shadow = fl_rgb_color(153, 154, 145),
                Ink = fl_rgb_color(47, 55, 58),
                Muted = fl_rgb_color(103, 113, 115),
+               ThinkingInk = fl_rgb_color(128, 133, 137),
                Blue = fl_rgb_color(192, 211, 224),
                BlueInk = fl_rgb_color(49, 76, 96),
                Title = fl_rgb_color(76, 112, 157);
+const Fl_Boxtype TranscriptFrame = FL_FREE_BOXTYPE;
 void edge(int x, int y, int w, int h, Fl_Color color) {
   fl_color(color);
   fl_rectf(x, y, w, h);
@@ -75,6 +78,7 @@ void theme() {
   Fl::set_boxtype(FL_DOWN_BOX, sunken, 2, 2, 4, 4);
   Fl::set_boxtype(FL_THIN_UP_BOX, raised, 1, 1, 2, 2);
   Fl::set_boxtype(FL_THIN_DOWN_BOX, sunken, 1, 1, 2, 2);
+  Fl::set_boxtype(TranscriptFrame, sunken, 12, 8, 24, 16);
   Fl::set_font(FL_HELVETICA, "DejaVu Sans");
   Fl::set_font(FL_COURIER, "DejaVu Sans Mono");
   Fl::scrollbar_size(15);
@@ -89,7 +93,7 @@ std::string buffer_text(Fl_Text_Buffer &b) {
 void set_text(Fl_Text_Buffer &b, const std::string &s) { b.text(s.c_str()); }
 std::string clean_label(std::string s) {
   for (char &c : s)
-    if (c == '/' || c == '\\' || c == '\t' || c == '\n' || c == '\r')
+    if (c == '\t' || c == '\n' || c == '\r')
       c = ' ';
   return s;
 }
@@ -287,6 +291,187 @@ public:
     return result;
   }
 };
+class ChatSearch : public Fl_Input {
+public:
+  ChatSearch() : Fl_Input(0, 0, 10, 10) { textsize(12); }
+  void draw() override {
+    Fl_Input::draw();
+    if (!*value() && Fl::focus() != this) {
+      fl_color(Muted);
+      fl_font(FL_HELVETICA, 12);
+      fl_draw("Search chats", x() + 8, y(), w() - 16, h(),
+              FL_ALIGN_LEFT | FL_ALIGN_INSIDE | FL_ALIGN_CLIP);
+    }
+  }
+};
+class ChatSidebar : public Fl_Hold_Browser {
+public:
+  enum Kind { Section, Workspace, Chat, Empty };
+  struct Row {
+    Kind kind;
+    std::string id, title;
+    bool expanded = false, indented = false;
+  };
+  std::vector<Row> entries;
+  std::string active, workspace;
+  std::function<void(Row, bool)> action;
+  int hovered = 0;
+  ChatSidebar() : Fl_Hold_Browser(0, 0, 10, 10) {
+    box(FL_THIN_DOWN_BOX);
+    color(Light);
+    selection_color(Light);
+    has_scrollbar(VERTICAL);
+    textsize(12);
+  }
+  void refresh() {
+    int scroll = vposition();
+    clear();
+    hovered = 0;
+    for (const auto &row : entries)
+      add(row.title.c_str());
+    vposition(scroll);
+    redraw();
+  }
+  int item_height(void *) const override { return 28; }
+  int item_width(void *) const override { return 0; }
+  void item_draw(void *item, int X, int Y, int W, int H) const override {
+    int index = lineno(item);
+    if (index < 1 || static_cast<size_t>(index) > entries.size())
+      return;
+    const auto &row = entries[index - 1];
+    bool selected = row.kind == Chat && row.id == active;
+    bool group = row.kind == Workspace;
+    fl_push_clip(X, Y, W, H);
+    fl_color(selected ? Title : group && row.id == workspace ? Blue
+                              : index == hovered ? Face : Light);
+    fl_rectf(X, Y, W, H);
+    if (selected) {
+      fl_color(fl_rgb_color(145, 175, 205));
+      fl_line(X, Y, X + W - 1, Y);
+    }
+    fl_color(selected ? FL_WHITE : row.kind == Section || row.kind == Empty
+                                      ? Muted : Ink);
+    fl_font(row.kind == Section ? FL_HELVETICA_BOLD : FL_HELVETICA, 12);
+    int inset = row.indented ? 30 : 9;
+    if (group) {
+      fl_color(BlueInk);
+      if (row.expanded)
+        fl_polygon(X + 8, Y + 12, X + 14, Y + 12, X + 11, Y + 16);
+      else
+        fl_polygon(X + 9, Y + 10, X + 9, Y + 17, X + 13, Y + 14);
+      fl_color(fl_rgb_color(225, 195, 116));
+      fl_rectf(X + 21, Y + 10, 13, 10);
+      fl_rectf(X + 21, Y + 7, 7, 4);
+      fl_color(fl_rgb_color(142, 118, 65));
+      fl_rect(X + 21, Y + 10, 13, 10);
+      fl_color(Ink);
+      inset = 40;
+    }
+    bool menu = index == hovered && (group || row.kind == Chat);
+    ClassicTable::cell_text(row.title, X + inset, Y, W - inset - (menu ? 30 : 8), H);
+    if (menu) {
+      fl_color(selected ? FL_WHITE : Muted);
+      fl_draw("...", X + W - 26, Y, 22, H, FL_ALIGN_CENTER);
+    }
+    if (item_selected(item) && Fl::focus() == this) {
+      fl_color(selected ? FL_WHITE : Shadow);
+      fl_rect(X + 2, Y + 2, W - 4, H - 4);
+    }
+    fl_pop_clip();
+  }
+  int handle(int event) override {
+    if (event == FL_MOVE || event == FL_ENTER) {
+      auto item = find_item(Fl::event_y());
+      int row = item ? lineno(item) : 0;
+      if (hovered != row) {
+        hovered = row;
+        copy_tooltip(row > 0 ? entries[row - 1].title.c_str() : "");
+        redraw();
+      }
+    } else if (event == FL_LEAVE) {
+      hovered = 0;
+      redraw();
+    } else if (event == FL_PUSH &&
+               !(scrollbar.visible() && Fl::event_inside(&scrollbar))) {
+      auto item = find_item(Fl::event_y());
+      int index = item ? lineno(item) : 0;
+      if (index > 0 && action && active_r()) {
+        auto row = entries[index - 1];
+        if (row.kind != Chat && row.kind != Workspace)
+          return 1;
+        value(index);
+        take_focus();
+        action(row, Fl::event_button() == FL_RIGHT_MOUSE ||
+                    Fl::event_x() > x() + w() -
+                        (scrollbar.visible() ? scrollbar.w() : 0) - 28);
+        return 1;
+      }
+    } else if (event == FL_KEYDOWN && value() > 0 && action) {
+      auto row = entries[value() - 1];
+      int key = Fl::event_key();
+      if (key == FL_Enter || key == FL_KP_Enter ||
+          (row.kind == Workspace && ((key == FL_Right && !row.expanded) ||
+                                    (key == FL_Left && row.expanded)))) {
+        action(row, false);
+        return 1;
+      }
+      if (key == FL_Menu || (key == FL_F + 10 && Fl::event_state(FL_SHIFT))) {
+        action(row, true);
+        return 1;
+      }
+    }
+    if (event == FL_KEYDOWN && (Fl::event_key() == FL_Up || Fl::event_key() == FL_Down)) {
+      int step = Fl::event_key() == FL_Up ? -1 : 1;
+      for (int index = value() + step; index > 0 && index <= size(); index += step)
+        if (entries[index - 1].kind == Chat || entries[index - 1].kind == Workspace) {
+          value(index);
+          if (!displayed(index)) middleline(index);
+          redraw();
+          return 1;
+        }
+      return 1;
+    }
+    return Fl_Hold_Browser::handle(event);
+  }
+};
+class LoadingMeter : public Fl_Widget {
+public:
+  bool running = false;
+  LoadingMeter() : Fl_Widget(0, 0, 10, 10) {
+    tooltip("Loading model. Waiting for the engine to become ready.");
+    hide();
+  }
+  ~LoadingMeter() override { Fl::remove_timeout(animate, this); }
+  void run(bool value) {
+    if (value == running)
+      return;
+    running = value;
+    if (value) {
+      show();
+      Fl::add_timeout(0.125, animate, this);
+    } else {
+      Fl::remove_timeout(animate, this);
+      hide();
+    }
+  }
+  static void animate(void *data) {
+    auto meter = static_cast<LoadingMeter *>(data);
+    meter->redraw();
+    if (meter->running)
+      Fl::repeat_timeout(0.125, animate, data);
+  }
+  void draw() override {
+    sunken(x(), y(), w(), h(), FL_WHITE);
+    int cells = std::max(1, (w() - 6) / 8);
+    auto ticks = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() / 125;
+    int step = ticks % cells;
+    fl_color(fl_rgb_color(38, 116, 61));
+    for (int i = 0; i < cells; ++i)
+      if ((i - step + cells) % cells < 5)
+        fl_rectf(x() + 3 + i * 8, y() + 3, 6, h() - 6);
+  }
+};
 class PaneTitle : public Fl_Box {
 public:
   PaneTitle(const char *text) : Fl_Box(0, 0, 10, 10, text) {}
@@ -301,12 +486,87 @@ public:
                             h());
   }
 };
-class Transcript : public Fl_Text_Display {
+// A wheel event belongs to the display under the pointer, even at its edges.
+// FLTK otherwise offers an unhandled wheel event to unrelated sibling panes.
+class ReadingDisplay : public Fl_Text_Display {
+public:
+  ReadingDisplay() : Fl_Text_Display(0, 0, 10, 10) {}
+  int handle(int event) override {
+    if (event == FL_MOUSEWHEEL) {
+      if (!Fl::event_inside(this))
+        return 0;
+      Fl_Text_Display::handle(event);
+      return 1;
+    }
+    return Fl_Text_Display::handle(event);
+  }
+};
+class Transcript : public ReadingDisplay {
 public:
   std::function<void()> selected;
-  Transcript() : Fl_Text_Display(0, 0, 10, 10) {}
+  std::function<void(bool)> follow_changed;
+  std::function<bool(int)> disclosure;
+  bool following = true;
+  Transcript() {
+    box(TranscriptFrame);
+    mVScrollBar->callback(+[](Fl_Widget *widget, void *data) {
+      auto &display = *static_cast<Transcript *>(data);
+      auto &bar = *static_cast<Fl_Scrollbar *>(widget);
+      Fl_Text_Display::v_scrollbar_cb(&bar, &display);
+      display.follow(bar.value() >= bar.maximum());
+    }, this);
+  }
+  void resize(int X, int Y, int W, int H) override {
+    bool changed = W != w();
+    ReadingDisplay::resize(X, Y, W, H);
+    if (changed)
+      wrap_mode(WRAP_AT_PIXEL, std::max(80, std::min(720, W - 47)));
+  }
+  void follow(bool value) {
+    following = value;
+    if (!value)
+      display_insert_position_hint = 0;
+    if (follow_changed)
+      follow_changed(value);
+  }
+  int view_row() const { return mTopLineNumHint; }
+  int view_column() const { return mHorizOffsetHint; }
+  void latest() {
+    follow(true);
+    insert_position(buffer()->length());
+    show_insert_position();
+  }
   int handle(int event) override {
-    int result = Fl_Text_Display::handle(event);
+    if (event == FL_MOUSEWHEEL && !Fl::event_inside(this))
+      return 0;
+    if (event == FL_PUSH && Fl::event_button() == FL_LEFT_MOUSE &&
+        Fl::event_inside(text_area.x, text_area.y, text_area.w, text_area.h) &&
+        disclosure && disclosure(xy_to_position(Fl::event_x(), Fl::event_y())))
+      return 1;
+    if (event == FL_KEYBOARD && !(Fl::event_state() & (FL_ALT | FL_SHIFT))) {
+      int key = Fl::event_key();
+      if (key == FL_End) {
+        latest();
+        return 1;
+      }
+      if (key == FL_Home || key == FL_Page_Up || key == FL_Page_Down ||
+          key == FL_Up || key == FL_Down) {
+        int step = key == FL_Page_Up || key == FL_Page_Down
+                       ? std::max(1, mNVisibleLines - 1) : 3;
+        int row = key == FL_Home ? 1 : view_row() +
+            ((key == FL_Page_Up || key == FL_Up) ? -step : step);
+        scroll(row, mHorizOffset);
+        follow(mTopLineNumHint >= mVScrollBar->maximum());
+        return 1;
+      }
+    }
+    if (event == FL_MOUSEWHEEL && Fl::event_dy() < 0)
+      follow(false);
+    if (event == FL_PUSH && Fl::event_button() == FL_LEFT_MOUSE)
+      follow(false);
+    int result = ReadingDisplay::handle(event);
+    if (event == FL_MOUSEWHEEL && Fl::event_dy() > 0)
+      follow(!mVScrollBar->visible() || mVScrollBar->value() >= mVScrollBar->maximum());
     if (event == FL_RELEASE && selected)
       selected();
     return result;
@@ -405,14 +665,16 @@ class Window : public Fl_Double_Window {
   ModelInfo info{};
   bool has_info = false, busy = false, working = false, probing = false,
        ready = false, closing = false, restoring = false, dirty = false,
-       show_left = true, show_right = true, show_output = false;
-  int left_width = 204, right_width = 278, output_height = 160;
+       show_left = true, show_right = true, show_output = false,
+       show_chats = true;
+  int left_width = 244, right_width = 278, output_height = 160;
   int stream_prefix = -1;
   std::string rendered_partial, rendered_style;
   std::string active, workspace, engine_path, model_path, projector,
-      phase = "Chat ready. Select a model, then Load.",
-      context_status = "Context counted before sending",
-      health = "Engine offline", partial_prompt, partial_answer;
+      phase = "Ready",
+      context_status,
+      health = "Engine offline", partial_prompt, partial_answer, partial_reasoning;
+  GenerationTimings timings{};
   Json attachments = Json::array();
   std::vector<std::string> open_chats;
   std::vector<ModelInfo> models;
@@ -431,36 +693,47 @@ class Window : public Fl_Double_Window {
   Fl_Menu_Bar *menu = nullptr;
   Fl_Button *new_button, *load_button, *unload_button, *engine_button,
       *model_button, *send_button, *stop_button, *attach_button, *remove_button,
-      *retry_button, *edit_button, *workspace_button;
+      *retry_button, *edit_button, *sidebar_menu, *left_toggle,
+      *chats_toggle, *latest_button;
   Fl_Input *model_name;
   Fl_Int_Input *port_input;
   Fl_Box *brand, *left_header, *center_header, *right_header, *phase_box,
-      *message_header, *status, *media_status, *output_header;
-  Fl_Tree *tree;
+      *message_header, *status, *media_status, *output_header, *speed_box;
+  ChatSidebar *sidebar;
+  Fl_Input *chat_search;
+  LoadingMeter *loading_meter;
+  bool model_loading = false;
+  std::chrono::steady_clock::time_point load_started;
   ChatTabs *tabs;
   Fl_Choice *exchange;
   Transcript *transcript;
   Composer *prompt;
   Fl_Text_Buffer text_buffer, style_buffer, prompt_buffer, activity_buffer,
-      log_buffer, thinking_buffer, master_buffer;
-  Fl_Text_Display::Style_Table_Entry styles[7] = {
+      log_buffer, master_buffer;
+  Fl_Text_Display::Style_Table_Entry styles[13] = {
       {Ink, FL_HELVETICA, 14, 0, FL_WHITE},
-      {BlueInk, FL_HELVETICA_BOLD, 14, 0, FL_WHITE},
+      {BlueInk, FL_HELVETICA, 12, 0, FL_WHITE},
       {Ink, FL_HELVETICA_BOLD, 14, 0, FL_WHITE},
       {Ink, FL_HELVETICA_ITALIC, 14, 0, FL_WHITE},
       {Ink, FL_COURIER, 13, Fl_Text_Display::ATTR_BGCOLOR, Light},
-      {BlueInk, FL_HELVETICA_BOLD, 16, 0, FL_WHITE},
-      {Muted, FL_HELVETICA, 13, 0, FL_WHITE}};
+      {Ink, FL_HELVETICA_BOLD, 14, 0, FL_WHITE},
+      {Muted, FL_HELVETICA, 13, 0, FL_WHITE},
+      {ThinkingInk, FL_HELVETICA, 13, 0, FL_WHITE},
+      {ThinkingInk, FL_HELVETICA_BOLD, 13, 0, FL_WHITE},
+      {ThinkingInk, FL_HELVETICA_ITALIC, 13, 0, FL_WHITE},
+      {ThinkingInk, FL_COURIER, 12, Fl_Text_Display::ATTR_BGCOLOR, Light},
+      {ThinkingInk, FL_HELVETICA_BOLD, 13, 0, FL_WHITE},
+      {Muted, FL_HELVETICA, 12, 0, FL_WHITE}};
   Fl_Hold_Browser *attachment_list;
   ClassicTable *model_list, *details;
   bool descending = false;
   int sort_column = 0;
   Fl_Tabs *right_tabs, *output_tabs;
   Fl_Group *models_page, *generation_page, *library_page, *activity_page,
-      *log_page, *thinking_page;
+      *log_page;
   Fl_Box *properties_label, *projector_label, *generation_help, *folder_label,
       *master_label;
-  Fl_Text_Display *master, *activity, *live_log, *thinking;
+  Fl_Text_Display *master, *activity, *live_log;
   Fl_Input *projector_text, *folder;
   Fl_Button *use_model_button, *projector_button, *projector_clear,
       *folder_button, *scan_button;
@@ -470,7 +743,10 @@ class Window : public Fl_Double_Window {
   Fl_Choice *thinking_choice;
   Divider *left_divider, *right_divider, *output_divider;
   std::map<Fl_Widget *, std::function<void()>> callbacks;
-  std::map<Fl_Tree_Item *, std::pair<bool, std::string>> tree_ids;
+  std::map<std::string, bool> workspace_expanded;
+  std::map<std::pair<std::string, size_t>, bool> thinking_collapsed;
+  struct Disclosure { int start, end; size_t turn; };
+  std::vector<Disclosure> disclosures;
   std::vector<std::pair<int, int>> positions;
 
 public:
@@ -515,7 +791,7 @@ public:
               open_chats.end())
         active = open_chats.empty() ? "" : open_chats.back();
       auto sizes =
-          Json::parse(config.get("linux-layout", "sizes", "[204,730,278]"));
+          Json::parse(config.get("linux-layout", "sizes", "[244,690,278]"));
       if (cJSON_GetArraySize(sizes.p) == 3) {
         left_width =
             std::clamp(cJSON_GetArrayItem(sizes.p, 0)->valueint, 160, 400);
@@ -531,11 +807,19 @@ public:
     }
     show_left = config.get("linux-layout", "left", "1") != "0";
     show_right = config.get("linux-layout", "right", "1") != "0";
+    show_chats = config.get("linux-layout", "chats", "1") != "0";
+    try {
+      auto states = Json::parse(config.get("linux-layout", "workspaces", "{}"));
+      for (const auto &ws : store.workspaces)
+        if (cJSON_IsBool(states.get(ws.first.c_str())))
+          workspace_expanded[ws.first] = cJSON_IsTrue(states.get(ws.first.c_str()));
+    } catch (const std::exception &) {
+    }
     if (active.empty())
       new_chat();
     else
       show_chat();
-    refresh_tree();
+    refresh_sidebar();
     update_generation();
     layout();
     controls();
@@ -563,7 +847,6 @@ public:
     master->buffer(nullptr);
     activity->buffer(nullptr);
     live_log->buffer(nullptr);
-    thinking->buffer(nullptr);
   }
   void resize(int x, int y, int width, int height) override {
     Fl_Double_Window::resize(x, y, width, height);
@@ -571,6 +854,23 @@ public:
       layout();
   }
   int handle(int event) override {
+    if (event == FL_MOUSEWHEEL) {
+      // Route to the pane under the pointer exactly once. Group's fallback
+      // delivery to siblings is inappropriate for independent workbench panes.
+      for (Fl_Widget *widget : std::initializer_list<Fl_Widget *>{transcript,
+           prompt, sidebar, model_list, details, attachment_list, activity,
+           live_log, master})
+        if (widget->visible_r() && widget->active_r() && Fl::event_inside(widget)) {
+          widget->handle(event);
+          return 1;
+        }
+      for (auto field : generation_fields)
+        if (field && field->visible_r() && field->active_r() && Fl::event_inside(field)) {
+          field->handle(event);
+          return 1;
+        }
+      return 1;
+    }
     if ((event == FL_SHORTCUT || event == FL_KEYBOARD) &&
         !(Fl::event_state() & (FL_CTRL | FL_ALT | FL_SHIFT))) {
       int key = Fl::event_key();
@@ -639,7 +939,7 @@ private:
     return i;
   }
   Fl_Text_Display *display(Fl_Text_Buffer &buffer) {
-    auto d = new Fl_Text_Display(0, 0, 10, 10);
+    auto d = new ReadingDisplay();
     d->buffer(&buffer);
     d->textfont(FL_COURIER);
     d->textsize(12);
@@ -684,8 +984,12 @@ private:
       }
     });
     add("&Edit/Workspace settings...", 0, [&] { edit_workspace(false); });
-    add("&View/Workspace Explorer", FL_F + 9, [&] {
+    add("&View/Chats sidebar", FL_F + 9, [&] {
       show_left = !show_left;
+      layout();
+    });
+    add("&View/Open chat tabs", 0, [&] {
+      show_chats = !show_chats;
       layout();
     });
     add("&View/Properties and Models", FL_F + 10, [&] {
@@ -699,7 +1003,8 @@ private:
     add("&View/Reset layout", 0, [&] {
       show_left = show_right = true;
       show_output = false;
-      left_width = 204;
+      show_chats = true;
+      left_width = 244;
       right_width = 278;
       output_height = 160;
       layout();
@@ -716,7 +1021,9 @@ private:
                  "\nLarkin Computing Bureau\n\nNative Linux workbench: "
                  "C++ / FLTK 1.4\nShared C request, model and streaming core.");
     });
-    new_button = button("New", [&] { new_chat(); });
+    new_button = button("+", [&] { new_chat(); });
+    new_button->tooltip("New chat (Ctrl+N)");
+    new_button->labelsize(20);
     load_button = button("@>  Load", [&] { load_model(); });
     unload_button = button("Unload", [&] { unload(); });
     engine_button = button("Engine...", [&] { choose_engine(); });
@@ -739,45 +1046,35 @@ private:
     brand = label("lcb-ai");
     brand->labelfont(FL_HELVETICA_BOLD);
     brand->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
-    left_header = label("Workspace Explorer", true);
-    workspace_button = button("Workspace...", [&] { edit_workspace(false); });
-    tree = new Fl_Tree(0, 0, 10, 10);
-    tree->showroot(0);
-    tree->color(FL_WHITE);
-    tree->selection_color(Blue);
-    tree->item_labelsize(12);
-    tree->item_labelfgcolor(Ink);
-    tree->connectorstyle(FL_TREE_CONNECTOR_DOTTED);
-    bind(tree, [&] {
-      auto item = tree->callback_item();
-      if (!item || !tree_ids.count(item))
-        return;
-      auto id = tree_ids.at(item);
-      if (Fl::event_button() == FL_RIGHT_MOUSE) {
-        Fl_Menu_Item items[4]{};
-        items[0].text = "Open";
-        items[1].text = "Close";
-        items[2].text = "Delete...";
-        if (!id.first) {
-          auto selected = items->popup(Fl::event_x(), Fl::event_y());
-          if (selected == &items[0])
-            open_chat(id.second);
-          else if (selected == &items[1])
-            close_chat(id.second);
-          else if (selected == &items[2]) {
-            open_chat(id.second);
-            delete_chat();
-          }
-        }
-      } else if (id.first) {
-        if (!busy)
-          workspace = id.second;
-      } else
-        open_chat(id.second);
+    left_header = label("Chats", true);
+    left_header->color(Title);
+    left_header->labelcolor(FL_WHITE);
+    remove(new_button);
+    Fl_Group::add(new_button);
+    left_toggle = button("<", [&] {
+      show_left = !show_left;
+      layout();
     });
+    sidebar_menu = button("...", [&] { sidebar_options(); });
+    sidebar_menu->tooltip("Chat and workspace options");
+    chat_search = new ChatSearch();
+    chat_search->tooltip("Search chat titles and workspace names");
+    chat_search->when(FL_WHEN_CHANGED);
+    bind(chat_search, [&] {
+      sidebar->vposition(0);
+      refresh_sidebar();
+    });
+    sidebar = new ChatSidebar();
+    sidebar->action = [&](ChatSidebar::Row row, bool menu) {
+      guard([&] { sidebar_action(row, menu); });
+    };
     center_header = label("Conversations", true);
     center_header->color(Title);
     center_header->labelcolor(FL_WHITE);
+    chats_toggle = button("-", [&] {
+      show_chats = !show_chats;
+      layout();
+    });
     tabs = new ChatTabs();
     tabs->select = [&](const std::string &id, bool close) {
       guard([&] {
@@ -798,13 +1095,41 @@ private:
     phase_box->box(FL_FLAT_BOX);
     phase_box->color(fl_rgb_color(228, 237, 243));
     phase_box->labelcolor(BlueInk);
+    phase_box->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE | FL_ALIGN_CLIP);
+    speed_box = label("");
+    speed_box->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
+    speed_box->labelcolor(Muted);
     transcript = new Transcript();
     transcript->buffer(&text_buffer);
-    transcript->highlight_data(&style_buffer, styles, 7, 'A', nullptr, nullptr);
+    transcript->highlight_data(&style_buffer, styles, 13, 'A', nullptr, nullptr);
     transcript->textsize(14);
     transcript->color(FL_WHITE);
     transcript->selection_color(Blue);
-    transcript->wrap_mode(Fl_Text_Display::WRAP_AT_BOUNDS, 0);
+    latest_button = button("Latest", [&] { transcript->latest(); });
+    latest_button->tooltip("Resume following the response (End)");
+    transcript->follow_changed = [&](bool follow) {
+      visible(latest_button, !follow);
+    };
+    latest_button->hide();
+    transcript->disclosure = [&](int position) {
+      for (const auto &item : disclosures)
+        if (position >= item.start && position < item.end) {
+          transcript->follow(false);
+          auto &collapsed = thinking_collapsed[{active, item.turn}];
+          collapsed = !collapsed;
+          if (busy && item.turn == positions.size()) {
+            rendered_partial.clear();
+            rendered_style.clear();
+            render_partial();
+          } else {
+            // Rebuild saved sections before the streaming tail if necessary.
+            stream_prefix = -1;
+            render(true);
+          }
+          return true;
+        }
+      return false;
+    };
     transcript->selected = [&] {
       if (busy)
         return;
@@ -817,8 +1142,7 @@ private:
         }
       }
     };
-    message_header = label(
-        "Message                                      Ctrl+Enter to send");
+    message_header = label("Message · Ctrl+Enter to send");
     attachment_list = new Fl_Hold_Browser(0, 0, 10, 10);
     attachment_list->textsize(12);
     attachment_list->color(FL_WHITE);
@@ -954,11 +1278,8 @@ private:
     log_page->labelsize(12);
     live_log = display(log_buffer);
     log_page->end();
-    thinking_page = new Fl_Group(0, 0, 10, 10, "Thinking");
-    thinking_page->labelsize(12);
-    thinking = display(thinking_buffer);
-    thinking_page->end();
     output_tabs->end();
+    loading_meter = new LoadingMeter();
     status = label("Engine offline");
     status->box(FL_DOWN_BOX);
     left_divider = new Divider(true);
@@ -989,41 +1310,58 @@ private:
   void layout() {
     place(menu, 0, 0, w(), 22);
     int top = 25;
-    place(new_button, 5, top, 75, 25);
-    place(load_button, 85, top, 75, 25);
-    place(unload_button, 165, top, 75, 25);
-    place(engine_button, 250, top, 84, 25);
-    place(model_button, 339, top, 80, 25);
-    place(model_name, 425, top, w() - 595, 25);
+    place(load_button, 5, top, 75, 25);
+    place(unload_button, 85, top, 75, 25);
+    place(engine_button, 170, top, 84, 25);
+    place(model_button, 259, top, 80, 25);
+    place(model_name, 345, top, w() - 515, 25);
     place(port_input, w() - 165, top, 64, 25);
     place(brand, w() - 94, top, 86, 25);
     int bottom = h() - 27 - (show_output ? output_height + 30 : 0);
     int left = show_left
                    ? std::clamp(left_width, 160,
                                 w() - (show_right ? right_width : 0) - 390)
-                   : 0,
+                   : 28,
         right = show_right ? std::clamp(right_width, 240, w() - left - 390) : 0;
     int cx = left ? left + 12 : 5, cw = w() - cx - right - (right ? 12 : 5),
         rx = w() - right - 5;
     visible(left_header, show_left);
-    visible(workspace_button, show_left);
-    visible(tree, show_left);
+    visible(new_button, show_left);
+    visible(sidebar_menu, show_left);
+    visible(chat_search, show_left);
+    visible(sidebar, show_left);
     visible(left_divider, show_left);
-    place(left_header, 5, 56, left, 22);
-    place(workspace_button, 8, 82, left - 6, 25);
-    place(tree, 7, 111, left - 4, h() - 140);
+    place(left_header, 5, 56, left, 26);
+    place(new_button, left - 77, 58, 24, 22);
+    place(sidebar_menu, left - 51, 58, 24, 22);
+    place(left_toggle, show_left ? left - 25 : 5, 58, 24, 22);
+    left_toggle->copy_label(show_left ? "<" : ">");
+    left_toggle->tooltip(show_left ? "Collapse Chats (F9)" : "Expand Chats (F9)");
+    place(chat_search, 8, 88, left - 6, 26);
+    place(sidebar, 7, 120, left - 4, h() - 149);
     place(left_divider, left + 5, 56, 6, h() - 83);
     place(center_header, cx, 56, cw, 22);
+    center_header->copy_label(("Conversations · " +
+        (active.empty() ? std::string("No open chat")
+                        : store.chats.at(active).str("title"))).c_str());
+    place(chats_toggle, cx + cw - 26, 56, 24, 22);
+    chats_toggle->copy_label(show_chats ? "-" : "+");
+    chats_toggle->tooltip(show_chats ? "Collapse open chat tabs"
+                                    : "Expand open chat tabs");
+    visible(tabs, show_chats);
     place(tabs, cx, 80, cw, 28);
-    place(exchange, cx + 2, 112, cw - 205, 25);
-    place(retry_button, cx + cw - 199, 112, 62, 25);
-    place(edit_button, cx + cw - 132, 112, 130, 25);
-    place(phase_box, cx + 2, 141, cw - 4, 26);
+    int chat_top = show_chats ? 112 : 82;
+    place(exchange, cx + 2, chat_top, cw - 205, 25);
+    place(retry_button, cx + cw - 199, chat_top, 62, 25);
+    place(edit_button, cx + cw - 132, chat_top, 130, 25);
+    place(phase_box, cx + 2, chat_top + 29, cw - 150, 26);
+    place(speed_box, cx + cw - 146, chat_top + 29, 142, 26);
     bool has_attachments = cJSON_GetArraySize(attachments.p) > 0;
     int extra = has_attachments ? 45 : 0;
     int composer = bottom - 123 - extra;
-    place(transcript, cx, 171, cw, composer - 171);
-    place(message_header, cx + 4, composer + 2, cw - 8, 22);
+    place(transcript, cx, chat_top + 59, cw, composer - chat_top - 59);
+    place(message_header, cx + 4, composer + 2, cw - 90, 22);
+    place(latest_button, cx + cw - 82, composer + 2, 80, 22);
     visible(attachment_list, has_attachments);
     place(attachment_list, cx, composer + 27, cw, 42);
     int ay = composer + 27 + extra;
@@ -1075,11 +1413,14 @@ private:
     place(output_divider, cx, bottom + 1, cw, 7);
     place(output_header, cx, bottom + 8, cw, 22);
     place(output_tabs, cx, bottom + 32, cw, output_height - 6);
-    for (auto page : {activity_page, log_page, thinking_page})
+    for (auto page : {activity_page, log_page})
       place(page, cx + 2, bottom + 58, cw - 4, output_height - 34);
-    for (auto display : {activity, live_log, thinking})
+    for (auto display : {activity, live_log})
       place(display, cx + 4, bottom + 60, cw - 8, output_height - 38);
-    place(status, 5, h() - 24, w() - 10, 21);
+    place(status, 5, h() - 24, w() - (model_loading ? 163 : 10), 21);
+    place(loading_meter, w() - 151, h() - 21, 143, 15);
+    if (transcript->following)
+      transcript->latest();
     redraw();
   }
   template <class Fn> void launch(Fn fn) {
@@ -1134,6 +1475,7 @@ private:
         std::string detail = e.what();
         post([this, detail] {
           working = false;
+          if (!engine.owned()) model_loading = false;
           set_phase(detail);
           error(detail);
           controls();
@@ -1199,8 +1541,13 @@ private:
         }
         bool became_ready = online && !ready;
         ready = online;
+        if (online || exit) model_loading = false;
+        else if (loading && !model_loading) {
+          model_loading = true;
+          load_started = std::chrono::steady_clock::now();
+        } else if (!loading && !engine.owned()) model_loading = false;
         if (became_ready && !busy)
-          set_phase("Model ready. Write a message and Send.");
+          set_phase("Ready");
         health = online           ? "Engine ready"
                  : loading        ? "Engine loading"
                  : engine.owned() ? "Engine starting"
@@ -1218,7 +1565,7 @@ private:
   }
   void controls() {
     bool idle = !busy && !working && !closing;
-    for (auto w : {new_button, engine_button, model_button, workspace_button,
+    for (auto w : {new_button, engine_button, model_button, sidebar_menu,
                    scan_button, folder_button, use_model_button,
                    projector_button, projector_clear, attach_button,
                    remove_button, retry_button, edit_button}) {
@@ -1227,6 +1574,10 @@ private:
       else
         w->deactivate();
     }
+    if (idle) { sidebar->activate(); chat_search->activate(); }
+    else { sidebar->deactivate(); chat_search->deactivate(); }
+    loading_meter->run(model_loading);
+    place(status, 5, h() - 24, w() - (model_loading ? 163 : 10), 21);
     if (idle && ready && !model_path.empty() && !active.empty())
       send_button->activate();
     else
@@ -1259,8 +1610,14 @@ private:
       else
         f->deactivate();
     }
-    auto line = health + "  |  127.0.0.1:" + std::string(port_input->value()) +
-                "  |  " + context_status;
+    std::string state = health;
+    if (model_loading) {
+      auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::steady_clock::now() - load_started).count();
+      state = "Loading model... " + std::to_string(seconds) + "s";
+    }
+    auto line = state + "  |  127.0.0.1:" + std::string(port_input->value());
+    if (!context_status.empty()) line += "  |  " + context_status;
     status->copy_label(line.c_str());
   }
   unsigned short port() {
@@ -1292,27 +1649,141 @@ private:
   void set_phase(const std::string &s) {
     phase = s;
     phase_box->copy_label(s.c_str());
+    phase_box->copy_tooltip(s.c_str());
     note(s);
   }
-  void refresh_tree() {
-    tree_ids.clear();
-    tree->clear();
-    tree->root(new Fl_Tree_Item(tree));
-    for (const auto &ws : store.workspaces) {
-      auto parent =
-          tree->insert(tree->root(), clean_label(ws.second.str("name")).c_str(),
-                       tree->root()->children());
-      tree_ids[parent] = {true, ws.first};
-      for (const auto &chat : store.chats)
-        if (chat.second.str("workspace") == ws.first) {
-          auto child = tree->insert(
-              parent, clean_label(chat.second.str("title")).c_str(),
-              parent->children());
-          tree_ids[child] = {false, chat.first};
-          if (chat.first == active)
-            tree->select(child, 0);
+  void update_speed() {
+    std::ostringstream label, detail;
+    label << std::fixed << std::setprecision(1);
+    if (timings.tokens_per_second > 0)
+      label << timings.tokens_per_second << " tok/s";
+    speed_box->copy_label(label.str().c_str());
+    detail << "Generation speed";
+    if (timings.generated_tokens > 0)
+      detail << "\n" << timings.generated_tokens << " generated tokens in "
+             << std::fixed << std::setprecision(2) << timings.generated_ms / 1000 << "s";
+    if (timings.prompt_per_second > 0)
+      detail << "\nPrompt processing: " << std::fixed << std::setprecision(1)
+             << timings.prompt_per_second << " tok/s";
+    speed_box->copy_tooltip(detail.str().c_str());
+  }
+  void sidebar_options() {
+    Fl_Menu_Item items[4]{};
+    items[0].text = "New workspace...";
+    items[1].text = "Workspace settings...";
+    items[2].text = "New chat";
+    auto selected = items->popup(sidebar_menu->x(), sidebar_menu->y() + sidebar_menu->h());
+    if (selected == &items[0]) edit_workspace(true);
+    else if (selected == &items[1]) edit_workspace(false);
+    else if (selected == &items[2]) new_chat();
+  }
+  void sidebar_action(const ChatSidebar::Row &row, bool menu) {
+    if (busy || working)
+      return;
+    if (row.kind == ChatSidebar::Workspace) {
+      if (menu) {
+        Fl_Menu_Item items[3]{};
+        items[0].text = "New chat";
+        items[1].text = "Workspace settings...";
+        auto selected = items->popup(Fl::event_x(), Fl::event_y());
+        if (!selected) return;
+        auto previous = workspace;
+        workspace = row.id;
+        if (selected == &items[0]) {
+          workspace_expanded[row.id] = true;
+          new_chat();
+        } else {
+          edit_workspace(false);
+          workspace = previous;
+          set_text(master_buffer, store.workspaces.at(workspace).str("master_prompt"));
+          refresh_sidebar();
         }
+      } else {
+        workspace_expanded[row.id] = !row.expanded;
+        refresh_sidebar();
+      }
+    } else if (row.kind == ChatSidebar::Chat) {
+      if (menu) {
+        Fl_Menu_Item items[4]{};
+        items[0].text = "Open";
+        items[1].text = "Close tab";
+        items[2].text = "Delete...";
+        auto selected = items->popup(Fl::event_x(), Fl::event_y());
+        if (selected == &items[0]) open_chat(row.id);
+        else if (selected == &items[1]) close_chat(row.id);
+        else if (selected == &items[2]) {
+          open_chat(row.id);
+          if (active == row.id) delete_chat();
+        }
+      } else open_chat(row.id);
     }
+  }
+  void refresh_sidebar() {
+    ChatSidebar::Row previous{};
+    bool had_selection = sidebar->value() > 0 &&
+        static_cast<size_t>(sidebar->value()) <= sidebar->entries.size();
+    if (had_selection) previous = sidebar->entries[sidebar->value() - 1];
+    int scroll = sidebar->vposition();
+    auto query = wide(chat_search->value());
+    std::transform(query.begin(), query.end(), query.begin(), towlower);
+    auto matches = [&](const std::string &text) {
+      auto value = wide(text);
+      std::transform(value.begin(), value.end(), value.begin(), towlower);
+      return value.find(query) != std::wstring::npos;
+    };
+    std::vector<std::pair<std::string, fs::file_time_type>> recent;
+    for (const auto &chat : store.chats) {
+      std::error_code ec;
+      auto time = fs::last_write_time(store.root / "chats" / (chat.first + ".json"), ec);
+      recent.emplace_back(chat.first, ec ? fs::file_time_type::min() : time);
+    }
+    std::sort(recent.begin(), recent.end(), [](const auto &a, const auto &b) {
+      return a.second != b.second ? a.second > b.second : a.first < b.first;
+    });
+    auto &rows = sidebar->entries;
+    rows.clear();
+    if (query.empty()) {
+      rows.push_back({ChatSidebar::Section, "", "Workspaces"});
+      std::vector<std::pair<std::string, std::string>> groups;
+      for (const auto &ws : store.workspaces)
+        groups.emplace_back(ws.second.str("name"), ws.first);
+      std::sort(groups.begin(), groups.end());
+      for (const auto &ws : groups) {
+        bool expanded = workspace_expanded[ws.second];
+        rows.push_back({ChatSidebar::Workspace, ws.second, clean_label(ws.first), expanded});
+        if (expanded) {
+          int count = 0;
+          for (const auto &chat : recent)
+            if (store.chats.at(chat.first).str("workspace") == ws.second) {
+              rows.push_back({ChatSidebar::Chat, chat.first,
+                              clean_label(store.chats.at(chat.first).str("title")), false, true});
+              ++count;
+            }
+          if (!count) rows.push_back({ChatSidebar::Empty, "", "No chats yet", false, true});
+        }
+      }
+    }
+    rows.push_back({ChatSidebar::Section, "", query.empty() ? "Recent chats" : "Search results"});
+    int count = 0;
+    for (const auto &entry : recent) {
+      const auto &chat = store.chats.at(entry.first);
+      if (matches(chat.str("title")) || matches(store.workspaces.at(chat.str("workspace")).str("name"))) {
+        rows.push_back({ChatSidebar::Chat, entry.first, clean_label(chat.str("title"))});
+        ++count;
+      }
+    }
+    if (!count) rows.push_back({ChatSidebar::Empty, "", query.empty() ? "No chats yet" : "No matching chats"});
+    sidebar->active = active;
+    sidebar->workspace = workspace;
+    sidebar->refresh();
+    for (size_t i = 0; i < rows.size(); ++i)
+      if (had_selection ? rows[i].kind == previous.kind && rows[i].id == previous.id &&
+                          rows[i].indented == previous.indented
+                        : rows[i].kind == ChatSidebar::Chat && rows[i].id == active) {
+        sidebar->value(static_cast<int>(i) + 1);
+        break;
+      }
+    sidebar->vposition(scroll);
   }
   void refresh_tabs() {
     tabs->entries.clear();
@@ -1328,7 +1799,11 @@ private:
     Json candidate = store.chats.at(active);
     candidate.set("draft", buffer_text(prompt_buffer));
     candidate.set("draft_attachments", attachments);
-    store.save("chats", candidate);
+    const auto &saved = store.chats.at(active);
+    auto saved_attachments = saved.get("draft_attachments")
+                                 ? saved.object("draft_attachments").dump() : "[]";
+    if (saved.str("draft") != candidate.str("draft") || saved_attachments != attachments.dump())
+      store.save("chats", candidate);
     dirty = false;
   }
   void open_chat(const std::string &id) {
@@ -1345,11 +1820,17 @@ private:
     }
     active = id;
     show_chat();
-    refresh_tree();
+    refresh_sidebar();
   }
-  void show_chat() {
+  void show_chat(bool preserve_view = false) {
     if (active.empty())
       return;
+    if (!preserve_view) {
+      timings = {};
+      update_speed();
+      context_status.clear();
+      controls();
+    }
     const auto &chat = store.chats.at(active);
     workspace = chat.str("workspace");
     restoring = true;
@@ -1373,9 +1854,8 @@ private:
     if (count)
       exchange->value(count - 1);
     refresh_attachments();
-    render();
+    render(preserve_view);
     refresh_tabs();
-    select_exchange(false);
     layout();
   }
   void new_chat() {
@@ -1410,13 +1890,14 @@ private:
         attachments = Json::array();
         set_text(text_buffer, "");
         set_text(style_buffer, "");
-        set_text(thinking_buffer, "");
+        disclosures.clear();
         exchange->clear();
         refresh_attachments();
       } else
         show_chat();
     }
     refresh_tabs();
+    refresh_sidebar();
     layout();
   }
   void delete_chat() {
@@ -1434,35 +1915,75 @@ private:
       new_chat();
     else
       show_chat();
-    refresh_tree();
+    refresh_sidebar();
   }
   void append(std::string &text, std::string &style, const std::string &s,
               char code) {
     text += s;
     style.append(s.size(), code);
   }
-  void markdown(std::string &text, std::string &style, const std::string &s) {
+  void message_text(std::string &text, std::string &style, const std::string &s,
+                    char code) {
+    for (char c : s) {
+      if (c == '\r') continue;
+      if (c != '\n' && (text.empty() || text.back() == '\n'))
+        append(text, style, "  ", code);
+      text += c;
+      style += code;
+    }
+  }
+  void message_end(std::string &text, std::string &style, char code = 'A') {
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
+      text.pop_back();
+      style.pop_back();
+    }
+    append(text, style, "\n\n", code);
+  }
+  void markdown(std::string &text, std::string &style, const std::string &s,
+                bool thinking = false) {
     struct Output {
       Window *window;
       std::string *text, *style;
-    } out{this, &text, &style};
+      bool thinking;
+    } out{this, &text, &style, thinking};
     markdown_render(
         wide(s).c_str(),
         +[](void *v, const wchar_t *s, unsigned flags) {
           auto &o = *static_cast<Output *>(v);
-          char code = flags & MdCode      ? 'E'
+          char code = o.thinking
+                      ? (flags & MdCode ? 'K' : flags & MdHeading ? 'L'
+                         : flags & MdBold ? 'I' : flags & MdItalic ? 'J' : 'H')
+                      : flags & MdCode      ? 'E'
                       : flags & MdHeading ? 'F'
                       : flags & MdBold    ? 'C'
                       : flags & MdItalic  ? 'D'
                       : flags & MdQuote   ? 'G'
                                           : 'A';
-          o.window->append(*o.text, *o.style, utf8(s), code);
+          o.window->message_text(*o.text, *o.style, utf8(s), code);
         },
         &out);
   }
+  void thinking_section(std::string &text, std::string &style,
+                        const std::string &trace, size_t turn, int offset = 0) {
+    if (trace.empty())
+      return;
+    bool collapsed = thinking_collapsed.try_emplace(std::make_pair(active, turn), true).first->second;
+    int start = offset + static_cast<int>(text.size());
+    append(text, style, collapsed ? "  [+] Thinking\n" : "  [-] Thinking\n", 'I');
+    disclosures.push_back({start, offset + static_cast<int>(text.size()), turn});
+    if (!collapsed) {
+      markdown(text, style, trace, true);
+      message_end(text, style, 'H');
+    }
+  }
   void render_partial() {
     std::string text, style;
+    disclosures.erase(std::remove_if(disclosures.begin(), disclosures.end(),
+        [&](const Disclosure &d) { return d.start >= stream_prefix; }),
+        disclosures.end());
+    thinking_section(text, style, partial_reasoning, positions.size(), stream_prefix);
     markdown(text, style, partial_answer);
+    if (text.empty()) append(text, style, "  ...", 'G');
     size_t common = 0;
     while (common < text.size() && common < rendered_partial.size() &&
            text[common] == rendered_partial[common] &&
@@ -1472,24 +1993,32 @@ private:
            (static_cast<unsigned char>(text[common]) & 0xc0) == 0x80)
       --common;
     if (common != text.size() || common != rendered_partial.size()) {
+      int row = transcript->view_row(), column = transcript->view_column();
       auto offset = stream_prefix + static_cast<int>(common);
       style_buffer.replace(offset, style_buffer.length(),
                            style.c_str() + common);
       text_buffer.replace(offset, text_buffer.length(), text.c_str() + common);
       rendered_partial = std::move(text);
       rendered_style = std::move(style);
-      transcript->insert_position(text_buffer.length());
-      transcript->show_insert_position();
+      if (transcript->following)
+        transcript->latest();
+      else
+        transcript->scroll(row, column);
     }
   }
-  void render() {
+  void render(bool preserve_view = false) {
     if (busy && stream_prefix >= 0) {
       render_partial();
       return;
     }
     stream_prefix = -1;
+    int row = transcript->view_row(), column = transcript->view_column();
+    int selection_start = 0, selection_end = 0;
+    bool selected = preserve_view && text_buffer.selection_position(
+                                         &selection_start, &selection_end);
     std::string text, style;
     positions.clear();
+    disclosures.clear();
     if (!active.empty()) {
       const auto &chat = store.chats.at(active);
       auto messages = chat.get("messages");
@@ -1500,52 +2029,55 @@ private:
         Json m(cJSON_Duplicate(p, 1));
         if (!(i % 2))
           begin = static_cast<int>(text.size());
-        append(text, style,
-               i % 2
-                   ? "Assistant · " +
-                         m.str("model", fs::path(model_path).stem().string()) +
-                         "\n"
-                   : "You\n",
-               'B');
-        markdown(text, style, m.str("content"));
+        append(text, style, i % 2 ? "Assistant says:\n" : "You say:\n",
+               i % 2 ? 'B' : 'M');
+        if (i % 2)
+          thinking_section(text, style, m.str("reasoning_content"), i / 2);
+        if (i % 2) markdown(text, style, m.str("content"));
+        else message_text(text, style, m.str("content"), 'A');
         append(text, style, "\n", 'A');
         if (m.get("attachments")) {
           cJSON *a;
           cJSON_ArrayForEach(a, m.get("attachments")) {
             Json item(cJSON_Duplicate(a, 1));
-            append(text, style,
-                   "[" + item.str("kind") + ": " + item.str("name") + "]\n",
+            message_text(text, style,
+                   item.str("name") + "\n",
                    'G');
           }
         }
-        if (i % 2 && m.str("status", "complete") != "complete")
-          append(text, style,
-                 "[" + m.str("status") + "] " + m.str("error") + "\n", 'G');
-        append(text, style, "\n", 'A');
+        if (i % 2) {
+          auto state = m.str("status", "complete");
+          auto error = m.str("error");
+          if (state == "stopped") message_text(text, style, "Stopped\n", 'G');
+          else if (state == "length") message_text(text, style, "Response limit reached\n", 'G');
+          else if (state == "error" && error.empty()) message_text(text, style, "Interrupted\n", 'G');
+          if (!error.empty()) message_text(text, style, error + "\n", 'G');
+        }
+        message_end(text, style);
         if (i % 2)
           positions.emplace_back(begin, static_cast<int>(text.size()));
         ++i;
       }
     }
     if (busy) {
-      append(text, style, "You\n", 'B');
-      markdown(text, style, partial_prompt);
-      append(text, style,
-             "\n\nAssistant · " + fs::path(model_path).stem().string() + "\n",
-             'B');
+      append(text, style, "You say:\n", 'M');
+      message_text(text, style, partial_prompt, 'A');
+      message_end(text, style);
+      append(text, style, "Assistant says:\n", 'B');
       stream_prefix = static_cast<int>(text.size());
       rendered_partial.clear();
       rendered_style.clear();
     }
-    if (text.empty())
-      append(text, style,
-             "Your chat is ready.\n\nSelect a local llama-server and GGUF "
-             "model, then Load.\nWrite a message below and press Ctrl+Enter.\n",
-             'G');
     set_text(style_buffer, style);
     set_text(text_buffer, text);
-    transcript->insert_position(text_buffer.length());
-    transcript->show_insert_position();
+    if (!preserve_view || transcript->following)
+      transcript->latest();
+    else {
+      transcript->scroll(row, column);
+      if (selected)
+        text_buffer.select(std::min(selection_start, text_buffer.length()),
+                           std::min(selection_end, text_buffer.length()));
+    }
     if (busy)
       render_partial();
   }
@@ -1553,15 +2085,8 @@ private:
     if (active.empty())
       return;
     int turn = exchange->value();
-    auto messages = store.chats.at(active).get("messages");
-    auto p = cJSON_GetArrayItem(messages, turn * 2 + 1);
-    if (!p) {
-      set_text(thinking_buffer, "");
-      return;
-    }
-    Json reply(cJSON_Duplicate(p, 1));
-    set_text(thinking_buffer, reply.str("reasoning_content"));
     if (scroll && turn >= 0 && static_cast<size_t>(turn) < positions.size()) {
+      transcript->follow(false);
       transcript->insert_position(positions[turn].first);
       transcript->show_insert_position();
     }
@@ -1664,7 +2189,7 @@ private:
         new_chat();
       else
         set_text(master_buffer, result.str("master_prompt"));
-      refresh_tree();
+      refresh_sidebar();
     }
   }
   void update_generation() {
@@ -1848,6 +2373,8 @@ private:
     int context = g.context_tokens;
     set_phase("Loading model...");
     ready = false;
+    model_loading = true;
+    load_started = std::chrono::steady_clock::now();
     job(
         [this, exe, model, proj, extra, p, context] {
           engine.start(exe, model, p, context, store.root / "engine.log", proj,
@@ -1862,6 +2389,7 @@ private:
     if (busy || working || probing || !engine.owned())
       return;
     ready = false;
+    model_loading = false;
     job(
         [this] {
           engine.stop();
@@ -2014,9 +2542,10 @@ private:
     started = std::chrono::steady_clock::now();
     partial_prompt = text;
     partial_answer.clear();
-    set_text(thinking_buffer, "");
-    set_phase(
-        "Preparing message: applying the template and counting tokens...");
+    partial_reasoning.clear();
+    timings = {};
+    update_speed();
+    set_phase("Connecting...");
     controls();
     render();
     launch([this, id, model, messages, attached, instruction, settings, text,
@@ -2026,31 +2555,34 @@ private:
                                    attached, store);
         post([this, prepared] {
           context_status = prepared.prompt < 0
-                               ? "Media: engine checks full history / " +
+                               ? "Context: media / " +
                                      std::to_string(prepared.context)
                                : "Context: " + std::to_string(prepared.prompt) +
                                      " + " + std::to_string(prepared.response) +
-                                     " reply + 32 / " +
-                                     std::to_string(prepared.context) + "; " +
-                                     std::to_string(prepared.omitted) +
-                                     " older exchanges omitted";
+                                     " reply / " +
+                                     std::to_string(prepared.context);
+          if (prepared.omitted)
+            context_status += " · " + std::to_string(prepared.omitted) + " older excluded";
           note(context_status);
-          set_phase("Reading prompt: waiting for the first token...");
+          set_phase("Waiting for reply...");
           controls();
         });
         auto reply = t->generate(prepared.wire, [this](const StreamReply &s) {
           std::string content = s.text, trace = s.reasoning;
           int total = s.progress_total, processed = s.progress_processed;
-          post([this, content, trace, total, processed] {
+          auto performance = s.timings;
+          post([this, content, trace, total, processed, performance] {
             if (!content.empty())
-              phase = "Writing answer";
+              phase = "Replying";
             else if (!trace.empty())
               phase = "Thinking";
             else if (total)
               phase = "Reading prompt: " + std::to_string(processed) + " / " +
                       std::to_string(total);
             partial_answer = content;
-            set_text(thinking_buffer, trace);
+            partial_reasoning = trace;
+            timings = performance;
+            update_speed();
             phase_box->copy_label(phase.c_str());
             render();
           });
@@ -2091,17 +2623,20 @@ private:
               error("Reply is still in memory; save failed: " +
                     std::string(e.what()));
             }
-            show_chat();
-            refresh_tree();
+            show_chat(true);
+            refresh_sidebar();
           } else
-            render();
+            render(true);
           auto elapsed = std::chrono::duration<double>(
                              std::chrono::steady_clock::now() - started)
                              .count();
-          set_phase(reply.status + " · " + std::to_string(reply.tokens) +
-                    " generated tokens · " +
-                    std::to_string(static_cast<int>(elapsed)) + "s" +
-                    (reply.error.empty() ? "" : " · " + reply.error));
+          note(reply.status + " · " + std::to_string(reply.tokens) +
+               " tokens · " + std::to_string(static_cast<int>(elapsed)) + "s");
+          set_phase(!reply.error.empty() ? reply.error
+                    : reply.status == "stopped" ? "Stopped"
+                    : reply.status == "length" ? "Response limit reached" : "Ready");
+          timings = reply.timings;
+          update_speed();
           controls();
         });
       } catch (const std::exception &e) {
@@ -2110,7 +2645,7 @@ private:
           busy = false;
           transport.reset();
           set_phase(detail);
-          render();
+          render(true);
           controls();
         });
       }
@@ -2119,7 +2654,7 @@ private:
   void stop() {
     if (transport) {
       transport->cancel();
-      set_phase("Stopping; keeping any received text...");
+      set_phase("Stopping...");
     }
   }
   void request_close() {
@@ -2151,6 +2686,11 @@ private:
       config.set("linux-layout", "vertical", vertical.dump());
       config.set("linux-layout", "left", show_left ? "1" : "0");
       config.set("linux-layout", "right", show_right ? "1" : "0");
+      config.set("linux-layout", "chats", show_chats ? "1" : "0");
+      Json expanded;
+      for (const auto &ws : workspace_expanded)
+        cJSON_AddBoolToObject(expanded.p, ws.first.c_str(), ws.second);
+      config.set("linux-layout", "workspaces", expanded.dump());
       config.save();
       Fl::remove_timeout(tick_cb, this);
       hide();

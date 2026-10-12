@@ -144,6 +144,7 @@ done:
     if(report && reply) {
         report->prompt_tokens=reply->prompt_tokens; report->tokens=reply->tokens;
         report->finish=reply->finish; report->saw_reasoning=reply->saw_reasoning;
+        report->timings=reply->timings;
     }
     free(reply); return ok;
 }

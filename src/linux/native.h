@@ -109,6 +109,7 @@ struct Prepared {
 struct Reply {
   std::string content, reasoning, error, status;
   int tokens = 0, prompt_tokens = 0;
+  GenerationTimings timings{};
 };
 class Transport {
   unsigned short port_;
