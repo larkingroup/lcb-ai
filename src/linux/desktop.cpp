@@ -352,7 +352,7 @@ public:
 };
 class ChatSidebar : public Fl_Hold_Browser {
 public:
-  enum Kind { Workspace, Chat, Empty };
+  enum Kind { Workspace, Chat, Empty, Section };
   struct Row {
     Kind kind;
     std::string id, title;
@@ -394,10 +394,10 @@ public:
     bool selected = row.kind == Chat && row.id == active;
     bool group = row.kind == Workspace;
     fl_push_clip(X, Y, W, H);
-    fl_color(selected ? Title : FL_WHITE);
+    fl_color(selected ? Title : row.kind == Section ? Face : FL_WHITE);
     fl_rectf(X, Y, W, H);
-    fl_color(selected ? FL_WHITE : row.kind == Empty ? Muted : Ink);
-    fl_font(group && row.id == workspace
+    fl_color(selected ? FL_WHITE : row.kind == Empty || row.kind == Section ? Muted : Ink);
+    fl_font(row.kind == Section || (group && row.id == workspace)
                 ? FL_HELVETICA_BOLD : FL_HELVETICA, textsize());
     int inset = row.indented ? 40 : 9;
     if (group) {
@@ -464,7 +464,7 @@ public:
         return 1;
       }
       int target = 0;
-      if (key == FL_Left && row.kind == Chat) {
+      if (key == FL_Left && row.kind == Chat && row.indented) {
         for (int index = value() - 1; index > 0; --index)
           if (entries[index - 1].kind == Workspace) {
             target = index;
@@ -812,7 +812,7 @@ class Window : public Fl_Double_Window {
   bool has_info = false, busy = false, working = false, probing = false,
        ready = false, closing = false, restoring = false, dirty = false,
        show_left = true, show_right = true, show_output = false,
-       show_chats = true;
+       show_chats = true, show_recents = false;
   int left_width = 210, right_width = 286, output_height = 110;
   int stream_prefix = -1;
   std::string rendered_partial, rendered_style;
@@ -957,6 +957,7 @@ public:
     show_left = config.get("linux-layout", "left", "1") != "0";
     show_right = config.get("linux-layout", "right", "1") != "0";
     show_chats = config.get("linux-layout", "chats", "1") != "0";
+    show_recents = config.get("linux-layout", "recents", "0") != "0";
     show_output = config.get("linux-layout", "output", "0") != "0";
     try {
       auto states = Json::parse(config.get("linux-layout", "workspaces", "{}"));
@@ -1173,6 +1174,26 @@ private:
       show_left = !show_left;
       layout();
     });
+    add("&View/Show recent chats", 0, [&] {
+      show_recents = !show_recents;
+      if (show_recents) {
+        show_left = true;
+        chat_search->value("");
+        search_workspace_expanded.clear();
+      }
+      refresh_sidebar();
+      layout();
+      if (show_recents)
+        for (size_t i = 0; i < sidebar->entries.size(); ++i)
+          if (sidebar->entries[i].kind == ChatSidebar::Section) {
+            if (i + 1 < sidebar->entries.size() &&
+                sidebar->entries[i + 1].kind == ChatSidebar::Chat)
+              sidebar->value(static_cast<int>(i) + 2);
+            sidebar->topline(static_cast<int>(i) + 1);
+            sidebar->take_focus();
+            break;
+          }
+    });
     add("&View/Open chat tabs", 0, [&] {
       show_chats = !show_chats;
       layout();
@@ -1191,9 +1212,11 @@ private:
       show_left = show_right = true;
       show_output = false;
       show_chats = true;
+      show_recents = false;
       left_width = 210;
       right_width = 286;
       output_height = 110;
+      refresh_sidebar();
       layout();
     });
     add("&Engine/Load model", FL_F + 5, [&] { load_model(); });
@@ -1522,6 +1545,7 @@ private:
   }
   void layout() {
     menu_checked("&View/Chats sidebar", show_left);
+    menu_checked("&View/Show recent chats", show_recents);
     menu_checked("&View/Open chat tabs", show_chats);
     menu_checked("&View/Properties and Models", show_right);
     menu_checked("&View/Output", show_output);
@@ -2025,6 +2049,13 @@ private:
       }
     }
     if (rows.empty()) rows.push_back({ChatSidebar::Empty, "", "No matching chats"});
+    if (show_recents && query.empty()) {
+      rows.push_back({ChatSidebar::Section, "", "Recent chats"});
+      for (const auto &entry : recent)
+        rows.push_back({ChatSidebar::Chat, entry.first,
+                        clean_label(store.chats.at(entry.first).str("title"))});
+      if (recent.empty()) rows.push_back({ChatSidebar::Empty, "", "No chats yet"});
+    }
     sidebar->active = active;
     sidebar->workspace = workspace;
     new_button->copy_tooltip(("New chat in " + store.workspaces.at(workspace).str("name") +
@@ -2037,8 +2068,9 @@ private:
       int index = static_cast<int>(i) + 1;
       if (!fallback || (row.kind == ChatSidebar::Workspace && row.id == workspace))
         fallback = index;
-      if (row.kind == ChatSidebar::Chat && row.id == active) fallback = index;
-      if (had_selection && row.kind == previous.kind && row.id == previous.id)
+      if (row.kind == ChatSidebar::Chat && row.id == active && row.indented) fallback = index;
+      if (had_selection && row.kind == previous.kind && row.id == previous.id &&
+          row.indented == previous.indented)
         selected = index;
     }
     sidebar->value(selected ? selected : fallback);
@@ -2962,6 +2994,7 @@ private:
       config.set("linux-layout", "left", show_left ? "1" : "0");
       config.set("linux-layout", "right", show_right ? "1" : "0");
       config.set("linux-layout", "chats", show_chats ? "1" : "0");
+      config.set("linux-layout", "recents", show_recents ? "1" : "0");
       config.set("linux-layout", "output", show_output ? "1" : "0");
       Json expanded;
       for (const auto &ws : workspace_expanded)
