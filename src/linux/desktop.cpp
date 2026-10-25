@@ -36,6 +36,9 @@
 #include <sstream>
 #include <thread>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <ctime>
+#include <limits>
 using namespace lcb;
 namespace {
 namespace icons {
@@ -127,6 +130,12 @@ public:
       : Fl_Button(0, 0, 10, 10, text), icon_(icon), toolbar_(toolbar) {
     labelsize(12);
   }
+  void show_as(const char *text, icons::Kind icon) {
+    if (icon_ == icon && label() && std::strcmp(label(), text) == 0) return;
+    icon_ = icon;
+    copy_label(text);
+    redraw();
+  }
   void draw() override {
     if (value()) sunken(x(), y(), w(), h(), Face);
     else if (!toolbar_ || (hovered_ && active_r())) raised(x(), y(), w(), h(), Face);
@@ -159,6 +168,103 @@ std::string clean_label(std::string s) {
     if (c == '\t' || c == '\n' || c == '\r')
       c = ' ';
   return s;
+}
+// Case-folded text for searching; ASCII stays on the fast path.
+std::string fold(const std::string &s) {
+  bool ascii = std::all_of(s.begin(), s.end(),
+                           [](char c) { return !(static_cast<unsigned char>(c) & 0x80); });
+  if (ascii) {
+    std::string out = s;
+    for (char &c : out)
+      if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+    return out;
+  }
+  auto w = wide(s);
+  std::transform(w.begin(), w.end(), w.begin(), towlower);
+  return utf8(w);
+}
+// Collapses whitespace and cuts at a word boundary within the byte budget.
+std::string clip_words(const std::string &s, size_t limit) {
+  std::string out;
+  for (char c : s) {
+    bool space = c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    if (space) {
+      if (!out.empty() && out.back() != ' ') out += ' ';
+    } else
+      out += c;
+  }
+  while (!out.empty() && out.back() == ' ') out.pop_back();
+  if (out.size() <= limit) return out;
+  auto cut = out.rfind(' ', limit);
+  out = truncate(out, cut != out.npos && cut > limit / 2 ? cut : limit);
+  while (!out.empty() && std::strchr(" ,;:-", out.back())) out.pop_back();
+  return out + "…";
+}
+// An immediate title from the first message: drop greetings and requests
+// phrased as filler, keep the first sentence.
+std::string quick_title(const std::string &text) {
+  auto title = clip_words(text, 400);
+  static const char *const openers[] = {
+      "hey there", "hey claude", "hey", "hi there", "hi", "hello", "yo",
+      "ok so", "okay so", "so", "please", "can you please", "could you please",
+      "can you", "could you", "would you", "i need you to", "i want you to",
+      "help me", "quick question"};
+  for (bool trimmed = true; trimmed;) {
+    trimmed = false;
+    auto lower = fold(title);
+    for (const char *opener : openers) {
+      size_t n = std::strlen(opener);
+      if (lower.compare(0, n, opener) == 0 &&
+          (lower.size() == n || std::strchr(" ,.!?:", lower[n]))) {
+        size_t at = n;
+        while (at < title.size() && std::strchr(" ,.!?:", title[at])) ++at;
+        if (at < title.size()) {
+          title.erase(0, at);
+          trimmed = true;
+        }
+        break;
+      }
+    }
+  }
+  auto end = title.find_first_of(".?!\n");
+  if (end != title.npos && end >= 12) title.resize(end + (title[end] == '?' ? 1 : 0));
+  title = clip_words(title, 56);
+  if (!title.empty() && title[0] >= 'a' && title[0] <= 'z')
+    title[0] = static_cast<char>(title[0] - 32);
+  return title.empty() ? "New chat" : title;
+}
+// Model titles arrive with quotes, labels or trailing punctuation.
+std::string tidy_title(std::string s) {
+  auto line = s.find_first_not_of(" \t\r\n");
+  if (line == s.npos) return "";
+  s.erase(0, line);
+  s = s.substr(0, s.find('\n'));
+  for (const char *prefix : {"Title:", "title:", "TITLE:"})
+    if (s.rfind(prefix, 0) == 0) s.erase(0, std::strlen(prefix));
+  auto strip = [](std::string &t) {
+    while (!t.empty() && std::strchr(" \t\"'*#`.", t.front())) t.erase(0, 1);
+    while (!t.empty() && std::strchr(" \t\"'*#`.", t.back())) t.pop_back();
+  };
+  strip(s);
+  return clip_words(s, 60);
+}
+// Compact recency for a list row: time today, weekday this week, then date.
+std::string when_label(std::time_t then, std::time_t now) {
+  if (then <= 0) return "";
+  std::tm a = *std::localtime(&then), b = *std::localtime(&now);
+  char text[32];
+  if (a.tm_year == b.tm_year && a.tm_yday == b.tm_yday)
+    std::strftime(text, sizeof(text), "%H:%M", &a);
+  else if (now - then < 6 * 86400 && now >= then)
+    std::strftime(text, sizeof(text), "%a", &a);
+  else if (a.tm_year == b.tm_year)
+    std::strftime(text, sizeof(text), "%b %e", &a);
+  else
+    std::strftime(text, sizeof(text), "%b %Y", &a);
+  std::string out = text;
+  auto twice = out.find("  ");
+  if (twice != out.npos) out.erase(twice, 1);
+  return out;
 }
 std::string menu_label(std::string s) {
   for (char &c : s)
@@ -354,17 +460,20 @@ public:
     return result;
   }
 };
+// Rows are stored by index in the browser text, so geometry and drawing look
+// up the row directly instead of scanning the list.
 class ChatSidebar : public Fl_Hold_Browser {
 public:
-  enum Kind { Workspace, Chat, Empty, Section };
+  enum Kind { Chat, Empty, Section };
+  enum Action { Open, Menu, Rename, Delete };
   struct Row {
     Kind kind;
-    std::string id, title;
-    bool expanded = false, indented = false;
+    std::string id, title, when, snippet;
+    bool pinned = false;
   };
   std::vector<Row> entries;
-  std::string active, workspace;
-  std::function<void(Row, bool)> action;
+  std::string active;
+  std::function<void(const Row &, Action)> action;
   int hovered = 0;
   ChatSidebar() : Fl_Hold_Browser(0, 0, 10, 10) {
     box(FL_THIN_DOWN_BOX);
@@ -373,130 +482,237 @@ public:
     has_scrollbar(VERTICAL);
     textsize(12);
   }
+  const Row *row_of(void *item) const {
+    if (!item) return nullptr;
+    size_t index = std::strtoul(item_text(item), nullptr, 10);
+    return index < entries.size() ? &entries[index] : nullptr;
+  }
   void refresh() {
     int scroll = vposition();
     clear();
     hovered = 0;
-    for (const auto &row : entries)
-      add(row.title.c_str());
+    for (size_t i = 0; i < entries.size(); ++i)
+      add(std::to_string(i).c_str());
     vposition(scroll);
     redraw();
   }
-  int item_height(void *) const override { return textsize() + 10; }
+  bool selectable(int line) const {
+    return line > 0 && line <= static_cast<int>(entries.size()) &&
+           entries[line - 1].kind == Chat;
+  }
+  int line_of(const std::string &id) const {
+    for (size_t i = 0; i < entries.size(); ++i)
+      if (entries[i].kind == Chat && entries[i].id == id)
+        return static_cast<int>(i) + 1;
+    return 0;
+  }
+  // Screen rectangle of a line, for the inline rename field and menus.
+  int line_y(int line) const {
+    int top = y() + Fl::box_dy(box()) - vposition();
+    for (int i = 1; i < line && i <= size(); ++i)
+      top += item_height(find_line(i));
+    return top;
+  }
+  int item_height(void *item) const override {
+    auto row = row_of(item);
+    if (!row) return textsize() + 10;
+    if (row->kind == Section) return 24;
+    return row->snippet.empty() ? 24 : 38;
+  }
   int item_width(void *) const override { return 0; }
   std::pair<int, int> context_position() const {
     if (Fl::event() != FL_KEYDOWN && Fl::event() != FL_SHORTCUT)
       return {Fl::event_x(), Fl::event_y()};
-    int row_y = y() + 2 + value() * item_height(nullptr) - vposition();
+    int row_y = line_y(value()) + 20;
     return {x() + 30, std::clamp(row_y, y() + 2, y() + h() - 2)};
   }
   void item_draw(void *item, int X, int Y, int W, int H) const override {
-    int index = lineno(item);
-    if (index < 1 || static_cast<size_t>(index) > entries.size())
-      return;
-    const auto &row = entries[index - 1];
-    bool selected = row.kind == Chat && row.id == active;
-    bool group = row.kind == Workspace;
+    auto row = row_of(item);
+    if (!row) return;
+    bool selected = row->kind == Chat && row->id == active;
+    bool hover = !selected && row->kind == Chat && hovered == lineno(item);
     fl_push_clip(X, Y, W, H);
-    fl_color(selected ? Title : row.kind == Section ? Face : FL_WHITE);
+    fl_color(selected ? Title : hover ? fl_rgb_color(236, 241, 245) : FL_WHITE);
     fl_rectf(X, Y, W, H);
-    fl_color(selected ? FL_WHITE : row.kind == Empty || row.kind == Section ? Muted : Ink);
-    fl_font(row.kind == Section || (group && row.id == workspace)
-                ? FL_HELVETICA_BOLD : FL_HELVETICA, textsize());
-    int inset = row.indented ? 40 : 9;
-    if (group) {
-      int cy = Y + H / 2;
-      fl_color(Shadow);
-      fl_rect(X + 7, cy - 4, 9, 9);
-      fl_color(Ink);
-      fl_line(X + 9, cy, X + 13, cy);
-      if (!row.expanded)
-        fl_line(X + 11, cy - 2, X + 11, cy + 2);
-      fl_color(fl_rgb_color(225, 195, 116));
-      fl_rectf(X + 21, cy - 3, 13, 10);
-      fl_rectf(X + 21, cy - 6, 7, 4);
-      fl_color(fl_rgb_color(142, 118, 65));
-      fl_rect(X + 21, cy - 3, 13, 10);
-      fl_color(Ink);
-      inset = 40;
+    if (row->kind == Section) {
+      fl_font(FL_HELVETICA_BOLD, 11);
+      fl_color(Muted);
+      ClassicTable::cell_text(row->title, X + 8, Y + 6, W - 16, H - 6);
+      fl_color(fl_rgb_color(219, 218, 206));
+      fl_line(X + 8, Y + H - 2, X + W - 8, Y + H - 2);
+      fl_pop_clip();
+      return;
     }
-    if (row.kind == Chat) {
-      icons::get(icons::New)->draw(X + inset - 3, Y + (H - 22) / 2);
-      inset += 21;
+    if (row->kind == Empty) {
+      fl_font(FL_HELVETICA_ITALIC, 12);
+      fl_color(Muted);
+      ClassicTable::cell_text(row->title, X + 12, Y, W - 20, 24);
+      fl_pop_clip();
+      return;
     }
-    ClassicTable::cell_text(row.title, X + inset, Y, W - inset - 8, H);
+    int right = X + W - 6;
+    if (!row->when.empty()) {
+      fl_font(FL_HELVETICA, 11);
+      fl_color(selected ? fl_rgb_color(206, 222, 238) : Muted);
+      int width = static_cast<int>(fl_width(row->when.c_str()));
+      fl_draw(row->when.c_str(), right - width, Y, width, 24,
+              FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
+      right -= width + 8;
+    }
+    int left = X + 12;
+    if (row->pinned) {
+      fl_color(selected ? FL_WHITE : fl_rgb_color(150, 111, 53));
+      int cx = left + 3, cy = Y + 12;
+      fl_polygon(cx - 4, cy - 1, cx + 4, cy - 1, cx, cy + 4);
+      fl_rectf(cx - 2, cy - 6, 5, 6);
+      fl_line(cx, cy + 4, cx, cy + 7);
+      left += 13;
+    }
+    fl_font(FL_HELVETICA, 12);
+    fl_color(selected ? FL_WHITE : Ink);
+    ClassicTable::cell_text(row->title, left, Y, right - left, 24);
+    if (!row->snippet.empty()) {
+      fl_font(FL_HELVETICA, 11);
+      fl_color(selected ? fl_rgb_color(206, 222, 238) : Muted);
+      ClassicTable::cell_text(row->snippet, X + 12, Y + 19, W - 18, 16);
+    }
     if (item_selected(item) && Fl::focus() == this) {
       fl_color(selected ? FL_WHITE : Shadow);
-      fl_rect(X + 2, Y + 2, W - 4, H - 4);
+      fl_line_style(FL_DOT);
+      fl_rect(X + 2, Y + 1, W - 4, H - 2);
+      fl_line_style(0);
     }
     fl_pop_clip();
+  }
+  void select_line(int line) {
+    value(line);
+    if (!displayed(line)) middleline(line);
+    redraw();
+  }
+  // Moves the keyboard selection to the next chat row in the given direction.
+  bool step(int direction) {
+    for (int line = value() + direction; line > 0 && line <= size(); line += direction)
+      if (selectable(line)) {
+        select_line(line);
+        return true;
+      }
+    return false;
   }
   int handle(int event) override {
     if (event == FL_MOVE || event == FL_ENTER) {
       auto item = find_item(Fl::event_y());
-      int row = item ? lineno(item) : 0;
-      if (hovered != row) {
-        hovered = row;
-        copy_tooltip(row > 0 ? entries[row - 1].title.c_str() : "");
+      int line = item ? lineno(item) : 0;
+      if (!selectable(line)) line = 0;
+      if (hovered != line) {
+        hovered = line;
+        copy_tooltip(line ? entries[line - 1].title.c_str() : nullptr);
+        redraw();
       }
     } else if (event == FL_LEAVE) {
-      hovered = 0;
+      if (hovered) { hovered = 0; redraw(); }
     } else if (event == FL_PUSH &&
                !(scrollbar.visible() && Fl::event_inside(&scrollbar))) {
       auto item = find_item(Fl::event_y());
-      int index = item ? lineno(item) : 0;
-      if (index > 0 && action && active_r()) {
-        auto row = entries[index - 1];
-        if (row.kind != Chat && row.kind != Workspace)
-          return 1;
-        value(index);
+      int line = item ? lineno(item) : 0;
+      if (selectable(line) && action && active_r()) {
+        value(line);
         take_focus();
-        action(row, Fl::event_button() == FL_RIGHT_MOUSE);
-        return 1;
+        auto row = entries[line - 1];
+        action(row, Fl::event_button() == FL_RIGHT_MOUSE ? Menu
+                    : Fl::event_clicks() ? Rename : Open);
       }
-    } else if (event == FL_KEYDOWN && value() > 0 && action) {
-      auto row = entries[value() - 1];
+      return 1;
+    } else if (event == FL_KEYDOWN && action) {
       int key = Fl::event_key();
-      if (key == FL_Enter || key == FL_KP_Enter ||
-          (row.kind == Workspace && ((key == FL_Right && !row.expanded) ||
-                                    (key == FL_Left && row.expanded)))) {
-        action(row, false);
+      if (key == FL_Up || key == FL_Down) {
+        step(key == FL_Up ? -1 : 1);
         return 1;
       }
-      if (key == FL_Menu || (key == FL_F + 10 && Fl::event_state(FL_SHIFT))) {
-        action(row, true);
+      if (key == FL_Home || key == FL_End) {
+        value(key == FL_Home ? 0 : size() + 1);
+        step(key == FL_Home ? 1 : -1);
         return 1;
       }
-      int target = 0;
-      if (key == FL_Left && row.kind == Chat && row.indented) {
-        for (int index = value() - 1; index > 0; --index)
-          if (entries[index - 1].kind == Workspace) {
-            target = index;
-            break;
-          }
-      } else if (key == FL_Right && row.kind == Workspace && row.expanded &&
-                 value() < size() && entries[value()].kind == Chat) {
-        target = value() + 1;
-      }
-      if (target) {
-        value(target);
-        if (!displayed(target)) middleline(target);
-        redraw();
-        return 1;
-      }
-    }
-    if (event == FL_KEYDOWN && (Fl::event_key() == FL_Up || Fl::event_key() == FL_Down)) {
-      int step = Fl::event_key() == FL_Up ? -1 : 1;
-      for (int index = value() + step; index > 0 && index <= size(); index += step)
-        if (entries[index - 1].kind == Chat || entries[index - 1].kind == Workspace) {
-          value(index);
-          if (!displayed(index)) middleline(index);
-          redraw();
-          return 1;
-        }
+      if (!selectable(value())) return Fl_Hold_Browser::handle(event);
+      auto row = entries[value() - 1];
+      if (key == FL_Enter || key == FL_KP_Enter) action(row, Open);
+      else if (key == FL_F + 2) action(row, Rename);
+      else if (key == FL_Delete) action(row, Delete);
+      else if (key == FL_Menu || (key == FL_F + 10 && Fl::event_state(FL_SHIFT)))
+        action(row, Menu);
+      else return Fl_Hold_Browser::handle(event);
       return 1;
     }
     return Fl_Hold_Browser::handle(event);
+  }
+};
+// A search box that shows its purpose while empty and hands navigation keys
+// to the list below it.
+class SearchField : public Fl_Input {
+public:
+  std::function<bool(int)> key;
+  SearchField() : Fl_Input(0, 0, 10, 10) {}
+  void draw() override {
+    Fl_Input::draw();
+    if (!size() && Fl::focus() != this) {
+      fl_font(FL_HELVETICA_ITALIC, 12);
+      fl_color(Muted);
+      fl_draw("Search chats  (Ctrl+K)", x() + 6, y(), w() - 12, h(),
+              FL_ALIGN_LEFT | FL_ALIGN_INSIDE | FL_ALIGN_CLIP);
+    }
+  }
+  int handle(int event) override {
+    if (event == FL_KEYBOARD && key && key(Fl::event_key()))
+      return 1;
+    if (event == FL_FOCUS || event == FL_UNFOCUS) redraw();
+    return Fl_Input::handle(event);
+  }
+};
+// An in-place title editor: Enter or leaving the field saves, Escape cancels.
+class RenameField : public Fl_Input {
+public:
+  std::function<void(bool)> done;
+  RenameField() : Fl_Input(0, 0, 10, 10) {
+    textsize(12);
+    box(FL_THIN_DOWN_BOX);
+    hide();
+  }
+  void finish(bool save) {
+    if (!visible()) return;
+    hide();
+    if (done) done(save);
+  }
+  int handle(int event) override {
+    if (event == FL_KEYBOARD) {
+      int k = Fl::event_key();
+      if (k == FL_Escape) { finish(false); return 1; }
+      if (k == FL_Enter || k == FL_KP_Enter) { finish(true); return 1; }
+    }
+    if (event == FL_UNFOCUS) {
+      int result = Fl_Input::handle(event);
+      finish(true);
+      return result;
+    }
+    return Fl_Input::handle(event);
+  }
+};
+// A small lamp beside the model picker: grey offline, amber loading, green ready.
+class StatusLamp : public Fl_Widget {
+public:
+  Fl_Color lamp = fl_rgb_color(150, 150, 146);
+  StatusLamp() : Fl_Widget(0, 0, 10, 10) {}
+  void draw() override {
+    fl_color(Face);
+    fl_rectf(x(), y(), w(), h());
+    int d = 10, cx = x() + (w() - d) / 2, cy = y() + (h() - d) / 2;
+    fl_color(lamp);
+    fl_pie(cx, cy, d, d, 0, 360);
+    fl_color(Shadow);
+    fl_arc(cx, cy, d, d, 0, 360);
+  }
+  void set(Fl_Color color, const char *tip) {
+    if (lamp != color) { lamp = color; redraw(); }
+    copy_tooltip(tip);
   }
 };
 class LoadingMeter : public Fl_Widget {
@@ -826,7 +1042,7 @@ class Window : public Fl_Double_Window {
   bool has_info = false, busy = false, working = false, probing = false,
        ready = false, closing = false, restoring = false, dirty = false,
        show_left = true, show_right = true, show_output = false,
-       show_chats = true, show_recents = false;
+       show_chats = false, pending_send = false;
   int left_width = 210, right_width = 286, output_height = 110;
   int stream_prefix = -1;
   std::string rendered_partial, rendered_style;
@@ -839,7 +1055,17 @@ class Window : public Fl_Double_Window {
   std::vector<std::string> open_chats;
   std::vector<ModelInfo> models;
   std::atomic<bool> scan_cancel{false};
-  std::shared_ptr<Transport> transport;
+  std::shared_ptr<Transport> transport, title_transport;
+  // The chat receiving the current reply; other chats stay browsable.
+  std::string stream_chat, pending_chat;
+
+  struct SearchText {
+    std::string title;
+    int messages = -1;
+    std::string folded, original;
+  };
+  std::map<std::string, SearchText> search_cache;
+  std::map<std::string, std::time_t> file_times;
   struct Worker {
     std::thread thread;
     std::shared_ptr<std::atomic<bool>> done;
@@ -858,9 +1084,10 @@ class Window : public Fl_Double_Window {
   Fl_Input *model_name;
   Fl_Int_Input *port_input;
   Fl_Box *brand, *left_header, *center_header, *right_header, *phase_box,
-      *message_header, *status, *media_status, *output_header, *speed_box,
+      *message_header, *media_status, *output_header, *speed_box,
       *search_label, *port_label, *runtime_model_label, *model_library_label;
   Fl_Box *toolbar_separators[3]{};
+  Fl_Button *status;
   // Toolbar model picker; the Properties window holds everything else.
   Fl_Box *model_picker_label, *thinking_label, *engine_path_label;
   Fl_Choice *model_picker, *quick_thinking;
@@ -870,7 +1097,12 @@ class Window : public Fl_Double_Window {
   std::vector<std::string> picker_paths;
   std::string pending_model, gpu;
   ChatSidebar *sidebar;
-  Fl_Input *chat_search;
+  SearchField *chat_search;
+  RenameField *rename_field;
+  std::string renaming;
+  Fl_Choice *workspace_picker;
+  std::vector<std::string> workspace_ids;
+  StatusLamp *lamp;
   LoadingMeter *loading_meter;
   bool model_loading = false;
   std::chrono::steady_clock::time_point load_started;
@@ -919,9 +1151,7 @@ class Window : public Fl_Double_Window {
   bool media_engine = false, reload_media = false;
   Divider *left_divider, *right_divider, *output_divider;
   std::map<Fl_Widget *, std::function<void()>> callbacks;
-  std::map<std::string, bool> workspace_expanded;
   std::set<std::string> cpu_warned;
-  std::map<std::string, bool> search_workspace_expanded;
   std::map<std::pair<std::string, size_t>, bool> thinking_collapsed;
   struct Disclosure { int start, end; size_t turn; };
   std::vector<Disclosure> disclosures;
@@ -985,22 +1215,16 @@ public:
     }
     show_left = config.get("linux-layout", "left", "1") != "0";
     show_right = config.get("linux-layout", "right", "1") != "0";
-    show_chats = config.get("linux-layout", "chats", "1") != "0";
-    show_recents = config.get("linux-layout", "recents", "0") != "0";
+    show_chats = config.get("linux-layout", "tabs", "0") != "0";
     show_output = config.get("linux-layout", "output", "0") != "0";
-    try {
-      auto states = Json::parse(config.get("linux-layout", "workspaces", "{}"));
-      for (const auto &ws : store.workspaces)
-        if (cJSON_IsBool(states.get(ws.first.c_str())))
-          workspace_expanded[ws.first] = cJSON_IsTrue(states.get(ws.first.c_str()));
-    } catch (const std::exception &) {
-    }
     if (active.empty())
       new_chat();
     else
       show_chat();
+    refresh_workspaces();
     refresh_sidebar();
     update_generation();
+
     layout();
     controls();
     note("FLTK workbench ready. Storage: " + store.root.string());
@@ -1008,6 +1232,13 @@ public:
       note(std::to_string(store.skipped) +
            " invalid saved files were left untouched.");
     Fl::add_timeout(1, tick_cb, this);
+    // Builds the search index once the window is up, so the first search
+    // keystroke is as quick as the rest.
+    Fl::add_timeout(0.3, +[](void *data) {
+      auto &w = *static_cast<Window *>(data);
+      for (const auto &chat : w.store.chats) w.search_text(chat.first);
+    }, this);
+
     if (!model_path.empty())
       read_selected_model(model_path, false, true);
     else if (*folder->value())
@@ -1036,8 +1267,9 @@ public:
   int handle(int event) override {
     if ((event == FL_SHORTCUT || event == FL_KEYBOARD) &&
         Fl::event_state(FL_CTRL) &&
+
         (Fl::event_key() == FL_Page_Up || Fl::event_key() == FL_Page_Down)) {
-      guard([&] { tabs->step(Fl::event_key() == FL_Page_Up ? -1 : 1); });
+      guard([&] { step_chat(Fl::event_key() == FL_Page_Up ? -1 : 1); });
       return 1;
     }
     if (event == FL_MOUSEWHEEL) {
@@ -1183,6 +1415,8 @@ private:
     add("&File/&New chat", FL_CTRL + 'n', [&] { new_chat(); });
     add("&File/New workspace...", 0, [&] { edit_workspace(true); });
     add("&File/Close chat", FL_CTRL + 'w', [&] { close_chat(active); });
+    add("&File/Rename chat", FL_F + 2, [&] { begin_rename(active); });
+    add("&File/Pin chat", 0, [&] { toggle_pin(active); });
     add("&File/Delete chat...", 0, [&] { delete_chat(); });
     add("&File/Quit", FL_CTRL + 'q', [&] { request_close(); });
     add("&Edit/Copy", FL_CTRL + 'c', [&] {
@@ -1195,37 +1429,13 @@ private:
       }
     });
     add("&Edit/Workspace settings...", 0, [&] { edit_workspace(false); });
-    add("&Edit/Find chat", FL_CTRL + 'f', [&] {
-      show_left = true;
-      layout();
-      chat_search->take_focus();
-      chat_search->insert_position(0, chat_search->size());
-    });
+    add("&Edit/Find chat", FL_CTRL + 'f', [&] { focus_search(); });
+    add("&Edit/Jump to chat", FL_CTRL + 'k', [&] { focus_search(); });
     add("&View/Chats sidebar", FL_F + 9, [&] {
       show_left = !show_left;
       layout();
     });
-    add("&View/Show recent chats", 0, [&] {
-      show_recents = !show_recents;
-      if (show_recents) {
-        show_left = true;
-        chat_search->value("");
-        search_workspace_expanded.clear();
-      }
-      refresh_sidebar();
-      layout();
-      if (show_recents)
-        for (size_t i = 0; i < sidebar->entries.size(); ++i)
-          if (sidebar->entries[i].kind == ChatSidebar::Section) {
-            if (i + 1 < sidebar->entries.size() &&
-                sidebar->entries[i + 1].kind == ChatSidebar::Chat)
-              sidebar->value(static_cast<int>(i) + 2);
-            sidebar->topline(static_cast<int>(i) + 1);
-            sidebar->take_focus();
-            break;
-          }
-    });
-    add("&View/Open chat tabs", 0, [&] {
+    add("&View/Chat tabs", 0, [&] {
       show_chats = !show_chats;
       layout();
     });
@@ -1233,13 +1443,12 @@ private:
       show_output = !show_output;
       layout();
     });
-    add("&View/Previous chat", FL_CTRL + FL_Page_Up, [&] { tabs->step(-1); });
-    add("&View/Next chat", FL_CTRL + FL_Page_Down, [&] { tabs->step(1); });
+    add("&View/Previous chat", FL_CTRL + FL_Page_Up, [&] { step_chat(-1); });
+    add("&View/Next chat", FL_CTRL + FL_Page_Down, [&] { step_chat(1); });
     add("&View/Reset layout", 0, [&] {
       show_left = show_right = true;
       show_output = false;
-      show_chats = true;
-      show_recents = false;
+      show_chats = false;
       left_width = 210;
       right_width = 286;
       output_height = 110;
@@ -1272,7 +1481,11 @@ private:
     }
     new_button = icon_button("New chat", icons::New, [&] { new_chat(); });
     new_button->tooltip("New chat (Ctrl+N)");
-    load_button = icon_button("Load", icons::Load, [&] { load_model(); });
+    load_button = icon_button("Load", icons::Load, [&] {
+      if (engine.owned()) unload();
+      else load_model();
+    });
+    lamp = new StatusLamp();
     unload_button = icon_button("Unload", icons::Stop, [&] { unload(); });
     engine_button = icon_button("Settings...", icons::Settings, [&] { settings_dialog(); });
     model_button = icon_button("Open model...", icons::Open, [&] { choose_model(); });
@@ -1315,19 +1528,68 @@ private:
       show_left = !show_left;
       layout();
     });
+    workspace_picker = new Fl_Choice(0, 0, 10, 10);
+    workspace_picker->textsize(12);
+    workspace_picker->color(FL_WHITE);
+    workspace_picker->tooltip("Workspace: its chats and master prompt");
+    bind(workspace_picker, [&] { pick_workspace(); });
     search_label = label("Search:");
-    chat_search = input();
-    chat_search->tooltip("Search chat titles and workspace names");
+    chat_search = new SearchField();
+    chat_search->textsize(12);
+    chat_search->color(FL_WHITE);
+    chat_search->tooltip("Search titles and messages in every workspace.\n"
+                         "Enter opens the first result, Down moves to the list, "
+                         "Escape clears.");
     chat_search->when(FL_WHEN_CHANGED);
     bind(chat_search, [&] {
-      search_workspace_expanded.clear();
       sidebar->vposition(0);
       refresh_sidebar();
+      if (*chat_search->value()) sidebar->step(1);
     });
-    sidebar = new ChatSidebar();
-    sidebar->action = [&](ChatSidebar::Row row, bool menu) {
-      guard([&] { sidebar_action(row, menu); });
+    chat_search->key = [&](int key) {
+      if (key == FL_Escape) {
+        if (!*chat_search->value()) {
+          prompt->take_focus();
+          return true;
+        }
+        chat_search->value("");
+        refresh_sidebar();
+        return true;
+      }
+      if (key == FL_Down || key == FL_Up) {
+        if (!sidebar->selectable(sidebar->value())) sidebar->step(1);
+        else sidebar->step(key == FL_Up ? -1 : 1);
+        sidebar->take_focus();
+        return true;
+      }
+      if (key == FL_Enter || key == FL_KP_Enter) {
+        int line = sidebar->selectable(sidebar->value()) ? sidebar->value() : 0;
+        if (!line) {
+          sidebar->value(0);
+          if (sidebar->step(1)) line = sidebar->value();
+        }
+        if (line) {
+          auto id = sidebar->entries[line - 1].id;
+          guard([&] {
+            chat_search->value("");
+            open_chat(id);
+            prompt->take_focus();
+          });
+        }
+        return true;
+      }
+      return false;
     };
+    sidebar = new ChatSidebar();
+    sidebar->action = [&](const ChatSidebar::Row &row, ChatSidebar::Action action) {
+      auto copy = row;
+      guard([&] { sidebar_action(copy, action); });
+    };
+    rename_field = new RenameField();
+    rename_field->done = [&](bool save) {
+      guard([&] { finish_rename(save); });
+    };
+
     center_header = label("Conversations", true);
     chats_toggle = button("-", [&] {
       show_chats = !show_chats;
@@ -1380,7 +1642,7 @@ private:
           transcript->follow(false);
           auto &collapsed = thinking_collapsed[{active, item.turn}];
           collapsed = !collapsed;
-          if (busy && item.turn == positions.size()) {
+          if (streaming_here() && item.turn == positions.size()) {
             rendered_partial.clear();
             rendered_style.clear();
             render_partial();
@@ -1453,7 +1715,11 @@ private:
     quick_thinking->tooltip("Auto follows the model's own default");
     bind(quick_thinking,
          [&] { edit_generation(GenThinking, quick_thinking->value()); });
-    send_button = icon_button("Send", icons::Send, [&] { send(); }, false);
+    send_button = icon_button("Send", icons::Send, [&] {
+      if (streaming_here()) stop();
+      else send();
+    }, false);
+    send_button->tooltip("Send (Ctrl+Enter). While replying: Stop (Esc)");
     stop_button = icon_button("Stop", icons::Stop, [&] { stop(); }, false);
     // Model details and settings live in one classic property sheet.
     Fl_Group::current(nullptr); // A top-level window, not a child of this one.
@@ -1589,9 +1855,14 @@ private:
     log_page->end();
     output_tabs->end();
     loading_meter = new LoadingMeter();
-    status = label("Engine offline");
+    status = button("Engine offline", [&] {
+      show_output = !show_output;
+      layout();
+    });
     status->box(FL_THIN_DOWN_BOX);
+    status->down_box(FL_THIN_DOWN_BOX);
     status->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE | FL_ALIGN_CLIP);
+    status->visible_focus(0);
     left_divider = new Divider(true);
     left_divider->moved = [&](int x) {
       left_width = std::clamp(x - 4, 160, std::max(160, w() - (show_right ? std::min(right_width, std::max(240, w() - 520)) : 0) - 350));
@@ -1626,21 +1897,21 @@ private:
   }
   void layout() {
     menu_checked("&View/Chats sidebar", show_left);
-    menu_checked("&View/Show recent chats", show_recents);
-    menu_checked("&View/Open chat tabs", show_chats);
+    menu_checked("&View/Chat tabs", show_chats);
     menu_checked("&View/Output", show_output);
     place(menu, 0, 0, w(), 22);
     const int top = 25, pane_top = 59;
     place(new_button, 5, top, 94, 28);
     place(toolbar_separators[0], 104, top + 2, 2, 24);
     place(model_picker_label, 112, top, 46, 28);
+    place(lamp, 154, top, 16, 28);
     int picker = std::clamp(w() - 520, 220, 380);
-    place(model_picker, 158, top + 2, picker, 24);
-    int tx = 158 + picker + 6;
-    place(load_button, tx, top, 69, 28);
-    place(unload_button, tx + 72, top, 83, 28);
-    place(toolbar_separators[1], tx + 162, top + 2, 2, 24);
-    place(properties_button, tx + 170, top, 104, 28);
+    place(model_picker, 172, top + 2, picker, 24);
+    int tx = 172 + picker + 6;
+    place(load_button, tx, top, 84, 28);
+    unload_button->hide();
+    place(toolbar_separators[1], tx + 90, top + 2, 2, 24);
+    place(properties_button, tx + 98, top, 104, 28);
     toolbar_separators[2]->hide();
     place(brand, w() - 94, top, 86, 28);
     for (Fl_Widget *widget : std::initializer_list<Fl_Widget *>{model_button,
@@ -1652,19 +1923,20 @@ private:
     int left = show_left
                    ? std::clamp(left_width, 160, std::max(160, w() - 350)) : 28;
     int cx = left + 12, cw = w() - cx - 5;
-    visible(left_header, show_left);
-    visible(search_label, show_left);
+    left_header->hide();
+    search_label->hide();
+    visible(workspace_picker, show_left);
     visible(chat_search, show_left);
     visible(sidebar, show_left);
     visible(left_divider, show_left);
-    place(left_header, 5, pane_top, left - 26, 22);
-    left_header->copy_label("Chats");
-    place(left_toggle, show_left ? left - 21 : 5, pane_top, 26, 22);
+    if (!show_left) rename_field->finish(true);
+    place(workspace_picker, 7, pane_top, left - 32, 24);
+    place(left_toggle, show_left ? left - 21 : 5, pane_top, 26, 24);
     left_toggle->copy_label(show_left ? "<" : ">");
     left_toggle->tooltip(show_left ? "Collapse Chats (F9)" : "Expand Chats (F9)");
-    place(search_label, 8, 86, 43, 23);
-    place(chat_search, 52, 86, left - 48, 23);
-    place(sidebar, 7, 114, left - 4, bottom - 114);
+    place(chat_search, 7, pane_top + 28, left - 4, 24);
+    place(sidebar, 7, pane_top + 56, left - 4, bottom - pane_top - 56);
+    if (rename_field->visible()) place_rename();
     place(left_divider, left + 5, pane_top, 6, bottom - pane_top);
     visible(tabs, show_chats);
     place(tabs, cx, pane_top, cw, 28);
@@ -1681,8 +1953,9 @@ private:
     int ay = composer + extra;
     int row = bottom - 26;
     place(prompt, cx, ay, cw - 107, row - ay - 4);
-    place(send_button, cx + cw - 101, ay, 101, 30);
-    place(stop_button, cx + cw - 101, ay + 33, 101, 26);
+    place(send_button, cx + cw - 101, ay, 101, row - ay - 4);
+    stop_button->hide();
+
     place(attach_button, cx, row, 92, 26);
     place(retry_button, cx + 96, row, 76, 26);
     place(edit_button, cx + 176, row, 78, 26);
@@ -1732,7 +2005,7 @@ private:
   static void rewrap_cb(void *data) {
     auto &w = *static_cast<Window *>(data);
     w.guard([&] {
-      if (w.busy) {
+      if (w.streaming_here()) {
         w.rendered_partial.clear();
         w.rendered_style.clear();
       }
@@ -1776,8 +2049,10 @@ private:
   static void tick_cb(void *data) {
     auto &w = *static_cast<Window *>(data);
     w.guard([&] { w.tick(); });
+    // Poll quickly while a model loads so Send unlocks the moment it is ready.
     if (w.shown())
-      Fl::repeat_timeout(1, tick_cb, data);
+      Fl::repeat_timeout(w.model_loading || (w.engine.owned() && !w.ready) ? 0.2 : 1,
+                         tick_cb, data);
   }
   void tick() {
     if (exit_requested && !closing) {
@@ -1786,7 +2061,7 @@ private:
         return;
     }
     reap_workers();
-    if (dirty && !busy &&
+    if (dirty && !streaming_here() &&
         std::chrono::steady_clock::now() - draft_changed >
             std::chrono::milliseconds(700))
       save_draft();
@@ -1838,6 +2113,12 @@ private:
         } else if (!loading && !engine.owned()) model_loading = false;
         if (became_ready && !busy)
           set_phase("Ready");
+        if (exit) pending_send = false;
+        if (became_ready && pending_send) {
+          pending_send = false;
+          if (active == pending_chat)
+            guard([&] { send(); });
+        }
         health = online           ? "Engine ready"
                  : loading        ? "Engine loading"
                  : engine.owned() ? "Engine starting"
@@ -1853,39 +2134,65 @@ private:
       });
     });
   }
+  bool streaming_here() const { return busy && !stream_chat.empty() && stream_chat == active; }
   void controls() {
     bool idle = !busy && !working && !closing;
-    for (auto w : {new_button, engine_button, model_button,
+    // Browsing chats stays available while a reply streams into one of them.
+    bool browse = !working && !closing;
+    bool here = streaming_here();
+    for (auto w : {engine_button, model_button,
                    scan_button, folder_button, use_model_button,
-                   projector_button, projector_clear, attach_button,
+                   projector_button, projector_clear,
                    remove_button, retry_button, edit_button}) {
       if (idle)
         w->activate();
       else
         w->deactivate();
     }
-    if (idle) { sidebar->activate(); chat_search->activate(); }
-    else { sidebar->deactivate(); chat_search->deactivate(); }
-    if (idle) tabs->activate();
-    else tabs->deactivate();
+    for (Fl_Widget *w : std::initializer_list<Fl_Widget *>{new_button, sidebar,
+             chat_search, tabs, workspace_picker})
+      if (browse) w->activate();
+      else w->deactivate();
+    if (browse && !here) attach_button->activate();
+    else attach_button->deactivate();
     loading_meter->run(model_loading);
     layout_status();
-    if (idle && ready && !model_path.empty() && !active.empty())
+    auto send_icon = static_cast<IconButton *>(send_button);
+    if (here) {
+      send_icon->show_as("Stop", icons::Stop);
       send_button->activate();
-    else
-      send_button->deactivate();
+    } else {
+      send_icon->show_as(pending_send ? "Queued" : "Send", icons::Send);
+      if (idle && !pending_send && !model_path.empty() && !active.empty() &&
+          (ready || engine.owned() || !engine_path.empty()))
+        send_button->activate();
+      else
+        send_button->deactivate();
+    }
     if (busy)
       stop_button->activate();
     else
       stop_button->deactivate();
-    if (idle && !engine.owned())
-      load_button->activate();
-    else
-      load_button->deactivate();
+    auto load_icon = static_cast<IconButton *>(load_button);
+    if (engine.owned()) {
+      load_icon->show_as(model_loading || !ready ? "Cancel" : "Unload", icons::Stop);
+      load_button->tooltip("Unload the model and stop the engine");
+    } else {
+      load_icon->show_as("Load", icons::Load);
+      load_button->tooltip("Load the selected model (F5)");
+    }
+    if (idle) load_button->activate();
+    else load_button->deactivate();
     if (idle && engine.owned())
       unload_button->activate();
     else
       unload_button->deactivate();
+    if (ready)
+      lamp->set(fl_rgb_color(46, 160, 67), "Model ready");
+    else if (model_loading || engine.owned())
+      lamp->set(fl_rgb_color(222, 160, 32), "Model loading");
+    else
+      lamp->set(fl_rgb_color(150, 150, 146), "No model loaded. Send loads it.");
     bool has_exchange = exchange->value() >= 0 && exchange->size() > 1;
     if (!idle || !has_exchange) {
       retry_button->deactivate();
@@ -1894,18 +2201,22 @@ private:
     } else {
       exchange->activate();
     }
-    menu_enabled("&File/&New chat", idle);
+    menu_enabled("&File/&New chat", browse);
     menu_enabled("&File/New workspace...", idle);
-    menu_enabled("&File/Close chat", idle && !active.empty());
+    menu_enabled("&File/Close chat", browse && show_chats && !active.empty());
+    menu_enabled("&File/Rename chat", browse && !active.empty());
+    menu_enabled("&File/Pin chat", browse && !active.empty());
     menu_enabled("&File/Delete chat...", idle && !active.empty());
     menu_enabled("&Edit/Workspace settings...", idle);
-    menu_enabled("&Edit/Find chat", idle);
-    menu_enabled("&View/Previous chat", idle && open_chats.size() > 1);
-    menu_enabled("&View/Next chat", idle && open_chats.size() > 1);
-    menu_enabled("&Model/Load", load_button->active());
-    menu_enabled("&Model/Unload", unload_button->active());
+    menu_enabled("&Edit/Find chat", browse);
+    menu_enabled("&Edit/Jump to chat", browse);
+    menu_enabled("&View/Previous chat", browse);
+    menu_enabled("&View/Next chat", browse);
+    menu_enabled("&Model/Load", idle && !engine.owned());
+    menu_enabled("&Model/Unload", idle && engine.owned());
+
     menu_enabled("&Model/Open model file...", idle);
-    menu_enabled("&Chat/Send", send_button->active());
+    menu_enabled("&Chat/Send", send_button->active() && !here);
     menu_enabled("&Chat/Stop response", busy);
     menu_enabled("&Chat/Retry", retry_button->active());
     menu_enabled("&Chat/Edit and resend...", edit_button->active());
@@ -1918,10 +2229,11 @@ private:
       port_input->activate();
     else
       port_input->deactivate();
-    if (busy)
+    if (here)
       prompt->deactivate();
     else
       prompt->activate();
+
     for (int i = 0; i < GenCount; ++i) {
       auto f = i == GenThinking ? static_cast<Fl_Widget *>(thinking_choice)
                                 : generation_fields[i];
@@ -1990,134 +2302,406 @@ private:
              << timings.prompt_per_second << " tok/s";
     speed_box->copy_tooltip(detail.str().c_str());
   }
-  void sidebar_action(const ChatSidebar::Row &row, bool menu) {
-    if (busy || working)
-      return;
-    if (row.kind == ChatSidebar::Workspace) {
-      if (menu) {
-        Fl_Menu_Item items[3]{};
-        items[0].text = "&New chat here";
-        items[1].text = "Workspace &settings...";
-        auto at = sidebar->context_position();
-        auto selected = items->popup(at.first, at.second);
-        if (!selected) return;
-        auto previous = workspace;
-        if (selected == &items[0]) {
-          workspace = row.id;
-          workspace_expanded[row.id] = true;
-          try {
-            new_chat();
-          } catch (...) {
-            workspace = previous;
-            throw;
-          }
-        } else {
-          edit_workspace(false, row.id);
+  // Last conversation activity. Older chats have no stamp, so their file time
+  // is read once and kept; later metadata saves must not reorder them.
+  std::time_t last_active(const std::string &id) {
+    double updated = store.chats.at(id).number("updated");
+    if (updated > 0) return static_cast<std::time_t>(updated);
+    auto found = file_times.find(id);
+    if (found != file_times.end()) return found->second;
+    struct stat info {};
+    std::time_t time = 0;
+    if (::stat((store.root / "chats" / (id + ".json")).c_str(), &info) == 0)
+      time = info.st_mtime;
+    file_times[id] = time;
+    return time;
+  }
+  void touch(Json &chat) {
+    chat.set("updated", static_cast<double>(std::time(nullptr)));
+  }
+  // Saves title, pin or workspace changes without changing the chat's place.
+  void save_meta(Json chat) {
+    if (chat.number("updated") <= 0)
+      chat.set("updated", static_cast<double>(last_active(chat.str("id"))));
+    store.save("chats", chat);
+  }
+  const SearchText &search_text(const std::string &id) {
+    const auto &chat = store.chats.at(id);
+    auto messages = chat.get("messages");
+    int count = cJSON_GetArraySize(messages);
+    auto &entry = search_cache[id];
+    auto title = chat.str("title");
+    if (entry.messages != count || entry.title != title) {
+      entry.title = title;
+      entry.messages = count;
+      entry.original.clear();
+      cJSON *p;
+      cJSON_ArrayForEach(p, messages) {
+        auto content = cJSON_GetObjectItemCaseSensitive(p, "content");
+        if (cJSON_IsString(content)) {
+          entry.original += content->valuestring;
+          entry.original += '\n';
         }
-      } else {
-        auto &expanded = *chat_search->value() ? search_workspace_expanded
-                                               : workspace_expanded;
-        expanded[row.id] = !row.expanded;
-        refresh_sidebar();
       }
-    } else if (row.kind == ChatSidebar::Chat) {
-      if (menu) {
-        Fl_Menu_Item items[4]{};
-        items[0].text = "&Open";
-        items[1].text = "&Close tab";
-        if (std::find(open_chats.begin(), open_chats.end(), row.id) == open_chats.end())
-          items[1].flags = FL_MENU_INACTIVE;
-        items[2].text = "&Delete...";
-        auto at = sidebar->context_position();
-        auto selected = items->popup(at.first, at.second);
-        if (selected == &items[0]) open_chat(row.id);
-        else if (selected == &items[1]) close_chat(row.id);
-        else if (selected == &items[2]) {
-          open_chat(row.id);
-          if (active == row.id) delete_chat();
-        }
-      } else open_chat(row.id);
+      entry.folded = fold(entry.original);
     }
+    return entry;
+  }
+  static std::string snippet(const SearchText &text, size_t at) {
+    const auto &source = text.folded.size() == text.original.size() ? text.original
+                                                                    : text.folded;
+    size_t start = at > 30 ? at - 30 : 0;
+    while (start && (static_cast<unsigned char>(source[start]) & 0xc0) == 0x80) --start;
+    if (start) {
+      auto space = source.find_first_of(" \n", start);
+      if (space != source.npos && space < at) start = space + 1;
+    }
+    auto piece = clip_words(source.substr(start, 140), 110);
+    return start ? "…" + piece : piece;
+  }
+  static ChatSidebar::Row label_row(ChatSidebar::Kind kind, const char *text) {
+    ChatSidebar::Row row{};
+    row.kind = kind;
+    row.title = text;
+    return row;
   }
   void refresh_sidebar() {
-    ChatSidebar::Row previous{};
-    bool had_selection = sidebar->value() > 0 &&
-        static_cast<size_t>(sidebar->value()) <= sidebar->entries.size();
-    if (had_selection) previous = sidebar->entries[sidebar->value() - 1];
-    int scroll = sidebar->vposition();
-    auto query = wide(chat_search->value());
-    std::transform(query.begin(), query.end(), query.begin(), towlower);
-    auto matches = [&](const std::string &text) {
-      auto value = wide(text);
-      std::transform(value.begin(), value.end(), value.begin(), towlower);
-      return value.find(query) != std::wstring::npos;
-    };
-    std::vector<std::pair<std::string, fs::file_time_type>> recent;
-    for (const auto &chat : store.chats) {
-      std::error_code ec;
-      auto time = fs::last_write_time(store.root / "chats" / (chat.first + ".json"), ec);
-      recent.emplace_back(chat.first, ec ? fs::file_time_type::min() : time);
-    }
-    std::sort(recent.begin(), recent.end(), [](const auto &a, const auto &b) {
-      return a.second != b.second ? a.second > b.second : a.first < b.first;
-    });
+    std::string previous;
+
+    if (sidebar->selectable(sidebar->value()))
+      previous = sidebar->entries[sidebar->value() - 1].id;
+    auto query = clip_words(fold(chat_search->value()), 200);
+    auto now = std::time(nullptr);
     auto &rows = sidebar->entries;
     rows.clear();
-    // Filter once, keeping chats in recency order within each workspace.
-    std::map<std::string, std::vector<std::string>> children;
-    for (const auto &entry : recent) {
-      const auto &chat = store.chats.at(entry.first);
-      if (matches(chat.str("title")) || matches(store.workspaces.at(chat.str("workspace")).str("name"))) {
-        children[chat.str("workspace")].push_back(entry.first);
+    struct Item {
+      std::string id;
+      std::time_t time;
+      size_t at;
+    };
+    auto by_time = [](const Item &a, const Item &b) {
+      return a.time != b.time ? a.time > b.time : a.id < b.id;
+    };
+    auto chat_row = [&](const Item &item, const std::string &snip = "") {
+      const auto &chat = store.chats.at(item.id);
+      ChatSidebar::Row row{ChatSidebar::Chat, item.id, clean_label(chat.str("title")),
+                           when_label(item.time, now), snip};
+      row.pinned = chat.number("pinned") != 0;
+      if (!query.empty() && chat.str("workspace") != workspace)
+        row.when = clean_label(store.workspaces.at(chat.str("workspace")).str("name")) +
+                   (row.when.empty() ? "" : " · " + row.when);
+      rows.push_back(row);
+    };
+    if (query.empty()) {
+      std::vector<Item> pinned, items;
+      for (const auto &chat : store.chats)
+        if (chat.second.str("workspace") == workspace)
+          (chat.second.number("pinned") != 0 ? pinned : items)
+              .push_back({chat.first, last_active(chat.first), 0});
+      std::sort(pinned.begin(), pinned.end(), by_time);
+      std::sort(items.begin(), items.end(), by_time);
+      if (!pinned.empty()) {
+        rows.push_back(label_row(ChatSidebar::Section, "PINNED"));
+        for (const auto &item : pinned) chat_row(item);
       }
-    }
-    std::vector<std::pair<std::string, std::string>> groups;
-    for (const auto &ws : store.workspaces)
-      if (query.empty() || children.count(ws.first) || matches(ws.second.str("name")))
-        groups.emplace_back(ws.second.str("name"), ws.first);
-    std::sort(groups.begin(), groups.end());
-    // Search reveals matches without changing the saved tree state.
-    auto &states = query.empty() ? workspace_expanded : search_workspace_expanded;
-    for (const auto &ws : groups) {
-      bool expanded = states.try_emplace(ws.second, true).first->second;
-      rows.push_back({ChatSidebar::Workspace, ws.second, clean_label(ws.first), expanded});
-      if (!expanded) continue;
-      auto found = children.find(ws.second);
-      if (found == children.end()) {
-        rows.push_back({ChatSidebar::Empty, "", "No chats yet", false, true});
-      } else {
-        for (const auto &id : found->second)
-          rows.push_back({ChatSidebar::Chat, id,
-                          clean_label(store.chats.at(id).str("title")), false, true});
+      std::tm day = *std::localtime(&now);
+      day.tm_hour = day.tm_min = day.tm_sec = 0;
+      std::time_t today = std::mktime(&day);
+      const std::pair<std::time_t, const char *> groups[] = {
+          {today, "TODAY"}, {today - 86400, "YESTERDAY"},
+          {today - 6 * 86400, "PREVIOUS 7 DAYS"},
+          {today - 29 * 86400, "PREVIOUS 30 DAYS"},
+          {std::numeric_limits<std::time_t>::min(), "OLDER"}};
+      size_t group = std::size(groups);
+      for (const auto &item : items) {
+        size_t g = 0;
+        while (g + 1 < std::size(groups) && item.time < groups[g].first) ++g;
+        if (g != group) {
+          group = g;
+          rows.push_back(label_row(ChatSidebar::Section, groups[g].second));
+        }
+        chat_row(item);
       }
-    }
-    if (rows.empty()) rows.push_back({ChatSidebar::Empty, "", "No matching chats"});
-    if (show_recents && query.empty()) {
-      rows.push_back({ChatSidebar::Section, "", "Recent chats"});
-      for (const auto &entry : recent)
-        rows.push_back({ChatSidebar::Chat, entry.first,
-                        clean_label(store.chats.at(entry.first).str("title"))});
-      if (recent.empty()) rows.push_back({ChatSidebar::Empty, "", "No chats yet"});
+      if (rows.empty())
+        rows.push_back(label_row(ChatSidebar::Empty, "No chats yet. Ctrl+N starts one."));
+    } else {
+      std::vector<Item> titles, contents;
+      for (const auto &chat : store.chats) {
+        if (fold(chat.second.str("title")).find(query) != std::string::npos)
+          titles.push_back({chat.first, last_active(chat.first), 0});
+        else {
+          auto at = search_text(chat.first).folded.find(query);
+          if (at != std::string::npos)
+            contents.push_back({chat.first, last_active(chat.first), at});
+        }
+      }
+      std::sort(titles.begin(), titles.end(), by_time);
+      std::sort(contents.begin(), contents.end(), by_time);
+      if (!titles.empty()) {
+        rows.push_back(label_row(ChatSidebar::Section, "TITLES"));
+        for (const auto &item : titles) chat_row(item);
+      }
+      if (!contents.empty()) {
+        rows.push_back(label_row(ChatSidebar::Section, "MESSAGES"));
+        size_t shown = 0;
+        for (const auto &item : contents) {
+          if (++shown > 200) break;
+          chat_row(item, snippet(search_cache.at(item.id), item.at));
+        }
+      }
+      if (rows.empty()) rows.push_back(label_row(ChatSidebar::Empty, "No matches"));
     }
     sidebar->active = active;
-    sidebar->workspace = workspace;
     new_button->copy_tooltip(("New chat in " + store.workspaces.at(workspace).str("name") +
                              " (Ctrl+N)").c_str());
     sidebar->refresh();
-    int selected = 0, fallback = 0;
-    for (size_t i = 0; i < rows.size(); ++i) {
-      const auto &row = rows[i];
-      if (row.kind != ChatSidebar::Chat && row.kind != ChatSidebar::Workspace) continue;
-      int index = static_cast<int>(i) + 1;
-      if (!fallback || (row.kind == ChatSidebar::Workspace && row.id == workspace))
-        fallback = index;
-      if (row.kind == ChatSidebar::Chat && row.id == active && row.indented) fallback = index;
-      if (had_selection && row.kind == previous.kind && row.id == previous.id &&
-          row.indented == previous.indented)
-        selected = index;
+    int line = previous.empty() ? 0 : sidebar->line_of(previous);
+    if (!line) line = sidebar->line_of(active);
+    sidebar->value(line);
+  }
+  void sidebar_action(const ChatSidebar::Row &row, ChatSidebar::Action action) {
+    if (working || !store.chats.count(row.id))
+      return;
+    switch (action) {
+    case ChatSidebar::Open: open_chat(row.id); break;
+    case ChatSidebar::Rename: begin_rename(row.id); break;
+    case ChatSidebar::Delete: delete_chat(row.id); break;
+    case ChatSidebar::Menu: chat_menu(row.id); break;
     }
-    sidebar->value(selected ? selected : fallback);
-    sidebar->vposition(scroll);
+  }
+  void chat_menu(const std::string &id) {
+    const auto &chat = store.chats.at(id);
+    bool pinned = chat.number("pinned") != 0;
+    std::vector<std::pair<std::string, std::string>> targets;
+    for (const auto &ws : store.workspaces)
+      if (ws.first != chat.str("workspace"))
+        targets.emplace_back(menu_label(clean_label(ws.second.str("name"))), ws.first);
+    std::sort(targets.begin(), targets.end());
+    enum { Open = 1, Rename, Pin, Close, Delete, Move = 100 };
+    std::vector<Fl_Menu_Item> items;
+    auto item = [&](const char *text, long code, int flags = 0, int key = 0) {
+      Fl_Menu_Item m{};
+      m.text = text;
+      m.shortcut_ = key;
+      m.user_data_ = reinterpret_cast<void *>(code);
+      m.flags = flags;
+      items.push_back(m);
+    };
+    bool tab = show_chats &&
+               std::find(open_chats.begin(), open_chats.end(), id) != open_chats.end();
+    item("&Open", Open);
+    item("&Rename", Rename, 0, FL_F + 2);
+    item(pinned ? "Un&pin" : "&Pin to top", Pin, targets.empty() && !tab ? FL_MENU_DIVIDER : 0);
+    if (!targets.empty()) {
+      item("&Move to", 0, FL_SUBMENU | (tab ? 0 : FL_MENU_DIVIDER));
+      for (size_t i = 0; i < targets.size(); ++i)
+        item(targets[i].first.c_str(), Move + static_cast<long>(i));
+      items.push_back(Fl_Menu_Item{});
+    }
+    if (tab) item("&Close tab", Close, FL_MENU_DIVIDER);
+    item("&Delete...", Delete, busy && id == stream_chat ? FL_MENU_INACTIVE : 0,
+         FL_Delete);
+    items.push_back(Fl_Menu_Item{});
+    auto at = sidebar->context_position();
+    auto chosen = items.data()->popup(at.first, at.second);
+    if (!chosen) return;
+    long code = reinterpret_cast<long>(chosen->user_data_);
+    if (code == Open) open_chat(id);
+    else if (code == Rename) begin_rename(id);
+    else if (code == Pin) toggle_pin(id);
+    else if (code == Close) close_chat(id);
+    else if (code == Delete) delete_chat(id);
+    else if (code >= Move && static_cast<size_t>(code - Move) < targets.size())
+      move_chat(id, targets[code - Move].second);
+  }
+  void toggle_pin(const std::string &id) {
+    if (working || !store.chats.count(id)) return;
+    auto chat = store.chats.at(id);
+    chat.set("pinned", chat.number("pinned") != 0 ? 0.0 : 1.0);
+    save_meta(chat);
+    refresh_sidebar();
+  }
+  void move_chat(const std::string &id, const std::string &target) {
+    if (working || !store.chats.count(id) || !store.workspaces.count(target)) return;
+    auto chat = store.chats.at(id);
+    chat.set("workspace", target);
+    save_meta(chat);
+    if (id == active) show_chat(true);
+    refresh_workspaces();
+    refresh_sidebar();
+    set_phase("Moved to " + store.workspaces.at(target).str("name"));
+  }
+  void begin_rename(const std::string &id) {
+    if (working || id.empty() || !store.chats.count(id)) return;
+    if (!show_left) {
+      show_left = true;
+      layout();
+    }
+    if (!sidebar->line_of(id) && *chat_search->value()) {
+      chat_search->value("");
+      refresh_sidebar();
+    }
+    int line = sidebar->line_of(id);
+    if (!line) return;
+    sidebar->select_line(line);
+    renaming = id;
+    rename_field->value(store.chats.at(id).str("title").c_str());
+    place_rename();
+    rename_field->show();
+    rename_field->take_focus();
+    rename_field->insert_position(0, rename_field->size());
+  }
+  void place_rename() {
+    int line = sidebar->line_of(renaming);
+    int bar = sidebar->scrollbar.visible() ? Fl::scrollbar_size() : 0;
+    int top = std::clamp(sidebar->line_y(std::max(line, 1)), sidebar->y() + 2,
+                         sidebar->y() + std::max(2, sidebar->h() - 26));
+    place(rename_field, sidebar->x() + 6, top, sidebar->w() - 10 - bar, 24);
+    rename_field->redraw();
+    sidebar->redraw();
+  }
+  void finish_rename(bool save) {
+    auto id = renaming;
+    renaming.clear();
+    if (save && store.chats.count(id)) {
+      auto title = clip_words(rename_field->value(), 200);
+      if (!title.empty() && title != store.chats.at(id).str("title")) {
+        auto chat = store.chats.at(id);
+        chat.set("title", title);
+        chat.set("renamed", 1.0);
+        save_meta(chat);
+        refresh_tabs();
+      }
+    }
+    refresh_sidebar();
+    if (Fl::event() == FL_KEYBOARD) sidebar->take_focus();
+    redraw();
+  }
+  void focus_search() {
+    if (!show_left) {
+      show_left = true;
+      layout();
+    }
+    chat_search->take_focus();
+    chat_search->insert_position(0, chat_search->size());
+  }
+  // Ctrl+Page Up/Down follow the tabs when shown, otherwise the list order.
+  void step_chat(int direction) {
+    if (show_chats) {
+      tabs->step(direction);
+      return;
+    }
+    int line = sidebar->line_of(active);
+    for (int next = line + direction; line && next > 0 && next <= sidebar->size();
+         next += direction)
+      if (sidebar->selectable(next)) {
+        open_chat(sidebar->entries[next - 1].id);
+        return;
+      }
+  }
+  void refresh_workspaces() {
+    workspace_picker->clear();
+    workspace_ids.clear();
+    std::vector<std::pair<std::string, std::string>> list;
+    for (const auto &ws : store.workspaces)
+      list.emplace_back(clean_label(ws.second.str("name")), ws.first);
+    std::sort(list.begin(), list.end());
+    for (const auto &ws : list) {
+      auto text = ws.first;
+      for (size_t at = 0; (at = text.find('&', at)) != text.npos; at += 2)
+        text.insert(at, "&");
+      int index = workspace_picker->add(("\x01" + std::to_string(workspace_ids.size())).c_str());
+      workspace_picker->replace(index, text.c_str());
+      workspace_ids.push_back(ws.second);
+    }
+    workspace_picker->mode(static_cast<int>(workspace_ids.size()) - 1, FL_MENU_DIVIDER);
+    workspace_picker->add("\x01" "new");
+    workspace_picker->replace(static_cast<int>(workspace_ids.size()), "New workspace...");
+    workspace_picker->add("\x01" "settings");
+    workspace_picker->replace(static_cast<int>(workspace_ids.size()) + 1,
+                              "Workspace settings...");
+    for (size_t i = 0; i < workspace_ids.size(); ++i)
+      if (workspace_ids[i] == workspace)
+        workspace_picker->value(static_cast<int>(i));
+  }
+  void pick_workspace() {
+    int i = workspace_picker->value();
+    if (i < 0) return;
+    if (static_cast<size_t>(i) < workspace_ids.size()) {
+      switch_workspace(workspace_ids[i]);
+      return;
+    }
+    refresh_workspaces();
+    edit_workspace(static_cast<size_t>(i) == workspace_ids.size());
+  }
+  // Switching opens the workspace's most recent chat, or a fresh one.
+  void switch_workspace(const std::string &id) {
+    if (working || id == workspace || !store.workspaces.count(id)) return;
+    chat_search->value("");
+    std::string best;
+    std::time_t latest = 0;
+    for (const auto &chat : store.chats)
+      if (chat.second.str("workspace") == id &&
+          (best.empty() || last_active(chat.first) > latest)) {
+        best = chat.first;
+        latest = last_active(chat.first);
+      }
+    if (best.empty()) {
+      save_draft();
+      workspace = id;
+      new_chat();
+    } else
+      open_chat(best);
+    refresh_workspaces();
+    refresh_sidebar();
+  }
+  // Asks the loaded model for a short title; the instant title stays if the
+  // engine is busy, thinks instead of answering, or the user renames first.
+  void suggest_title(const std::string &id, const std::string &question,
+                     const std::string &answer) {
+    if (title_transport) title_transport->cancel();
+    auto t = std::make_shared<Transport>(port());
+    title_transport = t;
+    Json body, system, user, kwargs;
+    auto messages = Json::array();
+    system.set("role", std::string("system"));
+    system.set("content", std::string(
+        "You name chat conversations. Reply with only a title of 2 to 6 words "
+        "in the language of the conversation. No quotes. No final punctuation."));
+    user.set("role", std::string("user"));
+    user.set("content", "User: " + truncate(question, 600) + "\nAssistant: " +
+                            truncate(answer, 300) + "\n\nTitle:");
+    messages.add(system);
+    messages.add(user);
+    body.set("model", std::string("local"));
+    body.set("messages", messages);
+    body.set("max_tokens", 24.0);
+    body.set("temperature", 0.2);
+    cJSON_AddBoolToObject(kwargs.p, "enable_thinking", 0);
+    body.set("chat_template_kwargs", kwargs);
+    cJSON_AddBoolToObject(body.p, "stream", 0);
+    auto wire = body.dump();
+    launch([this, t, id, wire] {
+      std::string title;
+      try {
+        auto reply = Json::parse(t->exchange("/v1/chat/completions", &wire, {}, 30));
+        auto first = cJSON_GetArrayItem(reply.get("choices"), 0);
+        auto message = first ? cJSON_GetObjectItemCaseSensitive(first, "message") : nullptr;
+        auto content = message ? cJSON_GetObjectItemCaseSensitive(message, "content") : nullptr;
+        if (cJSON_IsString(content)) title = tidy_title(content->valuestring);
+      } catch (const std::exception &) {
+      }
+      post([this, t, id, title] {
+        if (title_transport == t) title_transport.reset();
+        if (title.empty() || t->cancelled || !store.chats.count(id)) return;
+        auto chat = store.chats.at(id);
+        if (chat.number("renamed") != 0) return;
+        chat.set("title", title);
+        save_meta(chat);
+        refresh_tabs();
+        refresh_sidebar();
+      });
+    });
   }
   void refresh_tabs() {
     tabs->entries.clear();
@@ -2138,24 +2722,27 @@ private:
     auto saved_attachments = saved.get("draft_attachments")
                                  ? saved.object("draft_attachments").dump() : "[]";
     if (saved.str("draft") != candidate.str("draft") || saved_attachments != attachments.dump())
-      store.save("chats", candidate);
+      save_meta(candidate);
     dirty = false;
   }
   void open_chat(const std::string &id) {
-    if (busy || working)
+    if (working || !store.chats.count(id))
       return;
-    if (!store.chats.count(id))
+    if (id == active) {
+
+      refresh_sidebar();
       return;
+    }
     save_draft();
     if (std::find(open_chats.begin(), open_chats.end(), id) ==
         open_chats.end()) {
+      // Tabs are history now; the oldest quietly gives way.
       if (open_chats.size() >= 32)
-        throw std::runtime_error("Close a chat tab before opening another.");
+        open_chats.erase(open_chats.begin());
       open_chats.push_back(id);
     }
     active = id;
-    if (!*chat_search->value())
-      workspace_expanded[store.chats.at(id).str("workspace")] = true;
+    stream_prefix = -1;
     show_chat();
     refresh_sidebar();
   }
@@ -2193,15 +2780,18 @@ private:
     refresh_attachments();
     render(preserve_view);
     refresh_tabs();
+    if (workspace_picker->size() &&
+        (workspace_picker->value() < 0 ||
+         workspace_ids.at(workspace_picker->value()) != workspace))
+      refresh_workspaces();
     layout();
     controls();
   }
   void new_chat() {
-    if (busy || working)
+    if (working)
       return;
     save_draft();
     chat_search->value("");
-    search_workspace_expanded.clear();
     for (const auto &c : store.chats) {
       if (c.second.str("workspace") == workspace &&
           cJSON_GetArraySize(c.second.get("messages")) == 0 &&
@@ -2216,7 +2806,7 @@ private:
     open_chat(chat.str("id"));
   }
   void close_chat(const std::string &id) {
-    if (busy || working)
+    if (working)
       return;
     save_draft();
     open_chats.erase(std::remove(open_chats.begin(), open_chats.end(), id),
@@ -2241,21 +2831,37 @@ private:
     layout();
     controls();
   }
-  void delete_chat() {
-    if (busy || working || active.empty())
+  void delete_chat(std::string id = "") {
+    if (id.empty()) id = active;
+    if (working || id.empty() || !store.chats.count(id))
       return;
-    if (fl_choice("Delete this saved conversation? This cannot be undone.",
-                  "Cancel", "Delete", nullptr) != 1)
+    if (busy && id == stream_chat)
+      throw std::runtime_error("Stop the reply before deleting this chat.");
+    auto title = clip_words(store.chats.at(id).str("title"), 80);
+    if (fl_choice("Delete \"%s\"?\nThis cannot be undone.", "Cancel", "Delete",
+                  nullptr, title.c_str()) != 1)
       return;
-    auto id = active;
+    // Selection moves to the neighbouring row, as in a file list.
+    std::string next;
+    int line = sidebar->line_of(id);
+    for (int step : {1, -1}) {
+      for (int at = line + step; line && next.empty() && at > 0 && at <= sidebar->size(); at += step)
+        if (sidebar->selectable(at)) next = sidebar->entries[at - 1].id;
+    }
     store.erase(id);
+    search_cache.erase(id);
+    file_times.erase(id);
     open_chats.erase(std::remove(open_chats.begin(), open_chats.end(), id),
                      open_chats.end());
-    active = open_chats.empty() ? "" : open_chats.back();
-    if (active.empty())
-      new_chat();
-    else
-      show_chat();
+    if (id == active) {
+      active.clear();
+      stream_prefix = -1;
+      if (!next.empty() && store.chats.count(next))
+        open_chat(next);
+      else
+        new_chat();
+    }
+    refresh_tabs();
     refresh_sidebar();
   }
   void append(std::string &text, std::string &style, const std::string &s,
@@ -2358,7 +2964,7 @@ private:
     }
   }
   void render(bool preserve_view = false) {
-    if (busy && stream_prefix >= 0) {
+    if (streaming_here() && stream_prefix >= 0) {
       render_partial();
       return;
     }
@@ -2409,7 +3015,7 @@ private:
         ++i;
       }
     }
-    if (busy) {
+    if (streaming_here()) {
       speaker(text, style, false);
       message_text(text, style, partial_prompt, 'A');
       message_end(text, style);
@@ -2428,7 +3034,7 @@ private:
         text_buffer.select(std::min(selection_start, text_buffer.length()),
                            std::min(selection_end, text_buffer.length()));
     }
-    if (busy)
+    if (streaming_here())
       render_partial();
   }
   void select_exchange(bool scroll = true) {
@@ -2492,6 +3098,9 @@ private:
     auto draft = Json(cJSON_Duplicate(original, 1)).str("content");
     auto branch = store.branch(chat, static_cast<size_t>(turn), draft,
                                edit ? "Edit" : "Retry");
+    branch.set("pinned", 0.0);
+    touch(branch);
+    store.save("chats", branch);
     open_chat(branch.str("id"));
     if (edit)
       prompt->take_focus();
@@ -2539,11 +3148,13 @@ private:
       auto result = store.workspace(name.value(), buffer_text(buffer),
                                     create ? "" : id);
       if (create) {
+        save_draft();
         workspace = result.str("id");
         new_chat();
       } else if (id == workspace) {
         set_text(master_buffer, result.str("master_prompt"));
       }
+      refresh_workspaces();
       refresh_sidebar();
       layout();
     }
@@ -2948,8 +3559,9 @@ private:
         });
   }
   void unload() {
-    if (busy || working || probing || !engine.owned())
+    if (busy || working || !engine.owned())
       return;
+    pending_send = false;
     ready = false;
     model_loading = false;
     job(
@@ -3112,6 +3724,27 @@ private:
     if (model_path.empty())
       throw std::runtime_error(
           "Select the GGUF model used by the local server first.");
+    // Send loads the model when needed and goes out as soon as it is ready.
+    if (!ready) {
+      if (!engine.owned() && engine_path.empty())
+        throw std::runtime_error("Choose a llama-server under Properties > Engine first.");
+      save_draft();
+      pending_send = true;
+      pending_chat = active;
+      if (!engine.owned()) {
+        try {
+          load_model(cJSON_GetArraySize(attachments.p) > 0 && !projector.empty());
+        } catch (...) {
+          pending_send = false;
+          throw;
+        }
+        if (!model_loading) pending_send = false;
+      }
+      if (pending_send) set_phase("Loading model. Your message sends when it is ready.");
+      controls();
+      return;
+    }
+    if (title_transport) title_transport->cancel();
     save_draft();
     auto id = active, model = model_path;
     auto messages = store.chats.at(id).object("messages");
@@ -3122,6 +3755,7 @@ private:
     transport = std::make_shared<Transport>(port());
     auto t = transport;
     busy = true;
+    stream_chat = id;
     stream_prefix = -1;
     started = std::chrono::steady_clock::now();
     partial_prompt = text;
@@ -3168,7 +3802,7 @@ private:
             timings = performance;
             update_speed();
             phase_box->copy_label(phase.c_str());
-            render();
+            if (streaming_here()) render();
           });
         });
         post([this, id, model, text, attached, reply] {
@@ -3194,11 +3828,11 @@ private:
             candidate.set("messages", list);
             candidate.set("draft", std::string());
             candidate.set("draft_attachments", Json::array());
-            if (cJSON_GetArraySize(list.p) == 2) {
-              auto title = text;
-              std::replace(title.begin(), title.end(), '\n', ' ');
-              candidate.set("title", truncate(title, 80));
-            }
+            bool first = cJSON_GetArraySize(list.p) == 2 &&
+                         candidate.number("renamed") == 0;
+            if (first)
+              candidate.set("title", quick_title(text));
+            touch(candidate);
             store.chats.insert_or_assign(id, candidate);
             try {
               store.save("chats", candidate);
@@ -3206,10 +3840,17 @@ private:
               error("Reply is still in memory; save failed: " +
                     std::string(e.what()));
             }
-            show_chat(true);
+            if (active == id)
+              show_chat(true);
+            else
+              controls();
+            refresh_tabs();
             refresh_sidebar();
-          } else
+            if (first && reply.status == "complete" && !reply.content.empty())
+              suggest_title(id, text, reply.content);
+          } else if (active == id)
             render(true);
+
           auto elapsed = std::chrono::duration<double>(
                              std::chrono::steady_clock::now() - started)
                              .count();
@@ -3269,13 +3910,8 @@ private:
       config.set("linux-layout", "vertical", vertical.dump());
       config.set("linux-layout", "left", show_left ? "1" : "0");
       config.set("linux-layout", "right", show_right ? "1" : "0");
-      config.set("linux-layout", "chats", show_chats ? "1" : "0");
-      config.set("linux-layout", "recents", show_recents ? "1" : "0");
+      config.set("linux-layout", "tabs", show_chats ? "1" : "0");
       config.set("linux-layout", "output", show_output ? "1" : "0");
-      Json expanded;
-      for (const auto &ws : workspace_expanded)
-        cJSON_AddBoolToObject(expanded.p, ws.first.c_str(), ws.second);
-      config.set("linux-layout", "workspaces", expanded.dump());
       config.save();
       Fl::remove_timeout(tick_cb, this);
       hide();
