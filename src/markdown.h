@@ -6,4 +6,7 @@ enum { MdBold=1, MdItalic=2, MdCode=4, MdHeading=8, MdQuote=16, MdBlock=32 };
 /* Text spans are NUL terminated; source text is never modified. */
 typedef void (*MarkdownEmit)(void *context, const wchar_t *text, unsigned style);
 void markdown_render(const wchar_t *text, MarkdownEmit emit, void *context);
+/* Same, fitting tables into columns characters (0 = no limit). */
+void markdown_render_width(const wchar_t *text, size_t columns, MarkdownEmit emit,
+    void *context);
 #endif

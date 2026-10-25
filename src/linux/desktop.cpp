@@ -568,6 +568,7 @@ public:
   std::function<void()> selected;
   std::function<void(bool)> follow_changed;
   std::function<bool(int)> disclosure;
+  std::function<void()> rewrapped;
   bool following = true;
   Transcript() {
     box(TranscriptFrame);
@@ -581,8 +582,17 @@ public:
   void resize(int X, int Y, int W, int H) override {
     bool changed = W != w();
     ReadingDisplay::resize(X, Y, W, H);
-    if (changed)
+    if (changed) {
       wrap_mode(WRAP_AT_PIXEL, std::max(80, std::min(720, W - 47)));
+      if (rewrapped)
+        rewrapped();
+    }
+  }
+  // Monospace characters per line, so tables can be fitted to the pane.
+  size_t columns() const {
+    fl_font(FL_COURIER, 13);
+    double glyph = fl_width("0");
+    return glyph > 0 ? static_cast<size_t>(std::max(80, std::min(720, w() - 47)) / glyph) : 0;
   }
   void follow(bool value) {
     following = value;
@@ -862,7 +872,7 @@ class Window : public Fl_Double_Window {
   Composer *prompt;
   Fl_Text_Buffer text_buffer, style_buffer, prompt_buffer, activity_buffer,
       log_buffer, master_buffer;
-  static constexpr int StyleCount = 15;
+  static constexpr int StyleCount = 16;
   Fl_Text_Display::Style_Table_Entry styles[StyleCount] = {
       {Ink, FL_HELVETICA, 13, 0, FL_WHITE},
       {FL_WHITE, FL_HELVETICA_BOLD, 13, Fl_Text_Display::ATTR_BGCOLOR_EXT, Title},
@@ -878,7 +888,8 @@ class Window : public Fl_Double_Window {
       {ThinkingInk, FL_HELVETICA_BOLD, 13, 0, FL_WHITE},
       {Ink, FL_HELVETICA_BOLD, 13, Fl_Text_Display::ATTR_BGCOLOR_EXT, Face},
       {Ink, FL_COURIER, 13, Fl_Text_Display::ATTR_BGCOLOR_EXT, CodePaper},
-      {ThinkingInk, FL_COURIER, 12, Fl_Text_Display::ATTR_BGCOLOR_EXT, CodePaper}};
+      {ThinkingInk, FL_COURIER, 12, Fl_Text_Display::ATTR_BGCOLOR_EXT, CodePaper},
+      {Ink, FL_COURIER_BOLD, 13, Fl_Text_Display::ATTR_BGCOLOR_EXT, CodePaper}};
   Fl_Hold_Browser *attachment_list;
   ClassicTable *model_list, *details;
   bool descending = false;
@@ -1338,6 +1349,11 @@ private:
       visible(latest_button, !follow);
     };
     latest_button->hide();
+    transcript->rewrapped = [&] {
+      // Tables depend on the pane width; re-render once the resize settles.
+      Fl::remove_timeout(rewrap_cb, this);
+      Fl::add_timeout(0.15, rewrap_cb, this);
+    };
     transcript->disclosure = [&](int position) {
       for (const auto &item : disclosures)
         if (position >= item.start && position < item.end) {
@@ -1720,6 +1736,16 @@ private:
     Fl::awake(awake_cb, this);
   }
   static void awake_cb(void *data) { static_cast<Window *>(data)->drain(); }
+  static void rewrap_cb(void *data) {
+    auto &w = *static_cast<Window *>(data);
+    w.guard([&] {
+      if (w.busy) {
+        w.rendered_partial.clear();
+        w.rendered_style.clear();
+      }
+      w.render(true);
+    });
+  }
   void drain() {
     std::deque<std::function<void()>> pending;
     {
@@ -2268,14 +2294,14 @@ private:
       std::string *text, *style;
       bool thinking;
     } out{this, &text, &style, thinking};
-    markdown_render(
-        wide(s).c_str(),
+    markdown_render_width(
+        wide(s).c_str(), transcript->columns(),
         +[](void *v, const wchar_t *s, unsigned flags) {
           auto &o = *static_cast<Output *>(v);
           char code = o.thinking
                       ? (flags & MdBlock ? 'O' : flags & MdCode ? 'K' : flags & MdHeading ? 'L'
                          : flags & MdBold ? 'I' : flags & MdItalic ? 'J' : 'H')
-                      : flags & MdBlock     ? 'N'
+                      : flags & MdBlock     ? (flags & MdBold ? 'P' : 'N')
                       : flags & MdCode      ? 'E'
                       : flags & MdHeading ? 'F'
                       : flags & MdBold    ? 'C'
