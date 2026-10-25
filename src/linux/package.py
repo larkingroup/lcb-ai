@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def package(build, output):
-    name = 'lcb-ai-v0.16-linux-fltk-' + platform.machine()
+    name = 'lcb-ai-v0.17-linux-fltk-' + platform.machine()
     for filename in ('lcb-ai', 'lcb-cli'):
         binary = build / filename
         if not binary.is_file() or binary.read_bytes()[:4] != b'\x7fELF':
@@ -38,7 +38,7 @@ def package(build, output):
         shutil.copy2(ROOT / 'src/linux/lcb-ai.desktop', app / 'lcb-ai.desktop')
         shutil.copy2(ROOT / 'README.md', app / 'README.md')
         (app / 'RUNNING.txt').write_text(
-            'LCB-AI v0.16 — native Linux / FLTK\n\n'
+            'LCB-AI v0.17 — native Linux / FLTK\n\n'
             'Run ./lcb-ai. Both executables are compiled ELF binaries.\n'
             'No Python or Qt runtime is required.\n'
             'System libraries: libcurl, OpenSSL, and the display/font libraries\n'
