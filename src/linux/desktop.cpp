@@ -11,6 +11,7 @@
 #include <FL/Fl_Int_Input.H>
 #include <FL/Fl_Menu_Bar.H>
 #include <FL/Fl_RGB_Image.H>
+#include <FL/Fl_SVG_Image.H>
 #include <FL/Fl_Return_Button.H>
 #include <FL/Fl_Scrollbar.H>
 #include <FL/Fl_Scroll.H>
@@ -148,6 +149,35 @@ void field_box(int x, int y, int w, int h, Fl_Color color) {
 const Fl_Boxtype FieldBox = static_cast<Fl_Boxtype>(FL_FREE_BOXTYPE + 1);
 // Tahoma ships beside the executable; it is registered for this process only.
 // Returns whether it is available, bundled or installed.
+// The executable's folder; bundled fonts and assets sit beside it.
+fs::path exe_dir() {
+  char self[4096];
+  ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+  if (n <= 0) return {};
+  self[n] = 0;
+  return fs::path(self).parent_path();
+}
+// Window icons from the logo: the simple mark for small sizes, the full one above.
+void set_window_icons() {
+  auto dir = exe_dir();
+  static std::vector<std::unique_ptr<Fl_SVG_Image>> images;
+  for (const auto &[file, size] : {std::pair<const char *, int>{"lcb-icon-small.svg", 16},
+                                   {"lcb-icon-small.svg", 24}, {"lcb-icon.svg", 32},
+                                   {"lcb-icon.svg", 48}, {"lcb-icon.svg", 64}}) {
+    for (const auto &folder : {dir / "assets", dir.parent_path() / "share/lcb-ai"}) {
+      std::error_code error;
+      if (!fs::is_regular_file(folder / file, error)) continue;
+      auto image = std::make_unique<Fl_SVG_Image>((folder / file).c_str());
+      if (image->fail()) break;
+      image->resize(size, size);
+      images.push_back(std::move(image));
+      break;
+    }
+  }
+  std::vector<const Fl_RGB_Image *> list;
+  for (const auto &image : images) list.push_back(image.get());
+  if (!list.empty()) Fl_Window::default_icons(list.data(), static_cast<int>(list.size()));
+}
 bool load_interface_font() {
   // As Wine's own fontconfig rule: the embedded bitmap strikes have metrics
   // that disagree with the outlines, which spaces letters unevenly.
@@ -156,12 +186,7 @@ bool load_interface_font() {
       "<fontconfig><match target=\"font\"><test name=\"family\">"
       "<string>Tahoma</string></test><edit name=\"embeddedbitmap\" mode=\"assign\">"
       "<bool>false</bool></edit></match></fontconfig>"), FcFalse);
-  char self[4096];
-
-  ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
-  if (n > 0) {
-    self[n] = 0;
-    auto dir = fs::path(self).parent_path();
+  if (auto dir = exe_dir(); !dir.empty()) {
     for (const auto &folder : {dir / "fonts", dir.parent_path() / "share/lcb-ai/fonts"})
       for (const char *file : {"tahoma.ttf", "tahomabd.ttf"}) {
         std::error_code error;
@@ -4190,6 +4215,8 @@ int main(int argc, char **argv) {
   int result = 0;
   try {
     theme();
+    set_window_icons();
+
     std::signal(SIGTERM, exit_signal);
     std::signal(SIGINT, exit_signal);
     Fl::lock();

@@ -1,1 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" width="40" height="40" role="img"><title>LCB</title><rect width="40" height="40" rx="4" fill="#fff"/><g transform="translate(5 7) scale(0.2677580640579736)"><path fill="#202124" d="M8.789 108.633L8.789 22.734L20.156 22.734L20.156 98.496L62.461 98.496L62.461 108.633Z" transform="translate(-8.7890625 -22.734375)"/></g><rect x="29" y="7" width="6" height="6" fill="#d94732"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img"><title>LCB AI</title>
+<path fill="#202124" stroke="#fff" stroke-width="2.5" stroke-linejoin="round" d="M12 9H50Q58 9 58 17V40Q58 48 50 48H27L15 58V48H12Q4 48 4 40V17Q4 9 12 9Z"/>
+<g fill="none" stroke="#fff" stroke-width="4.2" stroke-linecap="square" stroke-linejoin="miter">
+<path d="M13 19V38H21"/>
+<path d="M36.5 20.5Q34.5 19 31.5 19Q25 19 25 28.5Q25 38 31.5 38Q34.5 38 36.5 36.5"/>
+<path d="M42 19V38H46.5Q51 38 51 33Q51 28.5 46.5 28.5H42M42 28.5H45.5Q49.5 28.5 49.5 24Q49.5 19 45.5 19H42"/>
+</g>
+<path fill="#d94732" stroke="#fff" stroke-width="2" stroke-linejoin="round" d="M53 1Q54.6 8.4 62 10Q54.6 11.6 53 19Q51.4 11.6 44 10Q51.4 8.4 53 1Z"/>
+</svg>

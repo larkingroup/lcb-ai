@@ -26,7 +26,8 @@ def package(build, output):
         for filename in ('lcb-ai', 'lcb-cli'):
             shutil.copy2(build / filename, app / filename)
             subprocess.run(['strip', '--strip-unneeded', str(app / filename)], check=True)
-        shutil.copy2(ROOT / 'assets/lcb-icon.svg', app / 'assets/lcb-icon.svg')
+        for filename in ('lcb-icon.svg', 'lcb-icon-small.svg'):
+            shutil.copy2(ROOT / 'assets' / filename, app / 'assets' / filename)
         shutil.copy2(ROOT / 'vendor/cjson/LICENSE', app / 'licenses/cJSON-LICENSE')
         shutil.copy2(ROOT / 'vendor/fltk/LICENSE', app / 'licenses/FLTK-LICENSE')
         (app / 'fonts').mkdir()
