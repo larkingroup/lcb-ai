@@ -103,11 +103,12 @@ void markdown_render(const wchar_t *text,MarkdownEmit emit,void *context)
                 if(!fence || tail==n) {
                     if(fence) fence=0;
                     else { fence=mark; fencecount=count; }
+                    put(&w,L" \r\n",3,MdCode|MdBlock);
                     s=end?end+1:s+wcslen(s); continue;
                 }
             }
         }
-        if(fence) put(&w,s,n,MdCode);
+        if(fence) put(&w,n?s:L" ",n?n:1,MdCode|MdBlock);
         else {
             k=offset;
             while(k<n && s[k]==L'#') k++;
@@ -120,7 +121,7 @@ void markdown_render(const wchar_t *text,MarkdownEmit emit,void *context)
             } else offset=0;
             inlines(&w,s+offset,n-offset,style,0);
         }
-        if(newline) put(&w,L"\r\n",2,fence?MdCode:0);
+        if(newline) put(&w,L"\r\n",2,fence?MdCode|MdBlock:0);
         s=end?end+1:s+wcslen(s);
     }
     flush(&w);

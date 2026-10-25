@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdio.h>
 
 Generation generation_defaults(void)
 {
@@ -271,7 +272,13 @@ static int stream_line(StreamReply *s)
     data+=5; if(*data==' ') data++;
     if(!strcmp(data,"[DONE]")) { s->done=1; return 1; }
     root=cJSON_ParseWithLengthOpts(data,strlen(data)+1,NULL,1);
-    if(!root || cJSON_GetObjectItemCaseSensitive(root,"error")) { cJSON_Delete(root); return 0; }
+    if(root && cJSON_GetObjectItemCaseSensitive(root,"error")) {
+        const cJSON *error=cJSON_GetObjectItemCaseSensitive(root,"error");
+        const cJSON *message=cJSON_IsObject(error)?cJSON_GetObjectItemCaseSensitive(error,"message"):error;
+        snprintf(s->error,sizeof(s->error),"%s",cJSON_IsString(message)?message->valuestring:"The engine reported an error.");
+        cJSON_Delete(root); return 0;
+    }
+    if(!root) return 0;
     choices=cJSON_GetObjectItemCaseSensitive(root,"choices");
     if(!cJSON_IsArray(choices)) { cJSON_Delete(root); return 0; }
     delta=cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(choices,0),"delta");

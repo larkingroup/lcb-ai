@@ -151,6 +151,10 @@ public:
   std::string read_log();
   std::string failure();
 };
+// Saved in place of an answer the model never emitted; never sent as history.
+extern const char *const NoAnswer;
+// Asks llama-server which accelerators it can use. False when it cannot tell.
+bool list_devices(const std::string &exe, std::vector<std::string> &devices);
 std::vector<std::string> split_arguments(const std::string &text);
 std::vector<ModelInfo> scan_models(const std::string &folder, bool recursive,
                                    const std::atomic<bool> &cancel);

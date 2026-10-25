@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <locale>
 #include <netinet/in.h>
+#include <poll.h>
 #include <openssl/evp.h>
 #include <random>
 #include <regex>
@@ -204,9 +205,14 @@ std::string truncate(std::string s, size_t n) {
   return s;
 }
 void validate_text(const std::string &s, size_t limit, bool empty) {
-  if (s.size() > limit || s.find('\0') != s.npos || (!empty && s.empty()))
-    throw std::runtime_error(
-        "Text exceeds the permitted size or contains NUL characters.");
+  if (!empty && s.empty())
+    throw std::runtime_error("Text is empty.");
+  if (s.size() > limit)
+    throw std::runtime_error("Text is too long (" +
+                             std::to_string(s.size() / 1024) + " KiB; limit " +
+                             std::to_string(limit / 1024) + " KiB).");
+  if (s.find('\0') != s.npos)
+    throw std::runtime_error("Text contains NUL characters.");
   wide(s);
 }
 std::string read_file(const fs::path &path, size_t limit) {
@@ -871,16 +877,18 @@ Prepared Transport::prepare(const std::string &model, const Json &messages,
     throw std::runtime_error("Response limit leaves no prompt room. Lower it "
                              "or reload with more context.");
   ConversationOwner c;
-  cJSON *item;
   std::vector<Json> attachment_sets;
-  cJSON_ArrayForEach(item, messages.p) {
-    Json m(cJSON_Duplicate(item, 1));
-    if (!conversation_add(&c.value,
-                          (m.str("role") == "assistant" ? "assistant" : "user"),
-                          m.str("content").c_str()))
+  for (int i = 0; i + 1 < cJSON_GetArraySize(messages.p); i += 2) {
+    Json user(cJSON_Duplicate(cJSON_GetArrayItem(messages.p, i), 1));
+    Json answer(cJSON_Duplicate(cJSON_GetArrayItem(messages.p, i + 1), 1));
+    if (answer.str("content") == NoAnswer)
+      continue;
+    if (!conversation_add(&c.value, "user", user.str("content").c_str()) ||
+        !conversation_add(&c.value, "assistant", answer.str("content").c_str()))
       throw std::runtime_error("Cannot prepare conversation.");
-    attachment_sets.push_back(m.get("attachments") ? m.object("attachments")
-                                                   : Json::array());
+    attachment_sets.push_back(user.get("attachments") ? user.object("attachments")
+                                                      : Json::array());
+    attachment_sets.push_back(Json::array());
   }
   attachment_sets.push_back(attachments);
   Module module{"Workspace", instruction.c_str()};
@@ -1023,7 +1031,9 @@ Reply Transport::generate(
         [&](const char *p, size_t n) {
           if (!stream_feed(state.get(), p, n))
             throw std::runtime_error(
-                "Invalid or oversized stream from the local engine.");
+                state->error[0] ? "Engine error: " + std::string(state->error)
+                                : "Invalid or oversized stream from the local "
+                                  "engine.");
           auto now = std::chrono::steady_clock::now();
           if (update && (state->done || (state->used && !emitted_content) ||
                          (state->reasoning_used && !emitted_reasoning) ||
@@ -1057,6 +1067,7 @@ Reply Transport::generate(
     update(*state);
   return reply;
 }
+const char *const NoAnswer = "[No final answer was emitted.]";
 std::vector<std::string> split_arguments(const std::string &s) {
   std::vector<std::string> out;
   std::string word;
@@ -1100,6 +1111,59 @@ std::vector<std::string> split_arguments(const std::string &s) {
   if (started)
     out.push_back(word);
   return out;
+}
+bool list_devices(const std::string &exe, std::vector<std::string> &devices) {
+  devices.clear();
+  int pipes[2];
+  if (pipe2(pipes, O_CLOEXEC))
+    return false;
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  posix_spawn_file_actions_adddup2(&actions, pipes[1], STDOUT_FILENO);
+  posix_spawn_file_actions_adddup2(&actions, pipes[1], STDERR_FILENO);
+  posix_spawn_file_actions_addchdir_np(&actions,
+                                       fs::path(exe).parent_path().c_str());
+  std::string path = exe, flag = "--list-devices";
+  char *argv[] = {path.data(), flag.data(), nullptr};
+  pid_t child = -1;
+  int rc = posix_spawn(&child, exe.c_str(), &actions, nullptr, argv, environ);
+  posix_spawn_file_actions_destroy(&actions);
+  close(pipes[1]);
+  std::string output;
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  while (!rc && output.size() < 65536) {
+    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now())
+                    .count();
+    pollfd fd{pipes[0], POLLIN, 0};
+    if (left <= 0 || poll(&fd, 1, static_cast<int>(left)) <= 0)
+      break;
+    char chunk[4096];
+    ssize_t n = read(pipes[0], chunk, sizeof(chunk));
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0)
+      break;
+    output.append(chunk, static_cast<size_t>(n));
+  }
+  close(pipes[0]);
+  if (rc)
+    return false;
+  kill(child, SIGKILL);
+  while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
+  }
+  auto at = output.find("Available devices:");
+  if (at == output.npos)
+    return false;
+  std::istringstream lines(output.substr(at));
+  std::string line;
+  std::getline(lines, line);
+  while (std::getline(lines, line) && line.rfind("  ", 0) == 0) {
+    line = line.substr(line.find_first_not_of(' '));
+    if (line != "(none)")
+      devices.push_back(line);
+  }
+  return true;
 }
 Engine::~Engine() { stop(); }
 std::vector<std::string> Engine::arguments() const {

@@ -32,6 +32,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <unistd.h>
@@ -70,8 +71,11 @@ const Fl_Color Face = fl_rgb_color(222, 222, 218),
                ThinkingInk = fl_rgb_color(128, 133, 137),
                Blue = fl_rgb_color(192, 211, 224),
                BlueInk = fl_rgb_color(49, 76, 96),
-               Title = fl_rgb_color(49, 91, 134);
+               Title = fl_rgb_color(49, 91, 134),
+               CodePaper = fl_rgb_color(236, 234, 224);
 const Fl_Boxtype TranscriptFrame = FL_FREE_BOXTYPE;
+const char *const EngineReleases =
+    "https://github.com/ggml-org/llama.cpp/releases/tag/b10566";
 void edge(int x, int y, int w, int h, Fl_Color color) {
   fl_color(color);
   fl_rectf(x, y, w, h);
@@ -858,20 +862,23 @@ class Window : public Fl_Double_Window {
   Composer *prompt;
   Fl_Text_Buffer text_buffer, style_buffer, prompt_buffer, activity_buffer,
       log_buffer, master_buffer;
-  Fl_Text_Display::Style_Table_Entry styles[13] = {
+  static constexpr int StyleCount = 15;
+  Fl_Text_Display::Style_Table_Entry styles[StyleCount] = {
       {Ink, FL_HELVETICA, 13, 0, FL_WHITE},
-      {BlueInk, FL_HELVETICA_BOLD, 12, 0, FL_WHITE},
+      {FL_WHITE, FL_HELVETICA_BOLD, 13, Fl_Text_Display::ATTR_BGCOLOR_EXT, Title},
       {Ink, FL_HELVETICA_BOLD, 13, 0, FL_WHITE},
       {Ink, FL_HELVETICA_ITALIC, 13, 0, FL_WHITE},
-      {Ink, FL_COURIER, 13, Fl_Text_Display::ATTR_BGCOLOR, Light},
-      {Ink, FL_HELVETICA_BOLD, 13, 0, FL_WHITE},
+      {Ink, FL_COURIER, 13, Fl_Text_Display::ATTR_BGCOLOR, CodePaper},
+      {Title, FL_HELVETICA_BOLD, 14, 0, FL_WHITE},
       {Muted, FL_HELVETICA, 13, 0, FL_WHITE},
       {ThinkingInk, FL_HELVETICA, 13, 0, FL_WHITE},
       {ThinkingInk, FL_HELVETICA_BOLD, 13, 0, FL_WHITE},
       {ThinkingInk, FL_HELVETICA_ITALIC, 13, 0, FL_WHITE},
-      {ThinkingInk, FL_COURIER, 12, Fl_Text_Display::ATTR_BGCOLOR, Light},
+      {ThinkingInk, FL_COURIER, 12, Fl_Text_Display::ATTR_BGCOLOR, CodePaper},
       {ThinkingInk, FL_HELVETICA_BOLD, 13, 0, FL_WHITE},
-      {Muted, FL_HELVETICA, 12, 0, FL_WHITE}};
+      {Ink, FL_HELVETICA_BOLD, 13, Fl_Text_Display::ATTR_BGCOLOR_EXT, Face},
+      {Ink, FL_COURIER, 13, Fl_Text_Display::ATTR_BGCOLOR_EXT, CodePaper},
+      {ThinkingInk, FL_COURIER, 12, Fl_Text_Display::ATTR_BGCOLOR_EXT, CodePaper}};
   Fl_Hold_Browser *attachment_list;
   ClassicTable *model_list, *details;
   bool descending = false;
@@ -892,6 +899,7 @@ class Window : public Fl_Double_Window {
   Divider *left_divider, *right_divider, *output_divider;
   std::map<Fl_Widget *, std::function<void()>> callbacks;
   std::map<std::string, bool> workspace_expanded;
+  std::set<std::string> cpu_warned;
   std::map<std::string, bool> search_workspace_expanded;
   std::map<std::pair<std::string, size_t>, bool> thinking_collapsed;
   struct Disclosure { int start, end; size_t turn; };
@@ -1318,7 +1326,7 @@ private:
     speed_box->labelcolor(Muted);
     transcript = new Transcript();
     transcript->buffer(&text_buffer);
-    transcript->highlight_data(&style_buffer, styles, 13, 'A', nullptr, nullptr);
+    transcript->highlight_data(&style_buffer, styles, StyleCount, 'A', nullptr, nullptr);
     transcript->textsize(13);
     transcript->color(FL_WHITE);
     transcript->selection_color(Blue);
@@ -2220,11 +2228,20 @@ private:
     text += s;
     style.append(s.size(), code);
   }
+  void speaker(std::string &text, std::string &style, bool assistant,
+               const std::string &model = "") {
+    auto label = assistant ? " Assistant" : " You";
+    append(text, style, model.empty() ? label : label + std::string(" \xc2\xb7 ") + model,
+           assistant ? 'B' : 'M');
+    append(text, style, "\n", assistant ? 'B' : 'M');
+  }
   void message_text(std::string &text, std::string &style, const std::string &s,
                     char code) {
     for (char c : s) {
       if (c == '\r') continue;
-      if (c != '\n' && (text.empty() || text.back() == '\n'))
+      // Wrapped lines cannot hang an indent, so only code boxes get one.
+      if ((code == 'N' || code == 'O') && c != '\n' &&
+          (text.empty() || text.back() == '\n'))
         append(text, style, "  ", code);
       text += c;
       style += code;
@@ -2249,8 +2266,9 @@ private:
         +[](void *v, const wchar_t *s, unsigned flags) {
           auto &o = *static_cast<Output *>(v);
           char code = o.thinking
-                      ? (flags & MdCode ? 'K' : flags & MdHeading ? 'L'
+                      ? (flags & MdBlock ? 'O' : flags & MdCode ? 'K' : flags & MdHeading ? 'L'
                          : flags & MdBold ? 'I' : flags & MdItalic ? 'J' : 'H')
+                      : flags & MdBlock     ? 'N'
                       : flags & MdCode      ? 'E'
                       : flags & MdHeading ? 'F'
                       : flags & MdBold    ? 'C'
@@ -2267,7 +2285,7 @@ private:
       return;
     bool collapsed = thinking_collapsed.try_emplace(std::make_pair(active, turn), true).first->second;
     int start = offset + static_cast<int>(text.size());
-    append(text, style, collapsed ? "  [+] Thinking\n" : "  [-] Thinking\n", 'I');
+    append(text, style, collapsed ? "[+] Thinking\n" : "[-] Thinking\n", 'I');
     disclosures.push_back({start, offset + static_cast<int>(text.size()), turn});
     if (!collapsed) {
       markdown(text, style, trace, true);
@@ -2281,7 +2299,7 @@ private:
         disclosures.end());
     thinking_section(text, style, partial_reasoning, positions.size(), stream_prefix);
     markdown(text, style, partial_answer);
-    if (text.empty()) append(text, style, "  ...", 'G');
+    if (text.empty()) append(text, style, "...", 'G');
     size_t common = 0;
     while (common < text.size() && common < rendered_partial.size() &&
            text[common] == rendered_partial[common] &&
@@ -2327,8 +2345,7 @@ private:
         Json m(cJSON_Duplicate(p, 1));
         if (!(i % 2))
           begin = static_cast<int>(text.size());
-        append(text, style, i % 2 ? "Assistant says:\n" : "You say:\n",
-               i % 2 ? 'B' : 'M');
+        speaker(text, style, i % 2 != 0, m.str("model"));
         if (i % 2)
           thinking_section(text, style, m.str("reasoning_content"), i / 2);
         if (i % 2) markdown(text, style, m.str("content"));
@@ -2358,10 +2375,10 @@ private:
       }
     }
     if (busy) {
-      append(text, style, "You say:\n", 'M');
+      speaker(text, style, false);
       message_text(text, style, partial_prompt, 'A');
       message_end(text, style);
-      append(text, style, "Assistant says:\n", 'B');
+      speaker(text, style, true, fs::path(model_path).stem().string());
       stream_prefix = static_cast<int>(text.size());
       rendered_partial.clear();
       rendered_style.clear();
@@ -2648,10 +2665,12 @@ private:
     int choice = fl_choice(
         "LCB-AI runs a local Linux llama-server with your existing "
         "GGUF.\nDownload and extract an engine, select Engine and Model, then "
-        "Load.\nPrismML PTQ / PQ models require their compatible engine fork.",
+        "Load.\nWith a graphics card, use the ubuntu-vulkan-x64 build; the "
+        "plain ubuntu-x64 build is CPU only.\nPrismML PTQ / PQ models require "
+        "their compatible engine fork.",
         "Close", "llama.cpp builds", "PrismML guide");
     if (choice == 1)
-      open_url("https://github.com/ggml-org/llama.cpp/releases/tag/b10566");
+      open_url(EngineReleases);
     else if (choice == 2)
       open_url(utf8(runtime_setup_url()));
   }
@@ -2684,12 +2703,24 @@ private:
     load_started = std::chrono::steady_clock::now();
     job(
         [this, exe, model, proj, extra, p, context] {
+          std::vector<std::string> devices;
+          bool cpu_only = list_devices(exe, devices) && devices.empty();
           engine.start(exe, model, p, context, store.root / "engine.log", proj,
                        extra);
-          return true;
+          return cpu_only;
         },
-        [this](bool) {
+        [this, exe](bool cpu_only) {
           set_phase("Engine started. Waiting for model readiness...");
+          if (cpu_only && cpu_warned.insert(exe).second) {
+            note("This llama-server build found no GPU; it runs on the CPU only.");
+            if (fl_choice("This llama-server build found no GPU, so the model "
+                          "runs on the CPU only and replies will be several "
+                          "times slower.\n\nFor NVIDIA, AMD or Intel graphics, "
+                          "download the ubuntu-vulkan-x64 build and choose its "
+                          "llama-server with Engine.",
+                          "Continue", "Get GPU build", nullptr) == 1)
+              open_url(EngineReleases);
+          }
         });
   }
   void unload() {
@@ -2828,9 +2859,11 @@ private:
     if (busy || working || active.empty())
       return;
     auto text = buffer_text(prompt_buffer);
-    if (text.find_first_not_of(" \t\r\n") == text.npos &&
-        cJSON_GetArraySize(attachments.p))
+    if (text.find_first_not_of(" \t\r\n") == text.npos) {
+      if (!cJSON_GetArraySize(attachments.p))
+        return;
       text = "Describe the attached media.";
+    }
     validate_text(text, LcbMaxPrompt, false);
     if (model_path.empty())
       throw std::runtime_error(
@@ -2906,9 +2939,8 @@ private:
             user.set("attachments", attached);
             answer.set("role", std::string("assistant"));
             answer.set("content",
-                       reply.content.empty()
-                           ? std::string("[No final answer was emitted.]")
-                           : reply.content);
+                       reply.content.empty() ? std::string(NoAnswer)
+                                             : reply.content);
             answer.set("reasoning_content", reply.reasoning);
             answer.set("model", fs::path(model).stem().string());
             answer.set("status", reply.status);
