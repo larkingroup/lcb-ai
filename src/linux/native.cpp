@@ -71,8 +71,35 @@ const std::map<std::string, Media> media = {
     {".mp4", {"video", "video/mp4"}},
     {".mkv", {"video", "video/x-matroska"}},
     {".webm", {"video", "video/webm"}},
-    {".mov", {"video", "video/quicktime"}}};
-constexpr size_t MaxMedia = 16 * 1048576, MaxMediaWire = 64 * 1048576;
+    {".mov", {"video", "video/quicktime"}},
+    // Text and code files are inlined into the message, so any model reads them.
+    {".txt", {"text", "text/plain"}}, {".md", {"text", "text/markdown"}},
+    {".markdown", {"text", "text/markdown"}}, {".csv", {"text", "text/csv"}},
+    {".tsv", {"text", "text/tab-separated-values"}}, {".json", {"text", "application/json"}},
+    {".jsonl", {"text", "application/jsonl"}}, {".xml", {"text", "application/xml"}},
+    {".yaml", {"text", "application/yaml"}}, {".yml", {"text", "application/yaml"}},
+    {".toml", {"text", "application/toml"}}, {".ini", {"text", "text/plain"}},
+    {".cfg", {"text", "text/plain"}}, {".conf", {"text", "text/plain"}},
+    {".log", {"text", "text/plain"}}, {".html", {"text", "text/html"}},
+    {".htm", {"text", "text/html"}}, {".css", {"text", "text/css"}},
+    {".js", {"text", "text/javascript"}}, {".mjs", {"text", "text/javascript"}},
+    {".ts", {"text", "text/plain"}}, {".tsx", {"text", "text/plain"}},
+    {".jsx", {"text", "text/plain"}}, {".py", {"text", "text/x-python"}},
+    {".c", {"text", "text/x-c"}}, {".h", {"text", "text/x-c"}},
+    {".cpp", {"text", "text/x-c++"}}, {".hpp", {"text", "text/x-c++"}},
+    {".cc", {"text", "text/x-c++"}}, {".cs", {"text", "text/plain"}},
+    {".java", {"text", "text/x-java"}}, {".kt", {"text", "text/plain"}},
+    {".go", {"text", "text/x-go"}}, {".rs", {"text", "text/x-rust"}},
+    {".rb", {"text", "text/x-ruby"}}, {".php", {"text", "text/x-php"}},
+    {".sh", {"text", "text/x-shellscript"}}, {".bash", {"text", "text/x-shellscript"}},
+    {".ps1", {"text", "text/plain"}}, {".bat", {"text", "text/plain"}},
+    {".sql", {"text", "application/sql"}}, {".lua", {"text", "text/x-lua"}},
+    {".swift", {"text", "text/plain"}}, {".r", {"text", "text/plain"}},
+    {".tex", {"text", "text/x-tex"}}, {".srt", {"text", "text/plain"}},
+    {".vtt", {"text", "text/vtt"}}};
+constexpr size_t MaxMedia = 16 * 1048576, MaxMediaWire = 64 * 1048576,
+                 MaxText = 192 * 1024;
+bool text_kind(const Media &m) { return std::strcmp(m.kind, "text") == 0; }
 struct ConversationOwner {
   Conversation value{};
   ~ConversationOwner() { conversation_clear(&value); }
@@ -315,7 +342,8 @@ void validate_attachments(const Json &items) {
     auto size = a.number("size");
     if (type == media.end() || !valid_id(name.stem().string(), 64) ||
         a.str("file") != name.filename().string() ||
-        a.str("kind") != type->second.kind || size < 1 || size > MaxMedia ||
+        a.str("kind") != type->second.kind || size < 1 ||
+        size > (text_kind(type->second) ? MaxText : MaxMedia) ||
         size != static_cast<size_t>(size))
       throw std::runtime_error("Invalid saved attachment.");
     if (!cJSON_IsString(a.get("name")))
@@ -525,10 +553,27 @@ Json Store::import_attachment(const std::string &path) {
   auto suffix = lower(fs::path(path).extension().string());
   auto type = media.find(suffix);
   if (type == media.end())
-    throw std::runtime_error("Choose a supported image, audio or video file.");
-  auto data = read_file(path, MaxMedia);
+    throw std::runtime_error("Choose a supported text, code, image, audio or video file.");
+  bool is_text = text_kind(type->second);
+  std::error_code error;
+  auto size = fs::file_size(path, error);
+  if (error)
+    throw std::runtime_error("Cannot read " + fs::path(path).filename().string() +
+                             ": " + error.message());
+  if (is_text && size > MaxText)
+    throw std::runtime_error("Text files are limited to " +
+                             std::to_string(MaxText / 1024) + " KiB.");
+  auto data = read_file(path, is_text ? MaxText : MaxMedia);
   if (data.empty())
     throw std::runtime_error("Attachment is empty.");
+  if (is_text) {
+    try {
+      validate_text(data, MaxText, false);
+    } catch (const std::exception &) {
+      throw std::runtime_error("This file is not UTF-8 text: " +
+                               fs::path(path).filename().string());
+    }
+  }
   Json item;
   item.set("file", digest(data) + suffix);
   item.set("name", fs::path(path).filename().string());
@@ -541,6 +586,22 @@ Json Store::import_attachment(const std::string &path) {
   if (!fs::exists(target))
     atomic_write(target, data);
   return item;
+}
+std::string Store::text_part(const Json &item) const {
+  Json items = Json::array();
+  items.add(item);
+  validate_attachments(items);
+  auto path = root / "attachments" / item.str("file");
+  auto data = read_file(path, MaxText);
+  if (data.size() != item.number("size") || digest(data) != path.stem().string())
+    throw std::runtime_error("Saved attachment changed or is incomplete: " +
+                             item.str("name"));
+  if (data.compare(0, 3, "\xef\xbb\xbf") == 0) data.erase(0, 3);
+  return data;
+}
+bool Store::is_text(const Json &item) {
+  auto found = media.find(fs::path(item.str("file")).extension().string());
+  return found != media.end() && text_kind(found->second);
 }
 Json Store::media_part(const Json &item) const {
   Json items = Json::array();
@@ -863,11 +924,42 @@ Json Transport::json(const std::string &path, const Json *body) {
 }
 Prepared Transport::prepare(const std::string &model, const Json &messages,
                             const std::string &instruction,
-                            const std::string &prompt, const Generation &g,
-                            const Json &attachments, const Store &store) {
+                            const std::string &typed, const Generation &g,
+                            const Json &all_attachments, const Store &store) {
   validate_text(instruction, LcbMaxPrompt);
-  validate_text(prompt, LcbMaxPrompt, false);
-  validate_attachments(attachments);
+  validate_text(typed, LcbMaxPrompt, false);
+  validate_attachments(all_attachments);
+  // Text files join the message itself; only media stays a separate part.
+  auto with_files = [&](std::string body, const Json &items) {
+    cJSON *it;
+    cJSON_ArrayForEach(it, items.p) {
+      Json a(cJSON_Duplicate(it, 1));
+      if (!Store::is_text(a)) continue;
+      std::string contents;
+      try {
+        contents = store.text_part(a);
+      } catch (const std::exception &) {
+        contents = "[This file is no longer available.]";
+      }
+      body += "\n\n<file name=\"" + a.str("name") + "\">\n" + contents + "\n</file>";
+    }
+    return body;
+  };
+  auto media_only = [](const Json &items) {
+    Json kept = Json::array();
+    cJSON *it;
+    cJSON_ArrayForEach(it, items.p) {
+      Json a(cJSON_Duplicate(it, 1));
+      if (!Store::is_text(a)) kept.add(a);
+    }
+    return kept;
+  };
+  const std::string prompt = with_files(typed, all_attachments);
+  if (prompt.size() > LcbMaxPrompt)
+    throw std::runtime_error("The message and its text files exceed " +
+                             std::to_string(LcbMaxPrompt / 1024) +
+                             " KiB. Attach fewer or smaller files.");
+  const Json attachments = media_only(all_attachments);
   auto props = json("/props");
   auto context_value =
       props.object("default_generation_settings").number("n_ctx");
@@ -897,11 +989,11 @@ Prepared Transport::prepare(const std::string &model, const Json &messages,
     Json answer(cJSON_Duplicate(cJSON_GetArrayItem(messages.p, i + 1), 1));
     if (answer.str("content") == NoAnswer)
       continue;
-    if (!conversation_add(&c.value, "user", user.str("content").c_str()) ||
+    auto earlier = user.get("attachments") ? user.object("attachments") : Json::array();
+    if (!conversation_add(&c.value, "user", with_files(user.str("content"), earlier).c_str()) ||
         !conversation_add(&c.value, "assistant", answer.str("content").c_str()))
       throw std::runtime_error("Cannot prepare conversation.");
-    attachment_sets.push_back(user.get("attachments") ? user.object("attachments")
-                                                      : Json::array());
+    attachment_sets.push_back(media_only(earlier));
     attachment_sets.push_back(Json::array());
   }
   attachment_sets.push_back(attachments);

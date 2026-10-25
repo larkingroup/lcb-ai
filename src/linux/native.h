@@ -80,6 +80,9 @@ public:
   void erase(const std::string &id);
   Json import_attachment(const std::string &path);
   Json media_part(const Json &item) const;
+  // Text and code attachments: their UTF-8 contents, inlined into the message.
+  std::string text_part(const Json &item) const;
+  static bool is_text(const Json &item);
 };
 class Settings {
   fs::path path_;

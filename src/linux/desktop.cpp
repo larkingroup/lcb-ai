@@ -3296,8 +3296,17 @@ private:
     if (busy || working)
       return;
     auto path =
-        chosen("Attach image, audio or video",
-               "*.{png,jpg,jpeg,bmp,gif,wav,mp3,flac,mp4,mkv,webm,mov}");
+        chosen("Attach a file",
+               "All supported (*.{txt,md,markdown,csv,tsv,json,jsonl,xml,yaml,yml,"
+               "toml,ini,cfg,conf,log,html,htm,css,js,mjs,ts,tsx,jsx,py,c,h,cpp,"
+               "hpp,cc,cs,java,kt,go,rs,rb,php,sh,bash,ps1,bat,sql,lua,swift,r,"
+               "tex,srt,vtt,png,jpg,jpeg,bmp,gif,wav,mp3,flac,mp4,mkv,webm,mov})\t"
+               "Text and code (*.{txt,md,markdown,csv,tsv,json,jsonl,xml,yaml,yml,"
+               "toml,ini,cfg,conf,log,html,htm,css,js,mjs,ts,tsx,jsx,py,c,h,cpp,"
+               "hpp,cc,cs,java,kt,go,rs,rb,php,sh,bash,ps1,bat,sql,lua,swift,r,"
+               "tex,srt,vtt})\t"
+               "Images, audio and video (*.{png,jpg,jpeg,bmp,gif,wav,mp3,flac,"
+               "mp4,mkv,webm,mov})");
     if (path.empty())
       return;
     if (cJSON_GetArraySize(attachments.p) >= 8)
@@ -3934,13 +3943,18 @@ private:
     if (busy || working || active.empty())
       return;
     auto text = buffer_text(prompt_buffer);
+    // Text files are inlined; only images, audio and video need the projector.
+    int media_count = 0;
+    cJSON *item;
+    cJSON_ArrayForEach(item, attachments.p)
+      if (!Store::is_text(Json(cJSON_Duplicate(item, 1)))) ++media_count;
     if (text.find_first_not_of(" \t\r\n") == text.npos) {
       if (!cJSON_GetArraySize(attachments.p))
         return;
-      text = "Describe the attached media.";
+      text = media_count ? "Describe the attached media." : "Review the attached file.";
     }
     validate_text(text, LcbMaxPrompt, false);
-    if (cJSON_GetArraySize(attachments.p) && engine.owned() && !media_engine) {
+    if (media_count && engine.owned() && !media_engine) {
       if (projector.empty())
         throw std::runtime_error("Attachments need a media projector. Choose "
                                  "one for this model under Media projector.");
@@ -3965,7 +3979,7 @@ private:
       pending_chat = active;
       if (!engine.owned()) {
         try {
-          load_model(cJSON_GetArraySize(attachments.p) > 0 && !projector.empty());
+          load_model(media_count > 0 && !projector.empty());
         } catch (...) {
           pending_send = false;
           throw;
