@@ -13,7 +13,10 @@ typedef struct Chat Chat;
 typedef struct ChatInfo ChatInfo;
 typedef struct Store Store;
 struct Workspace { char id[33], name[StoreName], prompt[LcbMaxPrompt+1]; };
-struct ChatInfo { char id[33], workspace[33], title[StoreName]; size_t turns; };
+/* updated: Unix seconds of the last exchange; pinned and renamed are flags. */
+struct ChatInfo { char id[33], workspace[33], title[StoreName]; size_t turns;
+	long long updated; int pinned, renamed; };
+
 struct Chat { ChatInfo info; Conversation conversation; char draft[LcbMaxPrompt+1]; };
 struct Store {
 	wchar_t root[MAX_PATH], error[512];
@@ -36,5 +39,7 @@ int store_new(Store *s, const char *workspace, Chat *chat);
 int store_branch(Store *s, const Chat *source, size_t turn, const char *prompt,
     const char *action, Chat *destination);
 Workspace *store_find_workspace(Store *s, const char *id);
+long long store_now(void);
+
 void chat_clear(Chat *chat);
 #endif

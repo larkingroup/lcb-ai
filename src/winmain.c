@@ -24,6 +24,7 @@
 #include "model_settings_win.h"
 #include "context_win.h"
 #include "markdown.h"
+#include "cJSON.h"
 #include <windowsx.h>
 #include <shellapi.h>
 
@@ -33,8 +34,10 @@ enum { IdModules = 100, IdPrompt, IdSend, IdNew, IdPort, IdExit, IdAbout,
 	IdRecursive, IdModels, IdChatTabs, IdLibraryTabs, IdDetails,
 	IdStop, IdCloseTab, IdGeneration, IdValue, IdViewLeft, IdViewRight, IdViewOutput, IdResetLayout, IdSetup,
 	IdExchange, IdRetry, IdResend, IdDeleteChat, IdOpenChat, IdEngineArguments, IdOutputTabs,
-    IdLatest, IdViewChats, IdChatSearch, IdSidebarMenu,
-	ReplyReady = WM_APP + 1, HealthReady, LibraryReady, StreamReady, BudgetReady, SettingsReady, TelemetryReady };
+    IdLatest, IdViewChats, IdChatSearch, IdSidebarMenu, IdRename, IdPin, IdFindChat, IdInsertText,
+    IdMoveFirst = 3000,
+	ReplyReady = WM_APP + 1, HealthReady, LibraryReady, StreamReady, BudgetReady, SettingsReady, TelemetryReady,
+    TitleReady };
 
 #define Paper RGB(255,255,255)
 #define Face RGB(236,233,216)
@@ -49,7 +52,7 @@ enum { IdModules = 100, IdPrompt, IdSend, IdNew, IdPort, IdExit, IdAbout,
 typedef struct Work Work;
 typedef struct StreamSnapshot StreamSnapshot;
 enum { SidebarSection, SidebarWorkspace, SidebarChat, SidebarEmpty };
-typedef struct SidebarRow { int kind, index, indented, expanded; } SidebarRow;
+typedef struct SidebarRow { int kind, index, indented, expanded; long long when; } SidebarRow;
 typedef struct RecentChat { size_t index; ULONGLONG modified; } RecentChat;
 typedef struct ThinkingSection { LONG start,end; size_t turn; } ThinkingSection;
 struct Work {
@@ -132,7 +135,12 @@ static struct {
 	wchar_t activitytext[8192];
 	ULONGLONG started, loadstarted;
 	double lastseconds;
+    int pendingsend;
+    HWND renamer;
+    char renaming[33];
+    HANDLE titlecancel;
 } app;
+
 
 static void layout(void);
 static void refreshcontrols(void);
@@ -140,6 +148,7 @@ static void refreshtitle(void);
 static void pollengine(void);
 static int savechat(void);
 static void listchats(void);
+static void whenlabel(long long then,long long now,wchar_t *out,size_t n);
 static void listworkspaces(void);
 static void sidebaractivate(int row,int menu);
 static int sidebarchat(int row,char id[33]);
@@ -155,6 +164,10 @@ static void commitproperty(void);
 static void stopreply(void);
 static void closetab(void);
 static void activatechat(const char *id);
+static void beginrename(const char *id);
+static void quicktitle(const char *text,char out[StoreName]);
+static void suggesttitle(const char *id,const char *question,const char *answer,unsigned short port);
+static void inserttext(void);
 static int runsetup(void);
 static const wchar_t *basenamew(const wchar_t *path);
 static LRESULT CALLBACK classiccontrol(HWND,UINT,WPARAM,LPARAM,UINT_PTR,DWORD_PTR);
@@ -795,7 +808,8 @@ static void
 refreshcontrols(void)
 {
 	refreshtitle();
-	EnableWindow(app.send, app.ntabs && !app.busy && !app.settings_pending && app.health == EngineReady);
+	EnableWindow(app.send, app.ntabs && !app.busy && !app.settings_pending && !app.pendingsend &&
+	    (app.health == EngineReady || app.process.process || setup_paths_ready(app.enginepath,app.modelpath)));
 	EnableWindow(app.exchange,app.ntabs && !app.busy && app.chat.conversation.count>0);
 	EnableWindow(app.retry,app.ntabs && !app.busy && !app.settings_pending && app.chat.conversation.count>0 && app.health==EngineReady);
 	EnableWindow(app.resend,app.ntabs && !app.busy && !app.settings_pending && app.chat.conversation.count>0);
@@ -936,7 +950,15 @@ submit(void)
 	HANDLE thread;
 	Work *w;
 	Module module;
-	if(!app.ntabs || app.busy || app.settings_pending || app.health != EngineReady) return;
+	if(!app.ntabs || app.busy || app.settings_pending) return;
+	/* Send loads the model when needed and goes out once it is ready. */
+	if(app.health != EngineReady) {
+		if(GetWindowTextLength(app.prompt)==0) return;
+		if(!app.process.process) loadmodel();
+		if(app.process.process) { app.pendingsend=1; note(L"Loading model. Your message sends when it is ready."); refreshcontrols(); }
+		return;
+	}
+	if(app.titlecancel) SetEvent(app.titlecancel);
 	commitproperty();
 	if(app.settings_pending) return;
 	if(!savechat()) return;
@@ -1024,14 +1046,13 @@ received(Work *w)
         } else SetWindowTextW(app.speed,L"");
 		note(summary);
 		SetWindowText(app.prompt, L"");
-		if(before==0 && !strcmp(app.chat.info.title,"New chat")) {
-			size_t n=strlen(w->prompt), j;
-			if(n>=StoreName) n=StoreName-1;
-			while(n && ((unsigned char)w->prompt[n]&0xc0)==0x80) n--;
-			memcpy(app.chat.info.title,w->prompt,n); app.chat.info.title[n]=0;
-			for(j=0;j<n;j++) if(app.chat.info.title[j]=='\r' || app.chat.info.title[j]=='\n') app.chat.info.title[j]=' ';
+		{
+			int first=before==0 && !app.chat.info.renamed;
+			if(first) quicktitle(w->prompt,app.chat.info.title);
+			app.chat.info.updated=store_now();
+			app.dirty=1; savechat(); listchats(); synctabs();
+			if(first && w->ok==1 && w->answer[0]) suggesttitle(app.chat.info.id,w->prompt,w->answer,w->port);
 		}
-		app.dirty=1; savechat(); listchats(); synctabs();
 		render();
 	} else {
 		while(c->count > before) { Message *m=&c->messages[--c->count]; free(m->text); free(m->reasoning); }
@@ -1303,37 +1324,46 @@ static void drawsidebar(DRAWITEMSTRUCT *d)
 {
     SidebarRow *row=(SidebarRow *)d->itemData;
     RECT r=d->rcItem,t=r;
-    wchar_t text[StoreName];
-    int active=0,hover=(int)d->itemID==app.sidebarhover,inset=9;
+    wchar_t text[StoreName],when[32];
+    int active=0,pinned=0,hover=(int)d->itemID==app.sidebarhover,inset=9;
     if(d->itemID==(UINT)-1 || !row) { fill(d->hDC,r,Light); return; }
-    if(row->kind==SidebarChat && (size_t)row->index<app.store.nchats)
+    if(row->kind==SidebarChat && (size_t)row->index<app.store.nchats) {
         active=app.ntabs && !strcmp(app.store.chats[row->index].id,app.chat.info.id);
-    fill(d->hDC,r,active?RGB(76,112,157):
-        row->kind==SidebarWorkspace && (size_t)row->index==app.selected?Blue:hover?Face:Light);
+        pinned=app.store.chats[row->index].pinned;
+    }
+    fill(d->hDC,r,active?RGB(76,112,157):hover && row->kind==SidebarChat?Face:Light);
     if(active) {
         RECT stripe=r; stripe.bottom=stripe.top+px(1);
         fill(d->hDC,stripe,RGB(145,175,205));
     }
-    if(row->kind==SidebarWorkspace) {
-        int x=MulDiv(r.left,96,app.dpi),y=MulDiv(r.top,96,app.dpi);
-        if(row->expanded) {
-            line(d->hDC,x+8,y+12,x+11,y+15,BlueInk);
-            line(d->hDC,x+11,y+15,x+14,y+12,BlueInk);
+    t.right-=px(8);
+    if(row->kind==SidebarChat) {
+        if(hover) {
+            RECT dots=r; dots.left=dots.right-px(26);
+            label(d->hDC,dots,L"...",active?Paper:Muted,app.normal,DT_CENTER);
+            t.right=r.right-px(30);
         } else {
-            line(d->hDC,x+9,y+10,x+12,y+13,BlueInk);
-            line(d->hDC,x+12,y+13,x+9,y+16,BlueInk);
+            whenlabel(row->when,store_now(),when,32);
+            if(when[0]) {
+                RECT w=t; SIZE size; HFONT old=SelectObject(d->hDC,app.normal);
+                GetTextExtentPoint32W(d->hDC,when,(int)wcslen(when),&size); SelectObject(d->hDC,old);
+                label(d->hDC,w,when,active?RGB(214,226,240):Muted,app.normal,DT_RIGHT);
+                t.right-=size.cx+px(8);
+            }
         }
-        if(app.icons) ImageList_Draw(app.icons,ClassicFolder,d->hDC,r.left+px(20),r.top+px(6),ILD_TRANSPARENT);
-        inset=40;
-    } else if(row->indented) inset=30;
-    t.left+=px(inset); t.right-=px(hover && row->kind!=SidebarSection && row->kind!=SidebarEmpty?30:8);
+        if(pinned) {
+            int x=MulDiv(r.left,96,app.dpi)+12,y=MulDiv(r.top,96,app.dpi)+14;
+            COLORREF c=active?Paper:RGB(195,146,58);
+            line(d->hDC,x-4,y-1,x+5,y-1,c); line(d->hDC,x-2,y-6,x-2,y-1,c);
+            line(d->hDC,x+2,y-6,x+2,y-1,c); line(d->hDC,x-2,y-6,x+3,y-6,c);
+            line(d->hDC,x,y-1,x,y+5,c);
+            inset=22;
+        }
+    }
+    t.left+=px(inset);
     SendMessageW(app.modules,LB_GETTEXT,d->itemID,(LPARAM)text);
     label(d->hDC,t,text,active?Paper:row->kind==SidebarSection || row->kind==SidebarEmpty?Muted:Ink,
         row->kind==SidebarSection?app.heading:app.normal,DT_LEFT);
-    if(hover && (row->kind==SidebarChat || row->kind==SidebarWorkspace)) {
-        t=r; t.left=t.right-px(26);
-        label(d->hDC,t,L"...",active?Paper:Muted,app.normal,DT_CENTER);
-    }
     if((d->itemState&ODS_FOCUS) && GetFocus()==app.modules) {
         t=r; InflateRect(&t,-px(2),-px(2)); DrawFocusRect(d->hDC,&t);
     }
@@ -1360,8 +1390,14 @@ classiccontrol(HWND window,UINT message,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PT
                 sidebaractivate(row,point.x>client.right-px(28));
                 return 0;
             }
+        } else if(message==WM_LBUTTONDBLCLK) {
+            char chat[33];
+            LRESULT hit=SendMessageW(window,LB_ITEMFROMPOINT,0,lp);
+            if(!HIWORD(hit) && sidebarchat(LOWORD(hit),chat)) beginrename(chat);
+            return 0;
         } else if(message==WM_MOUSELEAVE) {
             app.sidebarhover=-1; InvalidateRect(window,NULL,FALSE);
+
         } else if(message==WM_KEYDOWN) {
             int row=(int)SendMessageW(window,LB_GETCURSEL,0,0);
             if(wp==VK_UP || wp==VK_DOWN) {
@@ -1462,11 +1498,14 @@ layout(void)
     place(app.load,6,4,79,23); place(app.unload,89,4,85,23);
     place(app.engine,190,4,78,23); place(app.browse,273,4,84,23);
     place(app.model,364,5,w-556,21); place(app.port,w-185,5,62,21);
-    ShowWindow(app.workspace,SW_HIDE); ShowWindow(app.master,SW_HIDE);
+    ShowWindow(app.master,SW_HIDE);
     place(app.fresh,left?p.left-76:7,left?38:64,22,20);
     place(app.sidebarmenu,p.left-51,38,22,20);
-    place(app.chatsearch,10,65,p.left-16,26);
-    place(app.modules,9,97,p.left-14,p.bottom-130);
+    /* The workspace list sits above search, as on Linux. */
+    place(app.workspace,10,63,p.left-16,300);
+    place(app.chatsearch,10,92,p.left-16,26);
+    place(app.modules,9,124,p.left-14,p.bottom-157);
+    ShowWindow(app.workspace,left?SW_SHOW:SW_HIDE);
     ShowWindow(app.modules,left?SW_SHOW:SW_HIDE);
     ShowWindow(app.fresh,left?SW_SHOW:SW_HIDE);
     ShowWindow(app.chatsearch,left?SW_SHOW:SW_HIDE);
@@ -1556,15 +1595,6 @@ static int recentcompare(const void *a,const void *b)
     return strcmp(app.store.chats[x->index].id,app.store.chats[y->index].id);
 }
 
-static int workspacecompare(const void *a,const void *b)
-{
-    size_t x=*(const size_t *)a,y=*(const size_t *)b;
-    wchar_t *first=wide(app.store.workspaces[x].name),*second=wide(app.store.workspaces[y].name);
-    int result=first && second?CompareStringOrdinal(first,-1,second,-1,TRUE)-CSTR_EQUAL:0;
-    free(first); free(second);
-    return result?result:strcmp(app.store.workspaces[x].id,app.store.workspaces[y].id);
-}
-
 static void sidebarrow(int kind,int index,int indented,int expanded,const wchar_t *text)
 {
     LRESULT item;
@@ -1590,65 +1620,131 @@ static int sidebarmatches(const char *text,const wchar_t *query)
     free(value); return !query[0] || result;
 }
 
+/* Message text per chat for search; rebuilt only when a chat gains turns. */
+static struct { char id[33]; size_t turns; wchar_t *text; } searchcache[StoreChats];
+
+static const wchar_t *chattext(size_t index)
+{
+    const ChatInfo *info=&app.store.chats[index];
+    int slot=-1,i;
+    Chat *chat;
+    for(i=0;i<StoreChats;i++) {
+        if(!strcmp(searchcache[i].id,info->id)) { slot=i; break; }
+        if(slot<0 && !searchcache[i].id[0]) slot=i;
+    }
+    if(slot<0) slot=(int)(index%StoreChats);
+    if(!strcmp(searchcache[slot].id,info->id) && searchcache[slot].turns==info->turns && searchcache[slot].text)
+        return searchcache[slot].text;
+    free(searchcache[slot].text); searchcache[slot].text=NULL;
+    strcpy(searchcache[slot].id,info->id); searchcache[slot].turns=info->turns;
+    chat=calloc(1,sizeof(*chat));
+    if(chat && store_load(&app.store,info->id,chat)) {
+        size_t n=0,k;
+        char *all;
+        for(k=0;k<chat->conversation.count;k++) n+=strlen(chat->conversation.messages[k].text)+1;
+        all=malloc(n+1);
+        if(all) {
+            all[0]=0;
+            for(k=0;k<chat->conversation.count;k++) { strcat(all,chat->conversation.messages[k].text); strcat(all,"\n"); }
+            searchcache[slot].text=wide(all); free(all);
+        }
+    }
+    if(chat) { chat_clear(chat); free(chat); }
+    app.store.error[0]=0;
+    return searchcache[slot].text?searchcache[slot].text:L"";
+}
+
+/* Local calendar time for a Unix second, through the Win32 clock. */
+static int localdate(long long unix,SYSTEMTIME *out)
+{
+    ULONGLONG ticks=(ULONGLONG)unix*10000000ULL+116444736000000000ULL;
+    FILETIME utc={(DWORD)ticks,(DWORD)(ticks>>32)},local;
+    return FileTimeToLocalFileTime(&utc,&local) && FileTimeToSystemTime(&local,out);
+}
+
+static long long localmidnight(long long now)
+{
+    SYSTEMTIME day; FILETIME local,utc; ULONGLONG ticks;
+    if(!localdate(now,&day)) return now-now%86400;
+    day.wHour=day.wMinute=day.wSecond=day.wMilliseconds=0;
+    if(!SystemTimeToFileTime(&day,&local) || !LocalFileTimeToFileTime(&local,&utc)) return now-now%86400;
+    ticks=((ULONGLONG)utc.dwHighDateTime<<32)|utc.dwLowDateTime;
+    return (long long)((ticks-116444736000000000ULL)/10000000ULL);
+}
+
+/* Compact recency: time today, weekday this week, then date. */
+static void whenlabel(long long then,long long now,wchar_t *out,size_t n)
+{
+    SYSTEMTIME a,b;
+    static const wchar_t *days[]={L"Sun",L"Mon",L"Tue",L"Wed",L"Thu",L"Fri",L"Sat"};
+    static const wchar_t *months[]={L"Jan",L"Feb",L"Mar",L"Apr",L"May",L"Jun",L"Jul",L"Aug",L"Sep",L"Oct",L"Nov",L"Dec"};
+    out[0]=0;
+    if(then<=0 || !localdate(then,&a) || !localdate(now,&b)) return;
+    if(then>=localmidnight(now)) swprintf(out,n,L"%02d:%02d",a.wHour,a.wMinute);
+    else if(now>=then && now-then<6*86400) swprintf(out,n,L"%ls",days[a.wDayOfWeek%7]);
+    else if(a.wYear==b.wYear) swprintf(out,n,L"%ls %d",months[(a.wMonth+11)%12],a.wDay);
+    else swprintf(out,n,L"%ls %d",months[(a.wMonth+11)%12],a.wYear);
+}
+
+static void chatrow(size_t chat,int *selected)
+{
+    wchar_t *name=wide(app.store.chats[chat].title);
+    sidebarrow(SidebarChat,(int)chat,0,0,name?name:L"Chat"); free(name);
+    app.sidebar[app.nsidebar-1].when=app.store.chats[chat].updated;
+    if(!strcmp(app.store.chats[chat].id,app.chat.info.id) && *selected<0) *selected=app.nsidebar-1;
+}
+
 static void
 listchats(void)
 {
-    size_t i,j;
+    size_t i;
     int selected=-1,top=(int)SendMessageW(app.modules,LB_GETTOPINDEX,0,0),count=0;
-    int cursor=(int)SendMessageW(app.modules,LB_GETCURSEL,0,0),focused_group=-1;
-    wchar_t query[StoreName],*name;
+    wchar_t query[StoreName];
     RecentChat recent[StoreChats];
-    if(GetFocus()==app.modules && cursor>=0 && cursor<app.nsidebar && app.sidebar[cursor].kind==SidebarWorkspace)
-        focused_group=app.sidebar[cursor].index;
+    long long now=store_now();
     GetWindowTextW(app.chatsearch,query,StoreName);
-    for(i=0;i<app.store.nchats;i++) {
-        wchar_t path[MAX_PATH]; WIN32_FILE_ATTRIBUTE_DATA info;
-        recent[i].index=i; recent[i].modified=0;
-        swprintf(path,MAX_PATH,L"%ls\\chats\\%hs.json",app.store.root,app.store.chats[i].id);
-        if(GetFileAttributesExW(path,GetFileExInfoStandard,&info))
-            recent[i].modified=((ULONGLONG)info.ftLastWriteTime.dwHighDateTime<<32)|info.ftLastWriteTime.dwLowDateTime;
-    }
+    for(i=0;i<app.store.nchats;i++) { recent[i].index=i; recent[i].modified=(ULONGLONG)app.store.chats[i].updated; }
     qsort(recent,app.store.nchats,sizeof(*recent),recentcompare);
     app.sidebarbusy=1; app.sidebarhover=-1;
     SendMessageW(app.modules,WM_SETREDRAW,FALSE,0);
     SendMessageW(app.modules,LB_RESETCONTENT,0,0); app.nsidebar=0;
     if(!query[0]) {
-        size_t groups[StoreWorkspaces],group;
-        for(i=0;i<app.store.nworkspaces;i++) groups[i]=i;
-        qsort(groups,app.store.nworkspaces,sizeof(*groups),workspacecompare);
-        sidebarrow(SidebarSection,0,0,0,L"Workspaces");
-        for(group=0;group<app.store.nworkspaces;group++) {
-            wchar_t key[33]; int expanded,children=0;
-            i=groups[group];
-            swprintf(key,33,L"%hs",app.store.workspaces[i].id);
-            expanded=GetPrivateProfileIntW(L"workspace-layout",key,0,app.config)!=0;
-            name=wide(app.store.workspaces[i].name);
-            sidebarrow(SidebarWorkspace,(int)i,0,expanded,name?name:L"Workspace"); free(name);
-            if(expanded) {
-                for(j=0;j<app.store.nchats;j++) {
-                    size_t chat=recent[j].index;
-                    if(strcmp(app.store.chats[chat].workspace,app.store.workspaces[i].id)) continue;
-                    name=wide(app.store.chats[chat].title);
-                    sidebarrow(SidebarChat,(int)chat,1,0,name?name:L"Chat"); free(name); children++;
-                    if(!strcmp(app.store.chats[chat].id,app.chat.info.id)) selected=app.nsidebar-1;
-                }
-                if(!children) sidebarrow(SidebarEmpty,0,1,0,L"No chats yet");
+        /* One workspace at a time: pinned first, then by day. */
+        const char *ws=app.store.workspaces[app.selected].id;
+        static const wchar_t *groups[]={L"Today",L"Yesterday",L"Previous 7 days",L"Previous 30 days",L"Older"};
+        long long bounds[5];
+        int group=-1,g;
+        bounds[0]=localmidnight(now); bounds[1]=bounds[0]-86400;
+        bounds[2]=bounds[0]-6*86400; bounds[3]=bounds[0]-29*86400; bounds[4]=-1;
+        for(i=0;i<app.store.nchats;i++) {
+            size_t chat=recent[i].index;
+            if(strcmp(app.store.chats[chat].workspace,ws) || !app.store.chats[chat].pinned) continue;
+            if(!count++) sidebarrow(SidebarSection,0,0,0,L"Pinned");
+            chatrow(chat,&selected);
+        }
+        for(i=0;i<app.store.nchats;i++) {
+            size_t chat=recent[i].index;
+            if(strcmp(app.store.chats[chat].workspace,ws) || app.store.chats[chat].pinned) continue;
+            for(g=0;g<4 && app.store.chats[chat].updated<bounds[g];g++);
+            if(g!=group) { group=g; sidebarrow(SidebarSection,0,0,0,groups[g]); }
+            chatrow(chat,&selected); count++;
+        }
+        if(!count) sidebarrow(SidebarEmpty,0,0,0,L"No chats yet. Ctrl+N starts one.");
+    } else {
+        /* Titles first, then chats whose messages match, across workspaces. */
+        int pass,shown;
+        for(pass=0;pass<2;pass++) {
+            shown=0;
+            for(i=0;i<app.store.nchats;i++) {
+                size_t chat=recent[i].index;
+                int title=sidebarmatches(app.store.chats[chat].title,query);
+                if(pass==0 ? !title : title || FindStringOrdinal(FIND_FROMSTART,chattext(chat),-1,query,-1,TRUE)<0) continue;
+                if(!shown++) sidebarrow(SidebarSection,0,0,0,pass?L"Messages":L"Titles");
+                chatrow(chat,&selected); count++;
             }
         }
+        if(!count) sidebarrow(SidebarEmpty,0,0,0,L"No matches");
     }
-    sidebarrow(SidebarSection,0,0,0,query[0]?L"Search results":L"Recent chats");
-    for(j=0;j<app.store.nchats;j++) {
-        size_t chat=recent[j].index;
-        Workspace *ws=store_find_workspace(&app.store,app.store.chats[chat].workspace);
-        if(!sidebarmatches(app.store.chats[chat].title,query) && !(ws && sidebarmatches(ws->name,query))) continue;
-        name=wide(app.store.chats[chat].title);
-        sidebarrow(SidebarChat,(int)chat,0,0,name?name:L"Chat"); free(name); count++;
-        if(!strcmp(app.store.chats[chat].id,app.chat.info.id) && selected<0) selected=app.nsidebar-1;
-    }
-    if(!count) sidebarrow(SidebarEmpty,0,0,0,query[0]?L"No matching chats":L"No chats yet");
-    if(focused_group>=0)
-        for(i=0;i<(size_t)app.nsidebar;i++)
-            if(app.sidebar[i].kind==SidebarWorkspace && app.sidebar[i].index==focused_group) { selected=(int)i; break; }
     SendMessageW(app.modules,LB_SETCURSEL,selected,0);
     SendMessageW(app.modules,LB_SETTOPINDEX,top,0);
     SendMessageW(app.modules,WM_SETREDRAW,TRUE,0); InvalidateRect(app.modules,NULL,TRUE);
@@ -1692,7 +1788,15 @@ switchworkspace(void)
 	int ok;
 	if(app.busy || index<0 || (size_t)index>=app.store.nworkspaces) return;
 	if(!savechat()) { listworkspaces(); return; }
-	for(i=0;i<app.store.nchats;i++) if(strcmp(app.store.chats[i].workspace,app.store.workspaces[index].id)==0) break;
+	{
+	    /* Open the workspace's most recent chat. */
+	    size_t best=app.store.nchats;
+	    for(i=0;i<app.store.nchats;i++)
+	        if(!strcmp(app.store.chats[i].workspace,app.store.workspaces[index].id) &&
+	            (best==app.store.nchats || app.store.chats[i].updated>app.store.chats[best].updated)) best=i;
+	    i=best;
+	}
+	SetWindowTextW(app.chatsearch,L"");
 	ok=i<app.store.nchats ? store_load(&app.store,app.store.chats[i].id,&app.chat) :
 	    store_new(&app.store,app.store.workspaces[index].id,&app.chat);
 	if(!ok) { note(app.store.error); listworkspaces(); return; }
@@ -1932,6 +2036,260 @@ static void sidebaractivate(int row,int options)
     }
 }
 
+/* Copies a title within StoreName bytes without splitting a UTF-8 sequence. */
+static void settitle(char *to,const char *from)
+{
+    size_t n=strlen(from);
+    if(n>=StoreName) { n=StoreName-1; while(n && ((unsigned char)from[n]&0xc0)==0x80) n--; }
+    memcpy(to,from,n); to[n]=0;
+}
+
+/* Cuts at a word boundary within the byte limit, adding an ellipsis. */
+static void clipwords(char *s,size_t limit)
+{
+    size_t n=strlen(s),cut;
+    if(n<=limit) return;
+    cut=limit;
+    while(cut>limit/2 && s[cut]!=' ') cut--;
+    if(cut<=limit/2) { cut=limit; while(cut && ((unsigned char)s[cut]&0xc0)==0x80) cut--; }
+    while(cut && strchr(" ,;:-",s[cut-1])) cut--;
+    strcpy(s+cut,"\xe2\x80\xa6");
+}
+
+/* An immediate title from the first message: drop greetings, keep the first sentence. */
+static void quicktitle(const char *text,char out[StoreName])
+{
+    static const char *openers[]={"hey there","hey claude","hey","hi there","hi","hello","yo",
+        "ok so","okay so","so","please","can you please","could you please","can you","could you",
+        "would you","i need you to","i want you to","help me","quick question"};
+    char buf[512]; size_t i,j=0; int trimmed=1;
+    for(i=0;text[i] && j<sizeof(buf)-1;i++) {
+        char c=text[i];
+        if(c==' ' || c=='\t' || c=='\r' || c=='\n') { if(j && buf[j-1]!=' ') buf[j++]=' '; }
+        else buf[j++]=c;
+    }
+    while(j && buf[j-1]==' ') j--;
+    buf[j]=0;
+    while(trimmed) {
+        size_t k;
+        trimmed=0;
+        for(k=0;k<sizeof(openers)/sizeof(openers[0]);k++) {
+            size_t n=strlen(openers[k]),at=n;
+            if(_strnicmp(buf,openers[k],n) || (buf[n] && !strchr(" ,.!?:",buf[n]))) continue;
+            while(buf[at] && strchr(" ,.!?:",buf[at])) at++;
+            if(buf[at]) { memmove(buf,buf+at,strlen(buf+at)+1); trimmed=1; }
+            break;
+        }
+    }
+    {
+        char *end=strpbrk(buf,".?!");
+        if(end && end-buf>=12) end[*end=='?'?1:0]=0;
+    }
+    clipwords(buf,56);
+    if(buf[0]>='a' && buf[0]<='z') buf[0]=(char)(buf[0]-32);
+    settitle(out,buf[0]?buf:"New chat");
+}
+
+enum { ChangePin, ChangeMove, ChangeRename, ChangeTitle };
+
+/* Pin, move or retitle a chat, open or not, without changing its place. */
+static void changechat(const char *id,int kind,const char *value)
+{
+    Chat *chat;
+    char target[33];
+    int current=!strcmp(id,app.chat.info.id);
+    size_t k;
+    strcpy(target,id);
+    if(kind!=ChangeTitle && app.busy) return;
+    if(current) {
+        if(kind!=ChangeTitle && !savechat()) return;
+        chat=&app.chat;
+    } else {
+        chat=calloc(1,sizeof(*chat));
+        if(!chat || !store_load(&app.store,target,chat)) {
+            if(chat) { chat_clear(chat); free(chat); }
+            note(app.store.error); return;
+        }
+    }
+    if(kind==ChangePin) chat->info.pinned=!chat->info.pinned;
+    else if(kind==ChangeMove) strcpy(chat->info.workspace,value);
+    else if(kind==ChangeRename) { settitle(chat->info.title,value); chat->info.renamed=1; }
+    else if(!chat->info.renamed) settitle(chat->info.title,value);
+    if(!store_save(&app.store,chat)) note(app.store.error);
+    if(current && kind==ChangeMove) {
+        for(k=0;k<app.store.nworkspaces;k++) if(!strcmp(app.store.workspaces[k].id,value)) app.selected=k;
+        listworkspaces();
+    }
+    if(!current) { chat_clear(chat); free(chat); }
+    listchats(); synctabs(); refreshtitle(); InvalidateRect(app.window,NULL,FALSE);
+}
+
+static void finishrename(int save)
+{
+    HWND w=app.renamer;
+    char id[33],*title;
+    wchar_t text[StoreName];
+    if(!w) return;
+    app.renamer=NULL; strcpy(id,app.renaming); app.renaming[0]=0;
+    GetWindowTextW(w,text,StoreName); DestroyWindow(w);
+    if(save) {
+        title=utf8(text);
+        if(title) {
+            char *s=title,*e;
+            while(*s==' ') s++;
+            e=s+strlen(s); while(e>s && e[-1]==' ') *--e=0;
+            if(*s) changechat(id,ChangeRename,s);
+        }
+        free(title);
+    }
+    SetFocus(app.modules);
+}
+
+static LRESULT CALLBACK renameproc(HWND window,UINT message,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR data)
+{
+    (void)data;
+    if(message==WM_KEYDOWN && (wp==VK_RETURN || wp==VK_ESCAPE)) { finishrename(wp==VK_RETURN); return 0; }
+    if(message==WM_CHAR && (wp==L'\r' || wp==27)) return 0;
+    if(message==WM_GETDLGCODE) return DLGC_WANTALLKEYS;
+    if(message==WM_KILLFOCUS) { LRESULT result=DefSubclassProc(window,message,wp,lp); finishrename(1); return result; }
+    if(message==WM_NCDESTROY) RemoveWindowSubclass(window,renameproc,id);
+    return DefSubclassProc(window,message,wp,lp);
+}
+
+/* An in-place title editor over the chat's row: Enter saves, Escape cancels. */
+static void beginrename(const char *id)
+{
+    int row;
+    RECT r;
+    wchar_t *title;
+    size_t k;
+    if(app.busy || app.renamer) return;
+    for(k=0;k<app.store.nchats;k++) if(!strcmp(app.store.chats[k].id,id)) break;
+    if(k==app.store.nchats) return;
+    for(row=0;row<app.nsidebar;row++) if(app.sidebar[row].kind==SidebarChat && (size_t)app.sidebar[row].index==k) break;
+    if(row==app.nsidebar) { SetWindowTextW(app.chatsearch,L""); listchats();
+        for(row=0;row<app.nsidebar;row++) if(app.sidebar[row].kind==SidebarChat && (size_t)app.sidebar[row].index==k) break; }
+    if(row==app.nsidebar) return;
+    SendMessageW(app.modules,LB_SETCURSEL,row,0);
+    if(SendMessageW(app.modules,LB_GETITEMRECT,row,(LPARAM)&r)==LB_ERR) return;
+    title=wide(app.store.chats[k].title);
+    app.renamer=CreateWindowExW(0,L"EDIT",title?title:L"",WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL,
+        r.left+px(4),r.top+px(2),r.right-r.left-px(8),r.bottom-r.top-px(4),app.modules,NULL,GetModuleHandleW(NULL),NULL);
+    free(title);
+    if(!app.renamer) return;
+    strcpy(app.renaming,app.store.chats[k].id);
+    SendMessageW(app.renamer,WM_SETFONT,(WPARAM)app.normal,TRUE);
+    SendMessageW(app.renamer,EM_SETLIMITTEXT,StoreName/2,0);
+    SetWindowSubclass(app.renamer,renameproc,1,0);
+    SetFocus(app.renamer); SendMessageW(app.renamer,EM_SETSEL,0,-1);
+}
+
+typedef struct TitleWork { char id[33]; char *body; unsigned short port; HANDLE cancel; char title[StoreName]; } TitleWork;
+
+static DWORD WINAPI titleworker(void *arg)
+{
+    TitleWork *t=arg;
+    char *answer=NULL,error[256];
+    int rc=LocalJsonFailed,attempt;
+    /* The engine may still be closing the reply stream; give it a moment. */
+    for(attempt=0;attempt<3 && rc!=LocalJsonOk;attempt++) {
+        if(WaitForSingleObject(t->cancel,attempt?1000:300)==WAIT_OBJECT_0) break;
+        free(answer); answer=NULL;
+        rc=local_json(t->port,L"/v1/chat/completions",t->body,t->cancel,&answer,error,sizeof(error));
+    }
+    if(rc==LocalJsonOk && answer) {
+        cJSON *json=cJSON_Parse(answer);
+        cJSON *first=json?cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(json,"choices"),0):NULL;
+        cJSON *message=first?cJSON_GetObjectItemCaseSensitive(first,"message"):NULL;
+        cJSON *content=message?cJSON_GetObjectItemCaseSensitive(message,"content"):NULL;
+        if(cJSON_IsString(content)) {
+            /* Models add quotes, labels or trailing punctuation. */
+            char buf[StoreName],*s=content->valuestring,*e;
+            while(*s && strchr(" \t\r\n",*s)) s++;
+            if(!_strnicmp(s,"title:",6)) s+=6;
+            settitle(buf,s);
+            if((e=strpbrk(buf,"\r\n"))) *e=0;
+            s=buf; while(*s && strchr(" \t\"'*#`.",*s)) s++;
+            e=s+strlen(s); while(e>s && strchr(" \t\"'*#`.",e[-1])) *--e=0;
+            clipwords(s,60);
+            settitle(t->title,s);
+        }
+        cJSON_Delete(json);
+    }
+    free(answer);
+    PostMessageW(app.window,TitleReady,0,(LPARAM)t);
+    return 0;
+}
+
+/* Asks the loaded model for a short title; the instant one stays otherwise. */
+static void suggesttitle(const char *id,const char *question,const char *answer,unsigned short port)
+{
+    TitleWork *t=calloc(1,sizeof(*t));
+    cJSON *body=cJSON_CreateObject(),*messages=cJSON_AddArrayToObject(body,"messages"),*m,*kwargs;
+    char user[1200];
+    HANDLE thread;
+    if(!t || !body || !messages) { free(t); cJSON_Delete(body); return; }
+    snprintf(user,sizeof(user),"User: %.600s\nAssistant: %.300s\n\nTitle:",question,answer);
+    while(strlen(user) && !MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,user,-1,NULL,0)) user[strlen(user)-1]=0;
+    m=cJSON_CreateObject(); cJSON_AddStringToObject(m,"role","system");
+    cJSON_AddStringToObject(m,"content","You name chat conversations. Reply with only a title of 2 to 6 words "
+        "in the language of the conversation. No quotes. No final punctuation.");
+    cJSON_AddItemToArray(messages,m);
+    m=cJSON_CreateObject(); cJSON_AddStringToObject(m,"role","user"); cJSON_AddStringToObject(m,"content",user);
+    cJSON_AddItemToArray(messages,m);
+    cJSON_AddStringToObject(body,"model","local");
+    cJSON_AddNumberToObject(body,"max_tokens",24); cJSON_AddNumberToObject(body,"temperature",0.2);
+    kwargs=cJSON_AddObjectToObject(body,"chat_template_kwargs"); cJSON_AddBoolToObject(kwargs,"enable_thinking",0);
+    cJSON_AddBoolToObject(body,"stream",0);
+    t->body=cJSON_PrintUnformatted(body); cJSON_Delete(body);
+    strcpy(t->id,id); t->port=port; t->cancel=CreateEventW(NULL,TRUE,FALSE,NULL);
+    if(!t->body || !t->cancel) { if(t->cancel) CloseHandle(t->cancel); cJSON_free(t->body); free(t); return; }
+    if(app.titlecancel) SetEvent(app.titlecancel);
+    app.titlecancel=t->cancel;
+    thread=CreateThread(NULL,0,titleworker,t,0,NULL);
+    if(thread) CloseHandle(thread);
+    else { app.titlecancel=NULL; CloseHandle(t->cancel); cJSON_free(t->body); free(t); }
+}
+
+/* Inserts a UTF-8 text or code file into the message as a tagged block. */
+static void inserttext(void)
+{
+    OPENFILENAMEW of={0};
+    wchar_t path[MAX_PATH]={0},*text,*block;
+    const wchar_t *name;
+    HANDLE file;
+    DWORD size,got=0;
+    char *data,*start;
+    enum { Limit=12*1024 };
+    of.lStructSize=sizeof(of); of.hwndOwner=app.window; of.lpstrFile=path; of.nMaxFile=MAX_PATH;
+    of.lpstrTitle=L"Insert a text or code file";
+    of.lpstrFilter=L"Text and code\0*.txt;*.md;*.csv;*.tsv;*.json;*.jsonl;*.xml;*.yaml;*.yml;*.toml;*.ini;*.cfg;*.log;"
+        L"*.html;*.htm;*.css;*.js;*.ts;*.tsx;*.jsx;*.py;*.c;*.h;*.cpp;*.hpp;*.cc;*.cs;*.java;*.kt;*.go;*.rs;*.rb;"
+        L"*.php;*.sh;*.ps1;*.bat;*.sql;*.lua;*.swift;*.r;*.tex;*.srt;*.vtt\0All files\0*.*\0\0";
+    of.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR|OFN_DONTADDTORECENT;
+    if(!GetOpenFileNameW(&of)) return;
+    file=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
+    if(file==INVALID_HANDLE_VALUE) { note(L"Cannot open the file."); return; }
+    size=GetFileSize(file,NULL);
+    if(size==INVALID_FILE_SIZE || size>Limit) { CloseHandle(file); note(L"Text files are limited to 12 KiB on Windows."); return; }
+    data=calloc(size+1,1);
+    if(!data || !ReadFile(file,data,size,&got,NULL) || got!=size) { CloseHandle(file); free(data); note(L"Cannot read the file."); return; }
+    CloseHandle(file);
+    start=data; if(!strncmp(start,"\xef\xbb\xbf",3)) start+=3;
+    text=wide(start); free(data);
+    if(!text) { note(L"This file is not UTF-8 text."); return; }
+    name=wcsrchr(path,L'\\'); name=name?name+1:path;
+    block=malloc((wcslen(text)+wcslen(name)+64)*sizeof(*block));
+    if(block) {
+        int length=GetWindowTextLengthW(app.prompt);
+        swprintf(block,wcslen(text)+wcslen(name)+64,L"%ls<file name=\"%ls\">\r\n%ls\r\n</file>\r\n",length?L"\r\n\r\n":L"",name,text);
+        SendMessageW(app.prompt,EM_SETSEL,(WPARAM)length,(LPARAM)length);
+        SendMessageW(app.prompt,EM_REPLACESEL,TRUE,(LPARAM)block);
+        SetFocus(app.prompt);
+    }
+    free(block); free(text);
+}
+
 static void chatmenu(LPARAM position)
 {
     POINT point={GET_X_LPARAM(position),GET_Y_LPARAM(position)};
@@ -1955,14 +2313,37 @@ static void chatmenu(LPARAM position)
     if(!sidebarchat(item,id)) { sidebaractivate(item,1); return; }
     for(i=0;i<app.ntabs;i++) if(!strcmp(app.tabs[i],id)) break;
     menu=CreatePopupMenu(); if(!menu) return;
-    AppendMenuW(menu,MF_STRING,IdOpenChat,L"&Open");
+    {
+        size_t k,index=app.store.nchats;
+        HMENU move=CreatePopupMenu();
+        for(k=0;k<app.store.nchats;k++) if(!strcmp(app.store.chats[k].id,id)) index=k;
+        AppendMenuW(menu,MF_STRING,IdOpenChat,L"&Open");
+        AppendMenuW(menu,MF_STRING,IdRename,L"&Rename\tF2");
+        AppendMenuW(menu,MF_STRING,IdPin,index<app.store.nchats && app.store.chats[index].pinned?L"Un&pin":L"&Pin to top");
+        if(move) {
+            int added=0;
+            for(k=0;k<app.store.nworkspaces;k++) {
+                wchar_t *name;
+                if(index<app.store.nchats && !strcmp(app.store.workspaces[k].id,app.store.chats[index].workspace)) continue;
+                name=wide(app.store.workspaces[k].name);
+                AppendMenuW(move,MF_STRING,IdMoveFirst+(UINT)k,name?name:L"Workspace"); free(name); added++;
+            }
+            if(added) AppendMenuW(menu,MF_POPUP,(UINT_PTR)move,L"&Move to");
+            else DestroyMenu(move);
+        }
+    }
     AppendMenuW(menu,MF_STRING|(i<app.ntabs?0:MF_GRAYED),IdCloseTab,L"&Close tab");
     AppendMenuW(menu,MF_SEPARATOR,0,NULL);
-    AppendMenuW(menu,MF_STRING,IdDeleteChat,L"&Delete conversation...");
+    AppendMenuW(menu,MF_STRING,IdDeleteChat,L"&Delete conversation...\tDel");
     SendMessageW(app.modules,LB_SETCURSEL,item,0);
     command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,app.window,NULL);
     DestroyMenu(menu);
     if(command==IdOpenChat) activatechat(id);
+    else if(command==IdRename) beginrename(id);
+    else if(command==IdPin) changechat(id,ChangePin,NULL);
+    else if(command>=IdMoveFirst && (size_t)(command-IdMoveFirst)<app.store.nworkspaces)
+        changechat(id,ChangeMove,app.store.workspaces[command-IdMoveFirst].id);
+
     else if(command==IdDeleteChat) confirmdelete(id);
     else if(command==IdCloseTab && i<app.ntabs) {
         if(!strcmp(id,app.chat.info.id)) closetab();
@@ -2174,9 +2555,18 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 				else if(app.health==EngineOther) note(L"The selected port is not a ready local engine.");
 			}
 			if(app.health!=before) refreshcontrols();
+			if(app.health==EngineReady && app.pendingsend) { app.pendingsend=0; submit(); }
+			else if(app.health==EngineOffline && !app.process.process) app.pendingsend=0;
 		}
 		free(p); return 0;
 	}
+    case TitleReady: {
+        TitleWork *t=(TitleWork *)lp;
+        if(t->title[0] && WaitForSingleObject(t->cancel,0)!=WAIT_OBJECT_0) changechat(t->id,ChangeTitle,t->title);
+        if(app.titlecancel==t->cancel) app.titlecancel=NULL;
+        CloseHandle(t->cancel); cJSON_free(t->body); free(t);
+        return 0;
+    }
 	case LibraryReady: modellist((ScanJob *)lp); return 0;
 	case WM_NOTIFY: {
 		NMHDR *n=(NMHDR *)lp;
@@ -2285,6 +2675,10 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
             if(HIWORD(wp)==EN_CHANGE && app.modules) { SendMessageW(app.modules,LB_SETTOPINDEX,0,0); listchats(); }
             break;
         case IdSidebarMenu: sidebaroptions(); break;
+        case IdInsertText: inserttext(); break;
+        case IdRename: if(app.chat.info.id[0]) beginrename(app.chat.info.id); break;
+        case IdPin: if(app.chat.info.id[0]) changechat(app.chat.info.id,ChangePin,NULL); break;
+        case IdFindChat: SetFocus(app.chatsearch); SendMessageW(app.chatsearch,EM_SETSEL,0,-1); break;
         case IdWorkspace: if(HIWORD(wp)==CBN_SELCHANGE) switchworkspace(); break;
 		case IdNewWorkspace: workspaceedit(1); break;
 		case IdEditWorkspace: workspaceedit(0); break;
@@ -2423,6 +2817,11 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	AppendMenuW(edit,MF_SEPARATOR,0,NULL);
 	AppendMenuW(edit,MF_STRING,IdRetry,L"&Retry selected exchange");
 	AppendMenuW(edit,MF_STRING,IdResend,L"&Edit and resend...");
+	AppendMenuW(edit,MF_SEPARATOR,0,NULL);
+	AppendMenuW(edit,MF_STRING,IdInsertText,L"Insert text &file...");
+	AppendMenuW(edit,MF_STRING,IdFindChat,L"&Find chat\tCtrl+K");
+	AppendMenuW(file,MF_STRING,IdRename,L"&Rename conversation\tF2");
+	AppendMenuW(file,MF_STRING,IdPin,L"&Pin or unpin conversation");
 	AppendMenuW(engine,MF_STRING,IdBrowse,L"Select &model...");
 	AppendMenuW(engine,MF_STRING,IdEngine,L"Select &engine...");
 	AppendMenuW(engine,MF_SEPARATOR,0,NULL);
@@ -2535,6 +2934,23 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	pollengine();
 	if(!setup_paths_ready(app.enginepath,app.modelpath)) PostMessageW(app.window,WM_COMMAND,IdSetup,0);
 	while(GetMessageW(&msg,NULL,0,0)>0) {
+        if(msg.message==WM_KEYDOWN && msg.wParam==VK_F2 && !app.renamer) {
+            char id[33];
+            if(GetFocus()==app.modules && sidebarchat((int)SendMessageW(app.modules,LB_GETCURSEL,0,0),id)) beginrename(id);
+            else if(app.chat.info.id[0]) beginrename(app.chat.info.id);
+            continue;
+        }
+        /* Search: Enter opens the first result, Down moves into the list. */
+        if(msg.message==WM_KEYDOWN && GetFocus()==app.chatsearch && (msg.wParam==VK_RETURN || msg.wParam==VK_DOWN)) {
+            int row; char id[33];
+            for(row=0;row<app.nsidebar;row++) if(app.sidebar[row].kind==SidebarChat) break;
+            if(row<app.nsidebar) {
+                SendMessageW(app.modules,LB_SETCURSEL,row,0);
+                if(msg.wParam==VK_RETURN && sidebarchat(row,id)) { SetWindowTextW(app.chatsearch,L""); activatechat(id); SetFocus(app.prompt); }
+                else SetFocus(app.modules);
+            }
+            continue;
+        }
         if(msg.message==WM_KEYDOWN && msg.wParam==VK_DELETE && GetFocus()==app.modules) {
             char id[33];
             if(sidebarchat((int)SendMessageW(app.modules,LB_GETCURSEL,0,0),id)) confirmdelete(id);
@@ -2553,6 +2969,7 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
                 if(!wcscmp(kind,L"Edit")) { SendMessageW(focus,EM_SETSEL,0,-1); continue; }
             }
             if(msg.wParam=='W') { closetab(); continue; }
+            if(msg.wParam=='K') { SendMessageW(app.window,WM_COMMAND,IdFindChat,0); continue; }
             if(msg.wParam==VK_TAB && app.ntabs && !app.busy) {
                 int index=TabCtrl_GetCurSel(app.chattabs),step=(GetKeyState(VK_SHIFT)&0x8000)?app.ntabs-1:1;
                 activatechat(app.tabs[(index+step)%app.ntabs]); continue;

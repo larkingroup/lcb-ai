@@ -172,7 +172,27 @@ chat_parse(cJSON *json, Chat *chat)
 	}
 	if(i%2) return 0;
 	chat->info.turns=chat->conversation.count/2;
+	/* Optional fields shared with the Linux build. */
+	v=cJSON_GetObjectItemCaseSensitive(json,"updated");
+	chat->info.updated=cJSON_IsNumber(v) && v->valuedouble>0 ? (long long)v->valuedouble : 0;
+	v=cJSON_GetObjectItemCaseSensitive(json,"pinned");
+	chat->info.pinned=cJSON_IsNumber(v) && v->valuedouble!=0;
+	v=cJSON_GetObjectItemCaseSensitive(json,"renamed");
+	chat->info.renamed=cJSON_IsNumber(v) && v->valuedouble!=0;
 	return 1;
+}
+
+static long long
+unixtime(FILETIME t)
+{
+	ULONGLONG ticks=((ULONGLONG)t.dwHighDateTime<<32)|t.dwLowDateTime;
+	return ticks<116444736000000000ULL ? 0 : (long long)((ticks-116444736000000000ULL)/10000000ULL);
+}
+
+long long
+store_now(void)
+{
+	FILETIME t; GetSystemTimeAsFileTime(&t); return unixtime(t);
 }
 
 void
@@ -193,7 +213,12 @@ store_load(Store *s, const char *id, Chat *chat)
 	next=calloc(1,sizeof(*next));
 	ok=next && json && chat_parse(json,next) && strcmp(next->info.id,id)==0 && store_find_workspace(s,next->info.workspace);
 	cJSON_Delete(json);
+	if(ok && !next->info.updated) {
+		size_t i;
+		for(i=0;i<s->nchats;i++) if(!strcmp(s->chats[i].id,id)) next->info.updated=s->chats[i].updated;
+	}
 	if(ok) { chat_clear(chat); *chat=*next; free(next); return 1; }
+
 	if(next) { chat_clear(next); free(next); }
 	return fail(s,L"Cannot read chat; file left unchanged");
 }
@@ -252,7 +277,10 @@ store_save(Store *s, Chat *chat)
 	messages=json?cJSON_AddArrayToObject(json,"messages"):NULL;
 	ok=messages && cJSON_AddNumberToObject(json,"version",1) && cJSON_AddStringToObject(json,"id",chat->info.id) &&
 	    cJSON_AddStringToObject(json,"workspace",chat->info.workspace) && cJSON_AddStringToObject(json,"title",chat->info.title) &&
-	    cJSON_AddStringToObject(json,"draft",chat->draft);
+	    cJSON_AddStringToObject(json,"draft",chat->draft) &&
+	    cJSON_AddNumberToObject(json,"updated",(double)chat->info.updated) &&
+	    cJSON_AddNumberToObject(json,"pinned",chat->info.pinned?1:0) &&
+	    cJSON_AddNumberToObject(json,"renamed",chat->info.renamed?1:0);
 	for(i=0;ok && i<chat->conversation.count;i++) {
 		Message *message=&chat->conversation.messages[i];
 		m=cJSON_CreateObject();
@@ -283,6 +311,7 @@ store_new(Store *s, const char *workspace, Chat *chat)
 	int ok=0;
 	if(next && validid(workspace) && newid(next->info.id)) {
 		strcpy(next->info.workspace,workspace); strcpy(next->info.title,"New chat");
+		next->info.updated=store_now();
 		ok=store_save(s,next);
 		if(ok) { chat_clear(chat); *chat=*next; }
 	} else fail(s,L"Cannot prepare new chat");
@@ -302,6 +331,7 @@ store_branch(Store *s, const Chat *source, size_t turn, const char *prompt,
 	next=calloc(1,sizeof(*next));
 	if(!next || !newid(next->info.id)) { free(next); return fail(s,L"Cannot prepare conversation"); }
 	strcpy(next->info.workspace,source->info.workspace);
+	next->info.updated=store_now();
 	snprintf(next->info.title,StoreName,"%s %zu: %s",action,turn+1,source->info.title);
 	/* snprintf may cut a UTF-8 title between code units. */
 	n=strlen(next->info.title);
@@ -352,7 +382,10 @@ scan(Store *s, int chats)
 		path(s,name,chats?L"chats":L"workspaces",id); json=readjson(name);
 		if(chats) {
 			ok=json && chat_parse(json,chat) && strcmp(chat->info.id,id)==0 && store_find_workspace(s,chat->info.workspace);
+			/* Older chats have no stamp; their file time stands in. */
+			if(ok && !chat->info.updated) chat->info.updated=unixtime(data.ftLastWriteTime);
 			if(ok && s->nchats<StoreChats) s->chats[s->nchats++]=chat->info;
+
 			else s->skipped++;
 			chat_clear(chat);
 		} else {
