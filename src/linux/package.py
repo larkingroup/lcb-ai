@@ -29,7 +29,12 @@ def package(build, output):
         shutil.copy2(ROOT / 'assets/lcb-icon.svg', app / 'assets/lcb-icon.svg')
         shutil.copy2(ROOT / 'vendor/cjson/LICENSE', app / 'licenses/cJSON-LICENSE')
         shutil.copy2(ROOT / 'vendor/fltk/LICENSE', app / 'licenses/FLTK-LICENSE')
-        shutil.copytree(ROOT / 'vendor/kde1-icons', app / 'licenses/kde1-icons')
+        (app / 'fonts').mkdir()
+        for filename in ('tahoma.ttf', 'tahomabd.ttf'):
+            shutil.copy2(ROOT / 'vendor/wine-tahoma' / filename, app / 'fonts' / filename)
+        (app / 'licenses/wine-tahoma').mkdir()
+        for filename in ('LICENSE', 'NOTICE.md'):
+            shutil.copy2(ROOT / 'vendor/wine-tahoma' / filename, app / 'licenses/wine-tahoma' / filename)
         shutil.copy2(ROOT / 'src/linux/lcb-ai.desktop', app / 'lcb-ai.desktop')
         shutil.copy2(ROOT / 'README.md', app / 'README.md')
         (app / 'RUNNING.txt').write_text(
