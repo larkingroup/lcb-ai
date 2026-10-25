@@ -3,12 +3,22 @@
 
 #include <stddef.h>
 
+#ifdef _WIN32
+/* Windows keeps prompt-sized buffers in fixed structs and on the stack. */
 enum {
 	LcbMaxPrompt = 16384,
 	LcbMaxReply = 65536,
 	LcbMaxWire = 1048576,
     LcbMaxStreamWire = 16 * 1048576
 };
+#else
+enum {
+	LcbMaxPrompt = 262144,
+	LcbMaxReply = 1048576,
+	LcbMaxWire = 16 * 1048576,
+    LcbMaxStreamWire = 128 * 1048576
+};
+#endif
 
 typedef struct Message Message;
 typedef struct Conversation Conversation;
@@ -61,7 +71,10 @@ typedef struct Generation {
 	int top_k;
 	double min_p, presence_penalty;
 } Generation;
+/* max_tokens 0 = until the model stops; context_tokens 0 = the engine fits it. */
 Generation generation_defaults(void);
+/* Prompt room kept free for the reply: the limit, or a share of an Auto context. */
+int generation_reserve(const Generation *g, int context_tokens);
 int generation_valid(const Generation *g);
 double generation_value(const Generation *g, int field);
 int generation_set(Generation *g, int field, double value);
@@ -80,6 +93,7 @@ typedef struct StreamReply {
     int progress_total, progress_processed, progress_cached;
     double progress_ms;
     GenerationTimings timings;
+    char error[256]; /* Engine error event, if one ended the stream. */
 } StreamReply;
 enum { FinishUnknown, FinishStop, FinishLength, FinishOther };
 typedef struct ReplyReport {

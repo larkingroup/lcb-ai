@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <locale>
 #include <netinet/in.h>
+#include <poll.h>
 #include <openssl/evp.h>
 #include <random>
 #include <regex>
@@ -31,7 +32,7 @@ const char *fields[GenCount] = {
     "thinking",   "repeat_penalty",  "dry_multiplier", "top_k",
     "min_p",      "presence_penalty"};
 const char *labels[GenCount] = {
-    "Response tokens", "Temperature",     "Top P",          "Context (reload)",
+    "Response (0 = auto)", "Temperature", "Top P",          "Context (0 = auto)",
     "Thinking",        "Repeat penalty",  "DRY multiplier", "Top K",
     "Min P",           "Presence penalty"};
 namespace {
@@ -204,9 +205,14 @@ std::string truncate(std::string s, size_t n) {
   return s;
 }
 void validate_text(const std::string &s, size_t limit, bool empty) {
-  if (s.size() > limit || s.find('\0') != s.npos || (!empty && s.empty()))
-    throw std::runtime_error(
-        "Text exceeds the permitted size or contains NUL characters.");
+  if (!empty && s.empty())
+    throw std::runtime_error("Text is empty.");
+  if (s.size() > limit)
+    throw std::runtime_error("Text is too long (" +
+                             std::to_string(s.size() / 1024) + " KiB; limit " +
+                             std::to_string(limit / 1024) + " KiB).");
+  if (s.find('\0') != s.npos)
+    throw std::runtime_error("Text contains NUL characters.");
   wide(s);
 }
 std::string read_file(const fs::path &path, size_t limit) {
@@ -631,6 +637,11 @@ void Settings::set(const std::string &section, const std::string &key,
     throw std::runtime_error("Settings must be a single line.");
   ini_[section][lower(key)] = value;
 }
+void Settings::erase(const std::string &section, const std::string &key) {
+  auto s = ini_.find(section);
+  if (s != ini_.end())
+    s->second.erase(lower(key));
+}
 void Settings::save() {
   std::ostringstream out;
   for (const auto &s : ini_) {
@@ -690,8 +701,17 @@ void Settings::migrate(const std::string &old_path,
 Generation Settings::generation(const std::string &path,
                                 const ModelInfo *info) const {
   Generation g = generation_defaults();
-  model_defaults(info, -1, &g);
-  g.thinking = ThinkingAuto;
+  int thinking = -1;
+  try {
+    auto v = get(section(path), fields[GenThinking]);
+    if (!v.empty())
+      thinking = std::stoi(v);
+  } catch (const std::exception &) {
+  }
+  model_defaults(info, thinking, &g);
+  // Replies run until the model stops; llama.cpp fits context to free memory.
+  g.max_tokens = 0;
+  g.context_tokens = 0;
   for (int i = 0; i < 3; ++i) {
     const char *keys[] = {"max_tokens", "temperature100", "top_p100"};
     try {
@@ -867,44 +887,52 @@ Prepared Transport::prepare(const std::string &model, const Json &messages,
       props.object("chat_template_caps").get("supports_reasoning_effort"));
   if (const char *problem = reasoning_settings_error(&g, effort))
     throw std::runtime_error(problem);
-  if (context - g.max_tokens - 32 < 1)
+  if (context - generation_reserve(&g, context) - 32 < 1)
     throw std::runtime_error("Response limit leaves no prompt room. Lower it "
                              "or reload with more context.");
   ConversationOwner c;
-  cJSON *item;
   std::vector<Json> attachment_sets;
-  cJSON_ArrayForEach(item, messages.p) {
-    Json m(cJSON_Duplicate(item, 1));
-    if (!conversation_add(&c.value,
-                          (m.str("role") == "assistant" ? "assistant" : "user"),
-                          m.str("content").c_str()))
+  for (int i = 0; i + 1 < cJSON_GetArraySize(messages.p); i += 2) {
+    Json user(cJSON_Duplicate(cJSON_GetArrayItem(messages.p, i), 1));
+    Json answer(cJSON_Duplicate(cJSON_GetArrayItem(messages.p, i + 1), 1));
+    if (answer.str("content") == NoAnswer)
+      continue;
+    if (!conversation_add(&c.value, "user", user.str("content").c_str()) ||
+        !conversation_add(&c.value, "assistant", answer.str("content").c_str()))
       throw std::runtime_error("Cannot prepare conversation.");
-    attachment_sets.push_back(m.get("attachments") ? m.object("attachments")
-                                                   : Json::array());
+    attachment_sets.push_back(user.get("attachments") ? user.object("attachments")
+                                                      : Json::array());
+    attachment_sets.push_back(Json::array());
   }
   attachment_sets.push_back(attachments);
   Module module{"Workspace", instruction.c_str()};
   Prepared prepared;
   prepared.context = context;
-  prepared.response = g.max_tokens;
+  prepared.response = generation_reserve(&g, context);
   bool has_media = false;
-  for (const auto &a : attachment_sets)
-    has_media |= cJSON_GetArraySize(a.p) > 0;
-  if (has_media) {
-    auto modalities = props.object("modalities");
-    size_t total = 0;
-    for (const auto &a : attachment_sets) {
-      validate_attachments(a);
-      cJSON *it;
-      cJSON_ArrayForEach(it, a.p) {
-        Json att(cJSON_Duplicate(it, 1));
-        if (!cJSON_IsTrue(modalities.get(att.str("kind").c_str())))
+  auto modalities = props.object("modalities");
+  size_t total = 0;
+  for (size_t n = 0; n < attachment_sets.size(); ++n) {
+    auto &a = attachment_sets[n];
+    validate_attachments(a);
+    Json kept = Json::array();
+    cJSON *it;
+    cJSON_ArrayForEach(it, a.p) {
+      Json att(cJSON_Duplicate(it, 1));
+      if (!cJSON_IsTrue(modalities.get(att.str("kind").c_str()))) {
+        if (n + 1 == attachment_sets.size())
           throw std::runtime_error("The loaded engine does not support " +
                                    att.str("kind") +
                                    " input: " + att.str("name"));
-        total += static_cast<size_t>(att.number("size"));
+        continue; // Earlier media stays saved but a text-only engine skips it.
       }
+      total += static_cast<size_t>(att.number("size"));
+      kept.add(att);
     }
+    a = kept;
+    has_media |= cJSON_GetArraySize(a.p) > 0;
+  }
+  if (has_media) {
     if (total > 46 * 1048576)
       throw std::runtime_error("Conversation media exceeds 46 MiB. Start a new "
                                "chat or use smaller files.");
@@ -1023,7 +1051,9 @@ Reply Transport::generate(
         [&](const char *p, size_t n) {
           if (!stream_feed(state.get(), p, n))
             throw std::runtime_error(
-                "Invalid or oversized stream from the local engine.");
+                state->error[0] ? "Engine error: " + std::string(state->error)
+                                : "Invalid or oversized stream from the local "
+                                  "engine.");
           auto now = std::chrono::steady_clock::now();
           if (update && (state->done || (state->used && !emitted_content) ||
                          (state->reasoning_used && !emitted_reasoning) ||
@@ -1057,6 +1087,7 @@ Reply Transport::generate(
     update(*state);
   return reply;
 }
+const char *const NoAnswer = "[No final answer was emitted.]";
 std::vector<std::string> split_arguments(const std::string &s) {
   std::vector<std::string> out;
   std::string word;
@@ -1101,6 +1132,59 @@ std::vector<std::string> split_arguments(const std::string &s) {
     out.push_back(word);
   return out;
 }
+bool list_devices(const std::string &exe, std::vector<std::string> &devices) {
+  devices.clear();
+  int pipes[2];
+  if (pipe2(pipes, O_CLOEXEC))
+    return false;
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  posix_spawn_file_actions_adddup2(&actions, pipes[1], STDOUT_FILENO);
+  posix_spawn_file_actions_adddup2(&actions, pipes[1], STDERR_FILENO);
+  posix_spawn_file_actions_addchdir_np(&actions,
+                                       fs::path(exe).parent_path().c_str());
+  std::string path = exe, flag = "--list-devices";
+  char *argv[] = {path.data(), flag.data(), nullptr};
+  pid_t child = -1;
+  int rc = posix_spawn(&child, exe.c_str(), &actions, nullptr, argv, environ);
+  posix_spawn_file_actions_destroy(&actions);
+  close(pipes[1]);
+  std::string output;
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  while (!rc && output.size() < 65536) {
+    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now())
+                    .count();
+    pollfd fd{pipes[0], POLLIN, 0};
+    if (left <= 0 || poll(&fd, 1, static_cast<int>(left)) <= 0)
+      break;
+    char chunk[4096];
+    ssize_t n = read(pipes[0], chunk, sizeof(chunk));
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0)
+      break;
+    output.append(chunk, static_cast<size_t>(n));
+  }
+  close(pipes[0]);
+  if (rc)
+    return false;
+  kill(child, SIGKILL);
+  while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
+  }
+  auto at = output.find("Available devices:");
+  if (at == output.npos)
+    return false;
+  std::istringstream lines(output.substr(at));
+  std::string line;
+  std::getline(lines, line);
+  while (std::getline(lines, line) && line.rfind("  ", 0) == 0) {
+    line = line.substr(line.find_first_not_of(' '));
+    if (line != "(none)")
+      devices.push_back(line);
+  }
+  return true;
+}
 Engine::~Engine() { stop(); }
 std::vector<std::string> Engine::arguments() const {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -1131,6 +1215,9 @@ void Engine::start(const std::string &exe, const std::string &model,
   int probe = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (probe < 0)
     throw std::runtime_error(system_error("Cannot check engine port"));
+  // Like llama-server, ignore TIME_WAIT left by the previous engine.
+  int reuse = 1;
+  setsockopt(probe, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
   sockaddr_in address{};
   address.sin_family = AF_INET;
   address.sin_port = htons(port);
@@ -1152,8 +1239,6 @@ void Engine::start(const std::string &exe, const std::string &model,
                                                 "127.0.0.1",
                                                 "--port",
                                                 std::to_string(port),
-                                                "--ctx-size",
-                                                std::to_string(context),
                                                 "--parallel",
                                                 "1",
                                                 "--jinja",
@@ -1168,6 +1253,11 @@ void Engine::start(const std::string &exe, const std::string &model,
                                                 "localhost",
                                                 "--no-cors-credentials"})
     command.push_back(s);
+  // Without --ctx-size, llama.cpp fits the context to free device memory.
+  if (context) {
+    command.push_back("--ctx-size");
+    command.push_back(std::to_string(context));
+  }
   if (!projector.empty()) {
     if (!fs::is_regular_file(projector))
       throw std::runtime_error("The selected projector is unavailable.");

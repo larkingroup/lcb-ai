@@ -34,7 +34,7 @@ int conversation_fit(const Conversation *c, const Module *module, const char *pr
     }
     problem=reasoning_settings_error(g,effort);
     if(problem) { snprintf(error,capacity,"%s",problem); return 0; }
-    available=context_tokens-g->max_tokens-32;
+    available=context_tokens-generation_reserve(g,context_tokens)-32;
     if(available<1) { snprintf(error,capacity,"Response limit leaves no prompt room in the loaded context."); return 0; }
     /* The common case needs one exact count, independent of history length. */
     status=candidate(c,0,module,prompt,g,effort,counter,counter_context,&wire,&count,error,capacity);

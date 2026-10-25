@@ -34,7 +34,7 @@ static void refresh(Setup *s)
 	int i;
 	for(i=0;i<3;i++) SendMessageW(s->choices[i],BM_SETCHECK,i==s->selected?BST_CHECKED:BST_UNCHECKED,0);
 	SetWindowTextW(s->enginenote,s->selected==0?
-	    L"For lcb-ai: extract the llama.cpp ZIP, keep its DLLs together, then choose llama-server.exe.\r\nCPU is the easiest starting point. Other builds include GPU acceleration.":
+	    L"For lcb-ai: extract the llama.cpp ZIP, keep its DLLs together, then choose llama-server.exe.\r\nThis Vulkan build uses NVIDIA, AMD or Intel graphics and falls back to the CPU.":
 	    s->selected==1?L"Ollama is a separate runner with its own model library and service.\r\nlcb-ai currently connects to llama.cpp; select llama.cpp to finish setup here.":
 	    L"KoboldCpp is a separate GGUF runner with its own web interface.\r\nlcb-ai currently connects to llama.cpp; select llama.cpp to finish setup here.");
 	EnableWindow(s->enginefield,s->selected==0);
@@ -88,7 +88,7 @@ static LRESULT CALLBACK setupproc(HWND window, UINT message, WPARAM wp, LPARAM l
 		case BrowseEngine: if(s->selected==0) browse(window,s,1); break;
 		case BrowseModel: browse(window,s,0); break;
 		case DownloadEngine:
-			openlink(window,L"https://github.com/ggml-org/llama.cpp/releases/download/b10566/llama-b10566-bin-win-cpu-x64.zip"); break;
+			openlink(window,L"https://github.com/ggml-org/llama.cpp/releases/download/b10566/llama-b10566-bin-win-vulkan-x64.zip"); break;
 		case OtherEngines: openlink(window,L"https://github.com/ggml-org/llama.cpp/releases"); break;
 		case DownloadOllama: openlink(window,L"https://ollama.com/download/windows"); break;
 		case DownloadKobold: openlink(window,L"https://github.com/LostRuins/koboldcpp/releases/latest"); break;
@@ -142,7 +142,7 @@ int setup_dialog(HWND owner, HFONT font, wchar_t engine[MAX_PATH], wchar_t model
 	child(window,font,dpi,L"BUTTON",L"1. Choose a local engine",BS_GROUPBOX,0,16,76,748,294);
 	child(window,font,dpi,L"BUTTON",L"",BS_GROUPBOX,0,30,100,236,166);
 	s.choices[0]=child(window,font,dpi,L"BUTTON",L"llama.cpp (default)",WS_TABSTOP|BS_RADIOBUTTON,ChooseLlama,42,114,212,23);
-	child(window,font,dpi,L"STATIC",L"Runs GGUF files on CPU or GPU.\r\nGood for direct model loading.\r\nWorks with lcb-ai.\r\nCPU download: about 19 MB.",0,0,42,145,212,72);
+	child(window,font,dpi,L"STATIC",L"Runs GGUF files on CPU or GPU.\r\nGood for direct model loading.\r\nWorks with lcb-ai.\r\nGPU (Vulkan) build.",0,0,42,145,212,72);
 	child(window,font,dpi,L"BUTTON",L"Download llama.cpp",WS_TABSTOP,DownloadEngine,42,230,212,25);
 	child(window,font,dpi,L"BUTTON",L"",BS_GROUPBOX,0,272,100,236,166);
 	s.choices[1]=child(window,font,dpi,L"BUTTON",L"Ollama",WS_TABSTOP|BS_RADIOBUTTON,ChooseOllama,284,114,212,23);

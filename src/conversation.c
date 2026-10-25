@@ -3,11 +3,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdio.h>
 
 Generation generation_defaults(void)
 {
     Generation g={1024,0.7,0.95,4096,ThinkingAuto,1.0,0.0,40,0.05,0.0};
     return g;
+}
+
+int generation_reserve(const Generation *g, int context_tokens)
+{
+    int share=context_tokens/4;
+    if(g->max_tokens) return g->max_tokens;
+    return share<1024 ? 1024 : share>16384 ? 16384 : share;
 }
 
 const char *answer_status_name(int status)
@@ -27,9 +35,9 @@ int answer_status(int result, int finish)
 
 int generation_valid(const Generation *g)
 {
-    return g && g->max_tokens>=1 && g->max_tokens<=16384 &&
+    return g && g->max_tokens>=0 && g->max_tokens<=131072 &&
         g->temperature>=0 && g->temperature<=2 && g->top_p>0 && g->top_p<=1 &&
-        g->context_tokens>=512 && g->context_tokens<=1048576 &&
+        (g->context_tokens==0 || (g->context_tokens>=512 && g->context_tokens<=1048576)) &&
         g->thinking>=ThinkingAuto && g->thinking<=ThinkingOn &&
         g->repeat_penalty>=1 && g->repeat_penalty<=2 &&
         g->dry_multiplier>=0 && g->dry_multiplier<=4 &&
@@ -182,7 +190,7 @@ request_with_settings(const Conversation *c, const Module *module, const char *p
 	    cJSON_AddBoolToObject(root, "return_progress", 1) == NULL ||
 	    cJSON_AddBoolToObject(root, "timings_per_token", 1) == NULL ||
 	    cJSON_AddNumberToObject(root, "sse_ping_interval", 5) == NULL ||
-	    cJSON_AddNumberToObject(root, "max_tokens", g ? g->max_tokens : 1024) == NULL ||
+	    ((!g || g->max_tokens) && cJSON_AddNumberToObject(root, "max_tokens", g ? g->max_tokens : 1024) == NULL) ||
 	    !addmessage(messages, "system", module->instruction))
 		goto done;
 	for(i = 0; i < c->count; i++)
@@ -271,7 +279,13 @@ static int stream_line(StreamReply *s)
     data+=5; if(*data==' ') data++;
     if(!strcmp(data,"[DONE]")) { s->done=1; return 1; }
     root=cJSON_ParseWithLengthOpts(data,strlen(data)+1,NULL,1);
-    if(!root || cJSON_GetObjectItemCaseSensitive(root,"error")) { cJSON_Delete(root); return 0; }
+    if(root && cJSON_GetObjectItemCaseSensitive(root,"error")) {
+        const cJSON *error=cJSON_GetObjectItemCaseSensitive(root,"error");
+        const cJSON *message=cJSON_IsObject(error)?cJSON_GetObjectItemCaseSensitive(error,"message"):error;
+        snprintf(s->error,sizeof(s->error),"%s",cJSON_IsString(message)?message->valuestring:"The engine reported an error.");
+        cJSON_Delete(root); return 0;
+    }
+    if(!root) return 0;
     choices=cJSON_GetObjectItemCaseSensitive(root,"choices");
     if(!cJSON_IsArray(choices)) { cJSON_Delete(root); return 0; }
     delta=cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(choices,0),"delta");
