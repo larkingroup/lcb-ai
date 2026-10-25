@@ -861,6 +861,14 @@ class Window : public Fl_Double_Window {
       *message_header, *status, *media_status, *output_header, *speed_box,
       *search_label, *port_label, *runtime_model_label, *model_library_label;
   Fl_Box *toolbar_separators[3]{};
+  // Toolbar model picker; the Properties window holds everything else.
+  Fl_Box *model_picker_label, *thinking_label, *engine_path_label;
+  Fl_Choice *model_picker, *quick_thinking;
+  Fl_Button *properties_button, *engine_choose_button, *engine_options_button;
+  Fl_Double_Window *props;
+  Fl_Group *engine_page;
+  std::vector<std::string> picker_paths;
+  std::string pending_model, gpu;
   ChatSidebar *sidebar;
   Fl_Input *chat_search;
   LoadingMeter *loading_meter;
@@ -1061,8 +1069,10 @@ public:
       if (key == FL_F + 9 || key == FL_F + 10 || key == FL_F + 12) {
         if (key == FL_F + 9)
           show_left = !show_left;
-        else if (key == FL_F + 10)
-          show_right = !show_right;
+        else if (key == FL_F + 10) {
+          show_properties(0);
+          return 1;
+        }
         else
           show_output = !show_output;
         layout();
@@ -1219,10 +1229,6 @@ private:
       show_chats = !show_chats;
       layout();
     });
-    add("&View/Properties and Models", FL_F + 10, [&] {
-      show_right = !show_right;
-      layout();
-    });
     add("&View/Output", FL_F + 12, [&] {
       show_output = !show_output;
       layout();
@@ -1240,13 +1246,18 @@ private:
       refresh_sidebar();
       layout();
     });
-    add("&Engine/Load model", FL_F + 5, [&] { load_model(); });
-    add("&Engine/Unload", 0, [&] { unload(); });
-    add("&Engine/Stop response", FL_Escape, [&] { stop(); });
-    add("&Engine/Engine details and live log", 0, [&] { engine_details(); });
-    add("&Settings/Engine and model...", FL_CTRL + ',',
-        [&] { settings_dialog(); });
-    add("&Settings/Setup...", 0, [&] { setup(); });
+    add("&Chat/Send", FL_CTRL + FL_Enter, [&] { send(); });
+    add("&Chat/Stop response", FL_Escape, [&] { stop(); });
+    add("&Chat/Retry", FL_CTRL + 'r', [&] { retry(false); });
+    add("&Chat/Edit and resend...", FL_CTRL + 'e', [&] { retry(true); });
+    add("&Chat/Attach...", 0, [&] { attach(); });
+    add("&Model/Load", FL_F + 5, [&] { load_model(); });
+    add("&Model/Unload", 0, [&] { unload(); });
+    add("&Model/Open model file...", FL_CTRL + 'o', [&] { choose_model(); });
+    add("&Model/Properties...", FL_ALT + FL_Enter, [&] { show_properties(0); });
+    add("&Model/Engine log", 0, [&] { engine_details(); });
+    add("&Tools/Engine options...", FL_CTRL + ',', [&] { settings_dialog(); });
+    add("&Tools/Setup...", 0, [&] { setup(); });
     add("&Help/About", 0, [&] {
       fl_message("LCB-AI " LCB_VERSION
                  "\nLarkin Computing Bureau\n\nNative Linux workbench: "
@@ -1255,7 +1266,7 @@ private:
     });
     for (const char *path : {"&File/New workspace...", "&File/Delete chat...",
                              "&Edit/Copy", "&View/Output", "&View/Next chat",
-                             "&Engine/Unload"}) {
+                             "&Chat/Stop response", "&Model/Open model file..."}) {
       int index = menu->find_index(path);
       menu->mode(index, menu->mode(index) | FL_MENU_DIVIDER);
     }
@@ -1265,6 +1276,15 @@ private:
     unload_button = icon_button("Unload", icons::Stop, [&] { unload(); });
     engine_button = icon_button("Settings...", icons::Settings, [&] { settings_dialog(); });
     model_button = icon_button("Open model...", icons::Open, [&] { choose_model(); });
+    model_picker_label = label("Model:");
+    model_picker = new Fl_Choice(0, 0, 10, 10);
+    model_picker->textsize(12);
+    model_picker->color(FL_WHITE);
+    model_picker->tooltip("Choosing a model loads it");
+    bind(model_picker, [&] { pick_model(); });
+    properties_button = icon_button("Properties", icons::Settings,
+                                    [&] { show_properties(0); });
+    properties_button->tooltip("Model, generation, library and engine (F10)");
     for (auto &separator : toolbar_separators) {
       separator = new Fl_Box(FL_ENGRAVED_BOX, 0, 0, 2, 24, nullptr);
     }
@@ -1425,14 +1445,27 @@ private:
     prompt->color(FL_WHITE);
     prompt->selection_color(Blue);
     prompt->wrap_mode(Fl_Text_Display::WRAP_AT_BOUNDS, 0);
+    thinking_label = label("Thinking:");
+    quick_thinking = new Fl_Choice(0, 0, 10, 10);
+    quick_thinking->add("Auto|Off|On");
+    quick_thinking->textsize(12);
+    quick_thinking->color(FL_WHITE);
+    quick_thinking->tooltip("Auto follows the model's own default");
+    bind(quick_thinking,
+         [&] { edit_generation(GenThinking, quick_thinking->value()); });
     send_button = icon_button("Send", icons::Send, [&] { send(); }, false);
     stop_button = icon_button("Stop", icons::Stop, [&] { stop(); }, false);
+    // Model details and settings live in one classic property sheet.
+    Fl_Group::current(nullptr); // A top-level window, not a child of this one.
+    props = new Fl_Double_Window(560, 560, "Model Properties");
+    props->color(Face);
+    props->begin();
     right_header = label("Runtime", true);
     right_tabs = new Fl_Tabs(0, 0, 10, 10);
     right_tabs->labelsize(12);
     right_tabs->selection_color(Blue);
     right_tabs->begin();
-    models_page = new Fl_Scroll(0, 0, 10, 10, "Models");
+    models_page = new Fl_Scroll(0, 0, 10, 10, "Model");
     static_cast<Fl_Scroll *>(models_page)->type(Fl_Scroll::VERTICAL);
     models_page->color(Face);
     models_page->labelsize(12);
@@ -1482,8 +1515,10 @@ private:
         f->textsize(12);
         f->color(FL_WHITE);
         f->range(minimum[i], maximum[i]);
-        f->step(i == GenResponse || i == GenContext || i == GenTopK ? 1
-                                                                    : 0.000001);
+        if (i == GenResponse || i == GenContext || i == GenTopK)
+          f->step(1);
+        else
+          f->precision(2);
         f->when(FL_WHEN_RELEASE);
         generation_fields[i] =
             bind(f, [this, i, f] { edit_generation(i, f->value()); });
@@ -1517,12 +1552,29 @@ private:
     master = display(master_buffer);
     master->textfont(FL_HELVETICA);
     library_page->end();
+    engine_page = new Fl_Group(0, 0, 10, 10, "Engine");
+    engine_page->labelsize(12);
+    engine_page->begin();
+    engine_path_label = label("");
+    engine_path_label->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE | FL_ALIGN_CLIP |
+                             FL_ALIGN_WRAP);
+    engine_choose_button = button("Choose engine...", [&] { choose_engine(); });
+    engine_options_button = button("Launch options...", [&] { settings_dialog(); });
+    engine_page->end();
     right_tabs->end();
-    // Reuse the existing widgets in the permanent runtime and property sections.
-    for (Fl_Widget *widget : std::initializer_list<Fl_Widget *>{properties_label, details,
-           generation_labels[GenContext], generation_fields[GenContext],
-           generation_labels[GenTemperature], generation_fields[GenTemperature]})
-      Fl_Group::add(widget);
+    library_page->add(model_list);
+    library_page->add(use_model_button);
+    engine_page->add(port_label);
+    engine_page->add(port_input);
+    for (Fl_Widget *widget : std::initializer_list<Fl_Widget *>{
+             runtime_model_label, model_name, model_library_label, master_label,
+             master, right_header})
+      props->add(widget);
+    auto close = button("Close", [&] { props->hide(); });
+    close->resize(472, 524, 80, 28);
+    props->end();
+    props->set_non_modal();
+    begin();
     output_header = label("Output", true);
     output_tabs = new Fl_Tabs(0, 0, 10, 10);
     output_tabs->selection_color(Blue);
@@ -1576,33 +1628,37 @@ private:
     menu_checked("&View/Chats sidebar", show_left);
     menu_checked("&View/Show recent chats", show_recents);
     menu_checked("&View/Open chat tabs", show_chats);
-    menu_checked("&View/Properties and Models", show_right);
     menu_checked("&View/Output", show_output);
     place(menu, 0, 0, w(), 22);
     const int top = 25, pane_top = 59;
     place(new_button, 5, top, 94, 28);
-    place(model_button, 102, top, 122, 28);
-    place(toolbar_separators[0], 229, top + 2, 2, 24);
-    place(load_button, 238, top, 69, 28);
-    place(unload_button, 311, top, 83, 28);
-    place(toolbar_separators[1], 401, top + 2, 2, 24);
-    place(engine_button, 410, top, 106, 28);
-    place(toolbar_separators[2], 523, top + 2, 2, 24);
+    place(toolbar_separators[0], 104, top + 2, 2, 24);
+    place(model_picker_label, 112, top, 46, 28);
+    int picker = std::clamp(w() - 520, 220, 380);
+    place(model_picker, 158, top + 2, picker, 24);
+    int tx = 158 + picker + 6;
+    place(load_button, tx, top, 69, 28);
+    place(unload_button, tx + 72, top, 83, 28);
+    place(toolbar_separators[1], tx + 162, top + 2, 2, 24);
+    place(properties_button, tx + 170, top, 104, 28);
+    toolbar_separators[2]->hide();
     place(brand, w() - 94, top, 86, 28);
+    for (Fl_Widget *widget : std::initializer_list<Fl_Widget *>{model_button,
+             engine_button, center_header, chats_toggle, exchange,
+             message_header, right_divider, media_status})
+      widget->hide();
     output_height = std::clamp(output_height, 100, std::max(100, h() - 540));
     int bottom = h() - 27 - (show_output ? output_height + 30 : 0);
-    int right = show_right
-                    ? std::clamp(right_width, 240, std::max(240, w() - 520)) : 0;
     int left = show_left
-                   ? std::clamp(left_width, 160, std::max(160, w() - right - 350)) : 28;
-    int cx = left + 12, cw = w() - cx - right - (right ? 12 : 5),
-        rx = w() - right - 5;
+                   ? std::clamp(left_width, 160, std::max(160, w() - 350)) : 28;
+    int cx = left + 12, cw = w() - cx - 5;
     visible(left_header, show_left);
     visible(search_label, show_left);
     visible(chat_search, show_left);
     visible(sidebar, show_left);
     visible(left_divider, show_left);
     place(left_header, 5, pane_top, left - 26, 22);
+    left_header->copy_label("Chats");
     place(left_toggle, show_left ? left - 21 : 5, pane_top, 26, 22);
     left_toggle->copy_label(show_left ? "<" : ">");
     left_toggle->tooltip(show_left ? "Collapse Chats (F9)" : "Expand Chats (F9)");
@@ -1610,91 +1666,28 @@ private:
     place(chat_search, 52, 86, left - 48, 23);
     place(sidebar, 7, 114, left - 4, bottom - 114);
     place(left_divider, left + 5, pane_top, 6, bottom - pane_top);
-    place(center_header, cx, pane_top, cw - 26, 22);
-    auto title = "Conversation - " + store.workspaces.at(workspace).str("name");
-    if (!show_chats && !active.empty()) title += " - " + store.chats.at(active).str("title");
-    center_header->copy_label(title.c_str());
-    center_header->copy_tooltip(title.c_str());
-    place(chats_toggle, cx + cw - 26, pane_top, 24, 22);
-    chats_toggle->copy_label(show_chats ? "-" : "+");
-    chats_toggle->tooltip(show_chats ? "Collapse open chat tabs" : "Expand open chat tabs");
     visible(tabs, show_chats);
-    place(tabs, cx, 84, cw, 28);
-    int chat_top = show_chats ? 116 : 86;
-    place(exchange, cx + 2, chat_top, cw - 166, 25);
-    place(retry_button, cx + cw - 159, chat_top, 76, 25);
-    place(edit_button, cx + cw - 80, chat_top, 78, 25);
+    place(tabs, cx, pane_top, cw, 28);
+    int chat_top = show_chats ? pane_top + 31 : pane_top;
     bool has_attachments = cJSON_GetArraySize(attachments.p) > 0;
     int extra = has_attachments ? 44 : 0;
-    int composer = bottom - 112 - extra;
-    place(transcript, cx, chat_top + 29, cw, composer - chat_top - 29);
-    place(message_header, cx + 4, composer + 2, cw - 90, 22);
-    place(latest_button, cx + cw - 82, composer + 2, 80, 22);
+    int composer = bottom - 108 - extra;
+    place(transcript, cx, chat_top, cw, composer - chat_top - 4);
+    place(latest_button, cx + cw - 100, composer - 32, 80, 22);
     visible(attachment_list, has_attachments);
-    place(attachment_list, cx, composer + 26, cw - 107, 40);
+    place(attachment_list, cx, composer, cw - 107, 40);
     visible(remove_button, has_attachments);
-    place(remove_button, cx + cw - 101, composer + 30, 101, 26);
-    media_status->hide();
-    int ay = composer + 26 + extra;
-    place(prompt, cx, ay, cw - 107, bottom - ay - 2);
-    place(send_button, cx + cw - 101, ay, 101, 26);
-    place(stop_button, cx + cw - 101, ay + 28, 101, 26);
-    place(attach_button, cx + cw - 101, ay + 56, 101, 26);
-
-    for (Fl_Widget *widget : std::initializer_list<Fl_Widget *>{right_header,
-         right_tabs, right_divider, runtime_model_label, model_name, port_label,
-         port_input, properties_label, details, model_library_label,
-         generation_labels[GenContext], generation_fields[GenContext],
-         generation_labels[GenTemperature], generation_fields[GenTemperature]})
-      visible(widget, show_right);
-    place(right_header, rx, pane_top, right, 22);
-    place(right_divider, rx - 7, pane_top, 6, bottom - pane_top);
-    int pw = right - 12, px = rx + 6;
-    place(runtime_model_label, px, 87, 62, 23);
-    place(model_name, px + 66, 87, pw - 66, 23);
-    place(port_label, px, 114, 62, 23);
-    place(port_input, px + 66, 114, pw - 66, 23);
-    place(generation_labels[GenContext], px, 141, 110, 23);
-    place(generation_fields[GenContext], px + 114, 141, pw - 114, 23);
-    place(generation_labels[GenTemperature], px, 168, 110, 23);
-    place(generation_fields[GenTemperature], px + 114, 168, pw - 114, 23);
-    place(properties_label, rx, 199, right, 22);
-    int property_height = std::clamp(bottom - 480, 70, 151);
-    place(details, px, 224, pw, property_height);
-    int library_top = 231 + property_height;
-    place(model_library_label, rx, library_top, right, 22);
-    place(right_tabs, rx, library_top + 25, right, bottom - library_top - 25);
-    for (auto page : {models_page, generation_page, library_page})
-      place(page, rx + 2, library_top + 51, right - 4, bottom - library_top - 51);
-    int py = library_top + 55;
-    pw -= Fl::scrollbar_size();
-    int content_bottom = std::max(bottom, py + 170);
-    int list_height = std::max(40, content_bottom - py - 117);
-    place(model_list, px, py, pw, list_height);
-    place(use_model_button, px, py + list_height + 3, pw, 24);
-    place(projector_label, px, content_bottom - 86, pw, 20);
-    place(projector_text, px, content_bottom - 64, pw, 24);
-    place(projector_button, px, content_bottom - 35, pw / 2 - 2, 26);
-    place(projector_clear, px + pw / 2 + 2, content_bottom - 35, pw / 2 - 2, 26);
-    int row = 0;
-    for (int i = 0; i < GenCount; ++i) {
-      if (i == GenContext || i == GenTemperature) continue;
-      place(generation_labels[i], px, py + row * 26, pw - 104, 23);
-      place(i == GenThinking ? static_cast<Fl_Widget *>(thinking_choice) : generation_fields[i],
-            px + pw - 100, py + row * 26, 100, 23);
-      ++row;
-    }
-    place(reset_generation, px, py + row * 26 + 4, pw, 24);
-    ++row;
-    place(generation_help, px, py + row * 26 + 6, pw, bottom - py - row * 26 - 8);
-    visible(generation_help, bottom - py - row * 26 > 100);
-    place(folder_label, px, py, pw, 20);
-    place(folder, px, py + 22, pw, 23);
-    place(folder_button, px, py + 49, pw / 2 - 2, 25);
-    place(scan_button, px + pw / 2 + 2, py + 49, pw / 2 - 2, 25);
-    place(recursive, px, py + 77, pw, 22);
-    place(master_label, px, py + 103, pw, 22);
-    place(master, px, py + 128, pw, std::max(60, bottom - py - 131));
+    place(remove_button, cx + cw - 101, composer + 4, 101, 26);
+    int ay = composer + extra;
+    int row = bottom - 26;
+    place(prompt, cx, ay, cw - 107, row - ay - 4);
+    place(send_button, cx + cw - 101, ay, 101, 30);
+    place(stop_button, cx + cw - 101, ay + 33, 101, 26);
+    place(attach_button, cx, row, 92, 26);
+    place(retry_button, cx + 96, row, 76, 26);
+    place(edit_button, cx + 176, row, 78, 26);
+    place(thinking_label, cx + cw - 107 - 140, row, 62, 26);
+    place(quick_thinking, cx + cw - 107 - 76, row + 1, 72, 24);
     visible(output_header, show_output);
     visible(output_tabs, show_output);
     visible(output_divider, show_output);
@@ -1909,11 +1902,18 @@ private:
     menu_enabled("&Edit/Find chat", idle);
     menu_enabled("&View/Previous chat", idle && open_chats.size() > 1);
     menu_enabled("&View/Next chat", idle && open_chats.size() > 1);
-    menu_enabled("&Engine/Load model", load_button->active());
-    menu_enabled("&Engine/Unload", unload_button->active());
-    menu_enabled("&Engine/Stop response", busy);
-    menu_enabled("&Settings/Engine and model...", idle);
-    menu_enabled("&Settings/Setup...", idle);
+    menu_enabled("&Model/Load", load_button->active());
+    menu_enabled("&Model/Unload", unload_button->active());
+    menu_enabled("&Model/Open model file...", idle);
+    menu_enabled("&Chat/Send", send_button->active());
+    menu_enabled("&Chat/Stop response", busy);
+    menu_enabled("&Chat/Retry", retry_button->active());
+    menu_enabled("&Chat/Edit and resend...", edit_button->active());
+    menu_enabled("&Chat/Attach...", idle);
+    menu_enabled("&Tools/Engine options...", idle);
+    menu_enabled("&Tools/Setup...", idle);
+    if (idle) model_picker->activate();
+    else model_picker->deactivate();
     if (idle && !engine.owned())
       port_input->activate();
     else
@@ -1936,7 +1936,9 @@ private:
           std::chrono::steady_clock::now() - load_started).count();
       state = "Loading model... " + std::to_string(seconds) + "s";
     }
-    auto line = state + "  |  127.0.0.1:" + std::string(port_input->value());
+    auto line = state;
+    if (engine.owned() && !gpu.empty())
+      line += "  |  " + gpu;
     if (!context_status.empty()) line += "  |  " + context_status;
     status->copy_label(line.c_str());
     status->copy_tooltip(line.c_str());
@@ -2547,6 +2549,7 @@ private:
     }
   }
   void update_generation() {
+    quick_thinking->value(g.thinking);
     for (int i = 0; i < GenCount; ++i)
       if (i == GenThinking)
         thinking_choice->value(g.thinking);
@@ -2572,6 +2575,161 @@ private:
     }
     if (field == GenContext && engine.owned())
       set_phase("Context changed. Unload and reload the model to apply it.");
+  }
+  // One entry per library model, then the current file if it lives elsewhere.
+  void refresh_picker() {
+    model_picker->clear();
+    picker_paths.clear();
+    auto add = [&](std::string text, const std::string &path) {
+      for (size_t at = 0; (at = text.find('&', at)) != text.npos; at += 2)
+        text.insert(at, "&");
+      int index = model_picker->add(("\x01" + std::to_string(picker_paths.size())).c_str());
+      model_picker->replace(index, text.c_str());
+      picker_paths.push_back(path);
+    };
+    auto current = model_path.empty() ? fs::path() : fs::weakly_canonical(model_path);
+    bool listed = false;
+    for (const auto &m : models) {
+      if (model_role(m) == "Draft companion")
+        continue;
+      auto path = utf8(m.path);
+      std::ostringstream text;
+      text << clean_label(utf8(m.name)) << "   (" << std::fixed
+           << std::setprecision(1) << double(m.bytes) / (1024 * 1024 * 1024)
+           << " GB)";
+      listed |= !current.empty() && fs::weakly_canonical(path) == current;
+      add(text.str(), path);
+    }
+    // Recently used files outside the library folder stay one click away.
+    std::vector<std::string> recent;
+    try {
+      auto list = Json::parse(config.get("engine", "recent", "[]"));
+      cJSON *item;
+      cJSON_ArrayForEach(item, list.p) if (cJSON_IsString(item)) recent.push_back(item->valuestring);
+    } catch (const std::exception &) {
+    }
+    if (!model_path.empty())
+      recent.insert(recent.begin(), model_path);
+    for (const auto &path : recent) {
+      std::error_code error;
+      if (!fs::is_regular_file(path, error))
+        continue;
+      auto canonical = fs::weakly_canonical(path);
+      bool known = false;
+      for (const auto &p : picker_paths)
+        known |= fs::weakly_canonical(p) == canonical;
+      if (known)
+        continue;
+      add(canonical == current && has_info ? clean_label(utf8(info.name))
+                                           : fs::path(path).stem().string(),
+          path);
+    }
+    if (!picker_paths.empty())
+      model_picker->mode(static_cast<int>(picker_paths.size()) - 1, FL_MENU_DIVIDER);
+    model_picker->add("\x01" "browse");
+    model_picker->replace(static_cast<int>(picker_paths.size()), "Browse for a GGUF file...");
+    model_picker->value(-1);
+    for (size_t i = 0; i < picker_paths.size(); ++i)
+      if (!current.empty() && fs::weakly_canonical(picker_paths[i]) == current)
+        model_picker->value(static_cast<int>(i));
+  }
+  void remember_model(const std::string &path) {
+    auto list = Json::array();
+    Json old = Json::array();
+    try {
+      old = Json::parse(config.get("engine", "recent", "[]"));
+    } catch (const std::exception &) {
+    }
+    cJSON *item;
+    list.add(Json(cJSON_CreateString(path.c_str())));
+    cJSON_ArrayForEach(item, old.p) {
+      if (cJSON_GetArraySize(list.p) >= 8)
+        break;
+      if (cJSON_IsString(item) && path != item->valuestring)
+        list.add(Json(cJSON_Duplicate(item, 1)));
+    }
+    config.set("engine", "recent", list.dump());
+    config.save();
+  }
+  void pick_model() {
+    int i = model_picker->value();
+    if (i < 0)
+      return;
+    if (static_cast<size_t>(i) >= picker_paths.size()) {
+      refresh_picker();
+      auto path = chosen("Select a GGUF chat model", "*.gguf", model_path);
+      if (!path.empty())
+        switch_model(path);
+      return;
+    }
+    switch_model(picker_paths[i]);
+  }
+  // Picking a model loads it, replacing whatever is loaded.
+  void switch_model(const std::string &path) {
+    if (busy || working)
+      return;
+    if (!model_path.empty() && fs::weakly_canonical(path) == fs::weakly_canonical(model_path)) {
+      if (!engine.owned())
+        load_model();
+      return;
+    }
+    if (engine.owned()) {
+      pending_model = path;
+      unload();
+    } else
+      read_selected_model(path, true, false);
+  }
+  void layout_props() {
+    const int px = 20, py = 44, pw = 520;
+    place(right_tabs, 8, 8, 544, 506);
+    for (auto page : {models_page, generation_page, library_page})
+      place(page, 10, 34, 540, 478);
+    place(engine_page, 10, 34, 540, 478);
+    for (Fl_Widget *widget : std::initializer_list<Fl_Widget *>{runtime_model_label,
+             model_name, model_library_label, master_label, master, right_header})
+      widget->hide();
+    place(properties_label, px, py, pw, 22);
+    place(details, px, py + 26, pw, 270);
+    place(projector_label, px, py + 310, pw, 20);
+    place(projector_text, px, py + 332, pw, 24);
+    place(projector_button, px, py + 362, pw / 2 - 2, 26);
+    place(projector_clear, px + pw / 2 + 2, py + 362, pw / 2 - 2, 26);
+    int row = 0;
+    for (int i = 0; i < GenCount; ++i) {
+      place(generation_labels[i], px, py + row * 28, pw - 170, 24);
+      place(i == GenThinking ? static_cast<Fl_Widget *>(thinking_choice) : generation_fields[i],
+            px + pw - 160, py + row * 28, 160, 24);
+      ++row;
+    }
+    place(reset_generation, px + pw - 160, py + row * 28 + 4, 160, 26);
+    place(generation_help, px, py + row * 28 + 40, pw, 478 - (row * 28 + 50));
+    generation_help->show();
+    place(folder_label, px, py, pw, 20);
+    place(folder, px, py + 22, pw - 196, 24);
+    place(folder_button, px + pw - 190, py + 22, 92, 24);
+    place(scan_button, px + pw - 94, py + 22, 94, 24);
+    place(recursive, px, py + 50, pw, 22);
+    place(model_list, px, py + 78, pw, 330);
+    place(use_model_button, px + pw - 180, py + 414, 180, 26);
+    use_model_button->copy_label("Load selected model");
+    std::string engine_text = "llama-server:\n" +
+                              (engine_path.empty() ? std::string("Not chosen") : engine_path);
+    if (!gpu.empty())
+      engine_text += "\n\nAccelerator: " + gpu;
+    engine_path_label->copy_label(engine_text.c_str());
+    place(engine_path_label, px, py, pw, 96);
+    place(engine_choose_button, px, py + 102, 160, 26);
+    place(port_label, px, py + 146, 60, 24);
+    place(port_input, px + 64, py + 146, 100, 24);
+    place(engine_options_button, px, py + 184, 160, 26);
+  }
+  void show_properties(int tab) {
+    layout_props();
+    Fl_Widget *pages[] = {models_page, generation_page, library_page, engine_page};
+    right_tabs->value(pages[std::clamp(tab, 0, 3)]);
+    if (has_info)
+      show_model_details(info);
+    props->show();
   }
   void reset_defaults() {
     if (busy || working)
@@ -2605,11 +2763,11 @@ private:
     note("Engine selected: " + path);
   }
   void choose_model() {
-    if (busy || working || engine.owned())
+    if (busy || working)
       return;
     auto path = chosen("Select a GGUF chat model", "*.gguf", model_path);
     if (!path.empty())
-      read_selected_model(path, false, false);
+      switch_model(path);
   }
   void read_selected_model(const std::string &path, bool auto_load,
                            bool initial) {
@@ -2639,6 +2797,8 @@ private:
           config.save();
           update_generation();
           show_model_details(info);
+          remember_model(model_path);
+          refresh_picker();
           if (!initial)
             set_phase("Model selected: " + utf8(info.name));
           if (auto_load)
@@ -2757,12 +2917,23 @@ private:
     job(
         [this, exe, model, proj, extra, p, context] {
           std::vector<std::string> devices;
-          bool cpu_only = list_devices(exe, devices) && devices.empty();
+          std::string accelerator;
+          if (list_devices(exe, devices)) {
+            accelerator = devices.empty() ? "CPU only" : devices[0];
+            auto name = accelerator.find(": ");
+            if (name != accelerator.npos)
+              accelerator.erase(0, name + 2);
+            auto memory = accelerator.find(" (");
+            if (memory != accelerator.npos)
+              accelerator.erase(memory);
+          }
           engine.start(exe, model, p, context, store.root / "engine.log", proj,
                        extra);
-          return cpu_only;
+          return accelerator;
         },
-        [this, exe](bool cpu_only) {
+        [this, exe](const std::string &accelerator) {
+          gpu = accelerator;
+          bool cpu_only = accelerator == "CPU only";
           set_phase("Engine started. Waiting for model readiness...");
           if (cpu_only && cpu_warned.insert(exe).second) {
             note("This llama-server build found no GPU; it runs on the CPU only.");
@@ -2789,7 +2960,11 @@ private:
         [this](bool) {
           health = "Engine offline";
           set_phase("Model unloaded.");
-          if (reload_media) {
+          if (!pending_model.empty()) {
+            auto next = pending_model;
+            pending_model.clear();
+            read_selected_model(next, true, false);
+          } else if (reload_media) {
             reload_media = false;
             load_model(true);
           }
@@ -2828,6 +3003,7 @@ private:
         [this](const auto &result) {
           models = result;
           refresh_models();
+          refresh_picker();
           set_phase(std::to_string(models.size()) + " models found.");
         });
   }
@@ -2908,9 +3084,7 @@ private:
     if (model_role(m) == "Draft companion")
       throw std::runtime_error(
           "This is a draft companion. Choose a chat model.");
-    if (engine.owned())
-      throw std::runtime_error("Unload the current model first.");
-    read_selected_model(utf8(m.path), false, false);
+    switch_model(utf8(m.path));
   }
   void send() {
     if (busy || working || active.empty())

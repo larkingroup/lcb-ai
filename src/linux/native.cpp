@@ -1215,6 +1215,9 @@ void Engine::start(const std::string &exe, const std::string &model,
   int probe = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (probe < 0)
     throw std::runtime_error(system_error("Cannot check engine port"));
+  // Like llama-server, ignore TIME_WAIT left by the previous engine.
+  int reuse = 1;
+  setsockopt(probe, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
   sockaddr_in address{};
   address.sin_family = AF_INET;
   address.sin_port = htons(port);
