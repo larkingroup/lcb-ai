@@ -76,7 +76,19 @@ static const Profile profiles[]={
     GEMMA("gemma-2-2b-it","gemma2"), GEMMA("gemma-2-9b-it","gemma2"),
     GEMMA("gemma-2-27b-it","gemma2"), GEMMA("gemma-3-1b-it","gemma3"),
     GEMMA("gemma-3-4b-it","gemma3"), GEMMA("gemma-3-12b-it","gemma3"),
-    GEMMA("gemma-3-27b-it","gemma3")
+    GEMMA("gemma-3-27b-it","gemma3"),
+    /* https://huggingface.co/google/gemma-4-E4B-it (same sampler as Gemma 3) */
+    GEMMA("gemma-4-E2B-it","gemma4"), GEMMA("gemma-4-E4B-it","gemma4"),
+    GEMMA("gemma-4-12B-it","gemma4"), GEMMA("gemma-4-27B-it","gemma4")
+};
+/* Fine-tunes, merges and abliterations usually keep their family's sampler.
+ * Used only when neither the file name nor its base model matches above. */
+static const struct { const wchar_t *architecture, *profile; } families[]={
+    {L"qwen2",L"Qwen2.5-7B-Instruct"}, {L"qwen2moe",L"Qwen2-57B-A14B-Instruct"},
+    {L"qwen3",L"Qwen3-8B"}, {L"qwen3moe",L"Qwen3-30B-A3B"},
+    {L"qwen35",L"Qwen3.5-9B"}, {L"qwen35moe",L"Qwen3.5-35B-A3B"},
+    {L"gemma",L"gemma-7b-it"}, {L"gemma2",L"gemma-2-9b-it"},
+    {L"gemma3",L"gemma-3-12b-it"}, {L"gemma4",L"gemma-4-12B-it"}
 };
 #undef Q2
 #undef Q3
@@ -120,12 +132,24 @@ static const Profile *lookup(const wchar_t *identity, const wchar_t *arch)
     return NULL;
 }
 
-static void apply(const Profile *p, int thinking, Generation *g)
+static const Profile *family(const wchar_t *arch)
+{
+    size_t i,j;
+    for(i=0;i<sizeof(families)/sizeof(families[0]);i++) {
+        if(_wcsicmp(arch,families[i].architecture)) continue;
+        for(j=0;j<sizeof(profiles)/sizeof(profiles[0]);j++)
+            if(!wcscmp(profiles[j].name,families[i].profile)) return &profiles[j];
+    }
+    return NULL;
+}
+
+/* Auto follows the template, and thinking templates think unless told not to. */
+static void apply(const Profile *p, int thinking, int switchable, Generation *g)
 {
     g->temperature=p->temperature; g->top_p=p->top_p;
     g->repeat_penalty=p->repeat; g->presence_penalty=p->presence;
     g->top_k=p->top_k; g->min_p=0; g->max_tokens=p->response;
-    if(p->thinking && thinking==ThinkingOn) {
+    if(p->thinking && (thinking==ThinkingOn || (thinking!=ThinkingOff && switchable))) {
         g->temperature=p->thinking==2?1.0:0.6; g->top_p=0.95;
         g->presence_penalty=p->thinking==2?1.5:0;
         g->max_tokens=2048;
@@ -136,22 +160,24 @@ void model_defaults(const ModelInfo *m, int thinking, Generation *g)
 {
     const Profile *p=NULL;
     wchar_t identity[512];
-    int field;
+    int field, derived;
     *g=generation_defaults();
     if(!m || m->projector) return;
     normalize(m->identity,identity,512);
+    derived=wcsstr(identity,L"thinking") || wcsstr(identity,L"reason") ||
+        wcsstr(identity,L"distill") || wcsstr(identity,L"r1");
     if(m->identity[0]) p=lookup(m->identity,m->architecture);
-    if(!p && m->base_count<=1 && m->base_model[0] &&
-        !wcsstr(identity,L"thinking") && !wcsstr(identity,L"reason") &&
-        !wcsstr(identity,L"distill") && !wcsstr(identity,L"r1")) p=lookup(m->base_model,m->architecture);
+    if(!p && m->base_count<=1 && m->base_model[0] && !derived) p=lookup(m->base_model,m->architecture);
     if(!p && !m->identity[0] && !m->base_model[0]) {
         const wchar_t *name=wcsrchr(m->path,L'\\');
         if(!name) name=wcsrchr(m->path,L'/');
         p=lookup(name?name+1:m->path,m->architecture);
     }
-    if(p) apply(p,thinking,g);
+    if(!p && !derived) p=family(m->architecture);
+    if(p) apply(p,thinking,m->thinking_switch,g);
+    /* Sampling written into the GGUF by its publisher wins over the tables. */
     for(field=0;field<GenCount;field++) if(m->sampling_fields&(1u<<field))
         generation_set(g,field,generation_value(&m->sampling,field));
-    if(p && p->exact) apply(p,thinking,g);
-    if(p && p->thinking && m->thinking_switch) g->thinking=ThinkingOff;
+    if(p && p->exact) apply(p,thinking,m->thinking_switch,g);
+    if(thinking>=ThinkingAuto && thinking<=ThinkingOn) g->thinking=thinking;
 }

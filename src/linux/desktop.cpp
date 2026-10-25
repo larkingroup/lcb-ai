@@ -896,6 +896,8 @@ class Window : public Fl_Double_Window {
   Fl_Value_Input *generation_fields[GenCount]{};
   Fl_Box *generation_labels[GenCount]{};
   Fl_Choice *thinking_choice;
+  Fl_Button *reset_generation;
+  bool media_engine = false, reload_media = false;
   Divider *left_divider, *right_divider, *output_divider;
   std::map<Fl_Widget *, std::function<void()>> callbacks;
   std::map<std::string, bool> workspace_expanded;
@@ -1436,7 +1438,7 @@ private:
     details->entries = {{"Model", "Select a model", ""},
                         {"Use", "Double-click / Enter", ""}};
     details->refresh();
-    projector_label = label("Media projector (reload to apply)");
+    projector_label = label("Media projector (loaded for attachments)");
     projector_text = input();
     projector_text->readonly(1);
     projector_text->value(projector.c_str());
@@ -1448,8 +1450,8 @@ private:
     generation_page->color(Face);
     generation_page->labelsize(12);
     generation_page->begin();
-    const double minimum[] = {1, 0, 0.000001, 512, 0, 1, 0, 0, 0, -2},
-                 maximum[] = {16384, 2, 1, 1048576, 2, 2, 4, 1000, 1, 2};
+    const double minimum[] = {0, 0, 0.000001, 0, 0, 1, 0, 0, 0, -2},
+                 maximum[] = {131072, 2, 1, 1048576, 2, 2, 4, 1000, 1, 2};
     for (int i = 0; i < GenCount; ++i) {
       generation_labels[i] = label(labels[i]);
       if (i == GenThinking) {
@@ -1471,10 +1473,13 @@ private:
             bind(f, [this, i, f] { edit_generation(i, f->value()); });
       }
     }
+    reset_generation = button("Model defaults", [&] { reset_defaults(); });
     generation_help = label(
-        "Saved per model. Reload after changing context.\n\nThinking: Auto "
-        "uses the model template.\nEmitted traces appear in Output > "
-        "Thinking.\n\nRepeat: 1 = off.\nDRY, Top K, Min P, Presence: 0 = off.");
+        "Defaults come from the GGUF publisher, then the model family. Edits "
+        "are saved per model.\n\nResponse 0: until the model stops.\nContext 0: "
+        "llama.cpp fits it to free memory (reload to apply).\nThinking: Auto "
+        "uses the model template.\n\nRepeat: 1 = off.\nDRY, Top K, Min P, "
+        "Presence: 0 = off.");
     generation_help->align(FL_ALIGN_LEFT | FL_ALIGN_TOP | FL_ALIGN_INSIDE |
                            FL_ALIGN_WRAP);
     generation_help->labelcolor(Muted);
@@ -1663,6 +1668,8 @@ private:
             px + pw - 100, py + row * 26, 100, 23);
       ++row;
     }
+    place(reset_generation, px, py + row * 26 + 4, pw, 24);
+    ++row;
     place(generation_help, px, py + row * 26 + 6, pw, bottom - py - row * 26 - 8);
     visible(generation_help, bottom - py - row * 26 > 100);
     place(folder_label, px, py, pw, 20);
@@ -2532,8 +2539,25 @@ private:
                std::to_string(value));
     config.save();
     g = next;
+    // Thinking changes which recommended sampler applies.
+    if (field == GenThinking) {
+      g = config.generation(model_path, has_info ? &info : nullptr);
+      update_generation();
+    }
     if (field == GenContext && engine.owned())
       set_phase("Context changed. Unload and reload the model to apply it.");
+  }
+  void reset_defaults() {
+    if (busy || working)
+      return;
+    for (const char *key : fields)
+      config.erase(config.section(model_path), key);
+    config.save();
+    g = config.generation(model_path, has_info ? &info : nullptr);
+    update_generation();
+    note("Generation settings reset to the model defaults.");
+    if (engine.owned())
+      set_phase("Defaults restored. Reload the model to apply the context.");
   }
   void choose_engine() {
     if (busy || working || engine.owned())
@@ -2674,7 +2698,8 @@ private:
     else if (choice == 2)
       open_url(utf8(runtime_setup_url()));
   }
-  void load_model() {
+  // The projector costs VRAM and context, so it loads only for media chats.
+  void load_model(bool media = false) {
     if (busy || working || engine.owned())
       return;
     if (engine_path.empty() || model_path.empty())
@@ -2693,8 +2718,10 @@ private:
       if (result != 2)
         return;
     }
-    auto exe = engine_path, model = model_path, proj = projector,
+    auto exe = engine_path, model = model_path,
+         proj = media ? projector : std::string(),
          extra = config.get("engine", "extra_arguments");
+    media_engine = !proj.empty();
     auto p = port();
     int context = g.context_tokens;
     set_phase("Loading model...");
@@ -2736,6 +2763,10 @@ private:
         [this](bool) {
           health = "Engine offline";
           set_phase("Model unloaded.");
+          if (reload_media) {
+            reload_media = false;
+            load_model(true);
+          }
         });
   }
   void engine_details() {
@@ -2865,6 +2896,19 @@ private:
       text = "Describe the attached media.";
     }
     validate_text(text, LcbMaxPrompt, false);
+    if (cJSON_GetArraySize(attachments.p) && engine.owned() && !media_engine) {
+      if (projector.empty())
+        throw std::runtime_error("Attachments need a media projector. Choose "
+                                 "one for this model under Media projector.");
+      if (fl_choice("Attachments need the model's media projector, which is "
+                    "loaded only when needed.\nReload the model with it now? "
+                    "Send again once it is ready.",
+                    "Cancel", "Reload", nullptr) == 1) {
+        reload_media = true;
+        unload();
+      }
+      return;
+    }
     if (model_path.empty())
       throw std::runtime_error(
           "Select the GGUF model used by the local server first.");

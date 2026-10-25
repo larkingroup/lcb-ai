@@ -71,7 +71,10 @@ typedef struct Generation {
 	int top_k;
 	double min_p, presence_penalty;
 } Generation;
+/* max_tokens 0 = until the model stops; context_tokens 0 = the engine fits it. */
 Generation generation_defaults(void);
+/* Prompt room kept free for the reply: the limit, or a share of an Auto context. */
+int generation_reserve(const Generation *g, int context_tokens);
 int generation_valid(const Generation *g);
 double generation_value(const Generation *g, int field);
 int generation_set(Generation *g, int field, double value);

@@ -92,6 +92,7 @@ public:
   void set(const std::string &section, const std::string &key,
            const std::string &value);
   void save();
+  void erase(const std::string &section, const std::string &key);
   std::string section(const std::string &model) const;
   void migrate(const std::string &old_path, const std::string &new_path);
   Generation generation(const std::string &model,

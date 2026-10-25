@@ -32,7 +32,7 @@ const char *fields[GenCount] = {
     "thinking",   "repeat_penalty",  "dry_multiplier", "top_k",
     "min_p",      "presence_penalty"};
 const char *labels[GenCount] = {
-    "Response tokens", "Temperature",     "Top P",          "Context (reload)",
+    "Response (0 = auto)", "Temperature", "Top P",          "Context (0 = auto)",
     "Thinking",        "Repeat penalty",  "DRY multiplier", "Top K",
     "Min P",           "Presence penalty"};
 namespace {
@@ -637,6 +637,11 @@ void Settings::set(const std::string &section, const std::string &key,
     throw std::runtime_error("Settings must be a single line.");
   ini_[section][lower(key)] = value;
 }
+void Settings::erase(const std::string &section, const std::string &key) {
+  auto s = ini_.find(section);
+  if (s != ini_.end())
+    s->second.erase(lower(key));
+}
 void Settings::save() {
   std::ostringstream out;
   for (const auto &s : ini_) {
@@ -696,8 +701,17 @@ void Settings::migrate(const std::string &old_path,
 Generation Settings::generation(const std::string &path,
                                 const ModelInfo *info) const {
   Generation g = generation_defaults();
-  model_defaults(info, -1, &g);
-  g.thinking = ThinkingAuto;
+  int thinking = -1;
+  try {
+    auto v = get(section(path), fields[GenThinking]);
+    if (!v.empty())
+      thinking = std::stoi(v);
+  } catch (const std::exception &) {
+  }
+  model_defaults(info, thinking, &g);
+  // Replies run until the model stops; llama.cpp fits context to free memory.
+  g.max_tokens = 0;
+  g.context_tokens = 0;
   for (int i = 0; i < 3; ++i) {
     const char *keys[] = {"max_tokens", "temperature100", "top_p100"};
     try {
@@ -873,7 +887,7 @@ Prepared Transport::prepare(const std::string &model, const Json &messages,
       props.object("chat_template_caps").get("supports_reasoning_effort"));
   if (const char *problem = reasoning_settings_error(&g, effort))
     throw std::runtime_error(problem);
-  if (context - g.max_tokens - 32 < 1)
+  if (context - generation_reserve(&g, context) - 32 < 1)
     throw std::runtime_error("Response limit leaves no prompt room. Lower it "
                              "or reload with more context.");
   ConversationOwner c;
@@ -894,25 +908,31 @@ Prepared Transport::prepare(const std::string &model, const Json &messages,
   Module module{"Workspace", instruction.c_str()};
   Prepared prepared;
   prepared.context = context;
-  prepared.response = g.max_tokens;
+  prepared.response = generation_reserve(&g, context);
   bool has_media = false;
-  for (const auto &a : attachment_sets)
-    has_media |= cJSON_GetArraySize(a.p) > 0;
-  if (has_media) {
-    auto modalities = props.object("modalities");
-    size_t total = 0;
-    for (const auto &a : attachment_sets) {
-      validate_attachments(a);
-      cJSON *it;
-      cJSON_ArrayForEach(it, a.p) {
-        Json att(cJSON_Duplicate(it, 1));
-        if (!cJSON_IsTrue(modalities.get(att.str("kind").c_str())))
+  auto modalities = props.object("modalities");
+  size_t total = 0;
+  for (size_t n = 0; n < attachment_sets.size(); ++n) {
+    auto &a = attachment_sets[n];
+    validate_attachments(a);
+    Json kept = Json::array();
+    cJSON *it;
+    cJSON_ArrayForEach(it, a.p) {
+      Json att(cJSON_Duplicate(it, 1));
+      if (!cJSON_IsTrue(modalities.get(att.str("kind").c_str()))) {
+        if (n + 1 == attachment_sets.size())
           throw std::runtime_error("The loaded engine does not support " +
                                    att.str("kind") +
                                    " input: " + att.str("name"));
-        total += static_cast<size_t>(att.number("size"));
+        continue; // Earlier media stays saved but a text-only engine skips it.
       }
+      total += static_cast<size_t>(att.number("size"));
+      kept.add(att);
     }
+    a = kept;
+    has_media |= cJSON_GetArraySize(a.p) > 0;
+  }
+  if (has_media) {
     if (total > 46 * 1048576)
       throw std::runtime_error("Conversation media exceeds 46 MiB. Start a new "
                                "chat or use smaller files.");
@@ -1216,8 +1236,6 @@ void Engine::start(const std::string &exe, const std::string &model,
                                                 "127.0.0.1",
                                                 "--port",
                                                 std::to_string(port),
-                                                "--ctx-size",
-                                                std::to_string(context),
                                                 "--parallel",
                                                 "1",
                                                 "--jinja",
@@ -1232,6 +1250,11 @@ void Engine::start(const std::string &exe, const std::string &model,
                                                 "localhost",
                                                 "--no-cors-credentials"})
     command.push_back(s);
+  // Without --ctx-size, llama.cpp fits the context to free device memory.
+  if (context) {
+    command.push_back("--ctx-size");
+    command.push_back(std::to_string(context));
+  }
   if (!projector.empty()) {
     if (!fs::is_regular_file(projector))
       throw std::runtime_error("The selected projector is unavailable.");
