@@ -65,6 +65,8 @@ struct Work {
 	int ok;
 	HANDLE cancel;
 	const Conversation *conversation;
+	Conversation history; /* A private copy, so the open chat can change. */
+	char chat[33];
 	char *instruction;
 	Generation settings;
 	ContextBudget budget;
@@ -139,6 +141,7 @@ static struct {
     HWND renamer;
     char renaming[33];
     HANDLE titlecancel;
+    char streamchat[33]; /* The chat the running reply belongs to. */
 } app;
 
 
@@ -156,6 +159,7 @@ static void sidebaroptions(void);
 static void showchat(void);
 static void render_stream(void);
 static void render_pending(void);
+static int streaminghere(void);
 static void synctabs(void);
 static void opentab(void);
 static void generationrows(void);
@@ -769,7 +773,7 @@ render(void)
         appendstyle(L"\r\n\r\n",Ink,0,10);
 	}
 	SendMessageW(app.exchange,CB_SETCURSEL,app.turn,0);
-    if(app.busy && app.work) render_pending();
+    if(streaminghere()) render_pending();
 	refreshcontrols();
     if(app.followchat) SendMessageW(app.transcript,EM_SCROLLCARET,0,0);
     else {
@@ -814,30 +818,37 @@ refreshcontrols(void)
 	EnableWindow(app.retry,app.ntabs && !app.busy && !app.settings_pending && app.chat.conversation.count>0 && app.health==EngineReady);
 	EnableWindow(app.resend,app.ntabs && !app.busy && !app.settings_pending && app.chat.conversation.count>0);
 	EnableMenuItem(GetMenu(app.window),IdDeleteChat,MF_BYCOMMAND|
-	    (app.ntabs && !app.busy?MF_ENABLED:MF_GRAYED));
+	    (app.ntabs && !streaminghere()?MF_ENABLED:MF_GRAYED));
 	EnableMenuItem(GetMenu(app.window),IdCloseTab,MF_BYCOMMAND|
-	    (app.ntabs && !app.busy?MF_ENABLED:MF_GRAYED));
+	    (app.ntabs?MF_ENABLED:MF_GRAYED));
 	EnableMenuItem(GetMenu(app.window),IdRetry,MF_BYCOMMAND|
 	    (app.ntabs && !app.busy && !app.settings_pending && app.chat.conversation.count>0 && app.health==EngineReady?MF_ENABLED:MF_GRAYED));
 	EnableMenuItem(GetMenu(app.window),IdResend,MF_BYCOMMAND|
 	    (app.ntabs && !app.busy && !app.settings_pending && app.chat.conversation.count>0?MF_ENABLED:MF_GRAYED));
     EnableWindow(app.stop,app.busy && app.cancel && WaitForSingleObject(app.cancel,0)!=WAIT_OBJECT_0);
-    EnableWindow(app.chattabs,!app.busy); EnableWindow(app.closetab,app.ntabs && !app.busy);
+    EnableWindow(app.chattabs,TRUE); EnableWindow(app.closetab,app.ntabs!=0);
     EnableWindow(app.generation,!app.busy && !app.settings_pending);
-	EnableWindow(app.modules, !app.busy);
-    EnableWindow(app.chatsearch,!app.busy); EnableWindow(app.sidebarmenu,!app.busy);
-	EnableWindow(app.workspace, !app.busy);
-	EnableWindow(app.newworkspace, !app.busy);
-	EnableWindow(app.editworkspace, !app.busy);
-	EnableWindow(app.fresh, !app.busy);
+	/* Chats stay browsable while a reply streams into one of them. */
+	EnableWindow(app.modules, TRUE);
+    EnableWindow(app.chatsearch,TRUE); EnableWindow(app.sidebarmenu,TRUE);
+	EnableWindow(app.workspace, TRUE);
+	EnableWindow(app.newworkspace, TRUE);
+	EnableWindow(app.editworkspace, TRUE);
+	EnableWindow(app.fresh, TRUE);
 	EnableWindow(app.port, !app.busy && !app.process.process);
 	EnableWindow(app.load, !app.busy && !app.settings_pending && !app.process.process && app.health != EngineReady);
 	EnableWindow(app.unload, !app.busy && app.process.process != NULL);
 	EnableWindow(app.browse, !app.busy && !app.process.process);
 	EnableWindow(app.engine, !app.busy && !app.process.process);
 	EnableWindow(app.prompt,app.ntabs!=0);
-	SendMessage(app.prompt, EM_SETREADONLY, app.busy, 0);
+	SendMessage(app.prompt, EM_SETREADONLY, streaminghere(), 0);
 	InvalidateRect(app.window, NULL, FALSE);
+}
+
+/* Whether the running reply belongs to the chat on screen. */
+static int streaminghere(void)
+{
+    return app.busy && app.work && !strcmp(app.streamchat,app.chat.info.id);
 }
 
 static void
@@ -856,6 +867,7 @@ workfree(Work *w)
 	free(w->answer);
     free(w->reasoning);
 	free(w->instruction);
+	conversation_clear(&w->history);
 	free(w);
 }
 
@@ -987,7 +999,15 @@ submit(void)
 	}
 	w->port = (unsigned short)port;
 	w->target = app.window;
-	w->conversation=&app.chat.conversation; w->settings=app.settings;
+	{
+		size_t k;
+		for(k=0;k<app.chat.conversation.count;k++)
+			if(!conversation_add(&w->history,app.chat.conversation.messages[k].role,app.chat.conversation.messages[k].text)) {
+				note(L"Cannot prepare message: out of memory."); workfree(w); return;
+			}
+	}
+	w->conversation=&w->history; w->settings=app.settings;
+	strcpy(w->chat,app.chat.info.id); strcpy(app.streamchat,app.chat.info.id);
 	wcscpy(w->modelpath,app.modelpath);
 	w->cancel=CreateEventW(NULL,TRUE,FALSE,NULL);
     if(!w->cancel) { workfree(w); note(L"Cannot create request."); return; }
@@ -1030,7 +1050,37 @@ received(Work *w)
 	app.cancel=NULL; app.work=NULL; busy(0);
     free(app.live); app.live=NULL;
     SetWindowTextW(app.progress,w->ok==2?L"Stopped":!w->ok?L"Generation failed":L"Completed");
+	if(strcmp(w->chat,app.chat.info.id)) {
+		/* The reply belongs to a chat that is not on screen: save it there. */
+		Chat *chat=calloc(1,sizeof(*chat));
+		int saved=0,first=0;
+		if(chat && store_load(&app.store,w->chat,chat)) {
+			Conversation *b=&chat->conversation;
+			first=b->count==0 && !chat->info.renamed;
+			if(answer && conversation_add(b,"user",w->prompt) && conversation_add(b,"assistant",w->answer)) {
+				Message *m=&b->messages[b->count-1];
+				m->reasoning=w->reasoning; w->reasoning=NULL;
+				m->status=answer_status(w->ok,w->report.finish);
+				if(!w->ok) snprintf(m->error,sizeof(m->error),"%s",w->error);
+				if(first) quicktitle(w->prompt,chat->info.title);
+				chat->draft[0]=0; chat->info.updated=store_now();
+				saved=store_save(&app.store,chat);
+			} else if(strlen(w->prompt)<=LcbMaxPrompt) {
+				strcpy(chat->draft,w->prompt); store_save(&app.store,chat);
+			}
+		}
+		if(saved) {
+			wchar_t *title=wide(chat->info.title),line[320];
+			swprintf(line,320,L"Reply saved to \"%ls\".",title?title:L"chat"); note(line); free(title);
+			if(first && w->ok==1 && w->answer[0]) suggesttitle(w->chat,w->prompt,w->answer,w->port);
+		} else note(w->ok==2?L"Generation stopped. The draft was kept in its chat.":L"The reply could not be saved to its chat.");
+		if(chat) { chat_clear(chat); free(chat); }
+		free(answer); workfree(w);
+		listchats(); synctabs(); refreshcontrols();
+		return;
+	}
 	if(answer != NULL && conversation_add(c, "user", w->prompt) &&
+
 	    conversation_add(c, "assistant", w->answer)) {
 		wchar_t summary[128];
 		Message *message=&c->messages[c->count-1];
@@ -1442,7 +1492,7 @@ classiccontrol(HWND window,UINT message,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PT
                 ThinkingSection section=app.sections[i];
                 if(position>=section.start && position<section.end && section.turn<app.thinking_capacity) {
                     app.thinking_closed[section.turn]=!app.thinking_closed[section.turn];
-                    if(app.busy && section.turn==app.chat.conversation.count/2) render_stream();
+                    if(streaminghere() && section.turn==app.chat.conversation.count/2) render_stream();
                     else render();
                     return 0;
                 }
@@ -1773,7 +1823,6 @@ showchat(void)
 static void activatechat(const char *id)
 {
     size_t i;
-    if(app.busy) { synctabs(); return; }
     if(!strcmp(id,app.chat.info.id)) { if(!app.ntabs) showchat(); else synctabs(); return; }
     if(!savechat() || !store_load(&app.store,id,&app.chat)) { note(app.store.error); synctabs(); listchats(); return; }
     for(i=0;i<app.store.nworkspaces;i++) if(!strcmp(app.chat.info.workspace,app.store.workspaces[i].id)) break;
@@ -1786,7 +1835,7 @@ switchworkspace(void)
 	LRESULT index=SendMessageW(app.workspace,CB_GETCURSEL,0,0);
 	size_t i;
 	int ok;
-	if(app.busy || index<0 || (size_t)index>=app.store.nworkspaces) return;
+	if(index<0 || (size_t)index>=app.store.nworkspaces) return;
 	if(!savechat()) { listworkspaces(); return; }
 	{
 	    /* Open the workspace's most recent chat. */
@@ -1909,7 +1958,7 @@ static void opentab(void)
 static void closetab(void)
 {
     int index=TabCtrl_GetCurSel(app.chattabs);
-    if(app.busy || index<0 || !savechat()) return;
+    if(index<0 || !savechat()) return;
     if(app.ntabs==1) {
         app.ntabs=0; synctabs();
         app.sidebarbusy=1; SendMessageW(app.modules,LB_SETCURSEL,(WPARAM)-1,0); app.sidebarbusy=0;
@@ -1928,7 +1977,7 @@ static int deletechat(const char *id)
     Chat *next=NULL;
     int active, i, j;
     size_t workspace;
-    if(app.busy || strlen(id)!=32) return 0;
+    if((app.busy && !strcmp(id,app.streamchat)) || strlen(id)!=32) return 0;
     strcpy(target,id); active=!strcmp(target,app.chat.info.id);
     if(active) for(i=0;i<app.ntabs;i++) if(strcmp(app.tabs[i],target)) {
         next=calloc(1,sizeof(*next));
@@ -1963,7 +2012,7 @@ static void confirmdelete(const char *id)
     size_t i;
     wchar_t *title, question[512];
     char target[33];
-    if(app.busy) return;
+    if(app.busy && !strcmp(id,app.streamchat)) { note(L"Stop the reply before deleting this chat."); return; }
     for(i=0;i<app.store.nchats;i++) if(!strcmp(app.store.chats[i].id,id)) break;
     if(i==app.store.nchats) return;
     strcpy(target,id);
@@ -1986,7 +2035,7 @@ static int sidebarchat(int row,char id[33])
 static void sidebaroptions(void)
 {
     HMENU menu=CreatePopupMenu(); RECT r; int command;
-    if(!menu || app.busy) { if(menu) DestroyMenu(menu); return; }
+    if(!menu) return;
     AppendMenuW(menu,MF_STRING,IdNewWorkspace,L"New workspace...");
     AppendMenuW(menu,MF_STRING,IdEditWorkspace,L"Workspace settings...");
     AppendMenuW(menu,MF_SEPARATOR,0,NULL);
@@ -2000,7 +2049,7 @@ static void sidebaroptions(void)
 static void sidebaractivate(int row,int options)
 {
     SidebarRow item;
-    if(app.busy || row<0 || row>=app.nsidebar) return;
+    if(row<0 || row>=app.nsidebar) return;
     item=app.sidebar[row];
     if(item.kind==SidebarChat) {
         if(options) {
@@ -2100,7 +2149,6 @@ static void changechat(const char *id,int kind,const char *value)
     int current=!strcmp(id,app.chat.info.id);
     size_t k;
     strcpy(target,id);
-    if(kind!=ChangeTitle && app.busy) return;
     if(current) {
         if(kind!=ChangeTitle && !savechat()) return;
         chat=&app.chat;
@@ -2163,7 +2211,7 @@ static void beginrename(const char *id)
     RECT r;
     wchar_t *title;
     size_t k;
-    if(app.busy || app.renamer) return;
+    if(app.renamer) return;
     for(k=0;k<app.store.nchats;k++) if(!strcmp(app.store.chats[k].id,id)) break;
     if(k==app.store.nchats) return;
     for(row=0;row<app.nsidebar;row++) if(app.sidebar[row].kind==SidebarChat && (size_t)app.sidebar[row].index==k) break;
@@ -2297,7 +2345,7 @@ static void chatmenu(LPARAM position)
     HMENU menu;
     char id[33];
     int command, i;
-    if(app.busy) return;
+
     if(point.x==-1 && point.y==-1) {
         RECT r;
         item=(int)SendMessageW(app.modules,LB_GETCURSEL,0,0);
@@ -2664,7 +2712,7 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 		case IdEngine: if(!app.busy && !app.process.process) choosefile(1); break;
 		case IdCopy: copyselection(); break;
 		case IdNew:
-			if(!app.busy && savechat()) {
+			if(savechat()) {
 				if(app.chat.info.id[0] && !app.chat.conversation.count && !app.chat.draft[0]) showchat();
 				else if(store_new(&app.store,app.store.workspaces[app.selected].id,&app.chat)) { showchat(); note(L"New chat saved."); }
 				else note(app.store.error);
@@ -2715,7 +2763,7 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
                 wchar_t speed[64]; swprintf(speed,64,L"%.1f tok/s",snapshot->timings.tokens_per_second);
                 SetWindowTextW(app.speed,speed);
             }
-            render_stream();
+            if(streaminghere()) render_stream();
             InvalidateRect(app.window,NULL,FALSE);
             return 0;
         }
@@ -2970,7 +3018,7 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
             }
             if(msg.wParam=='W') { closetab(); continue; }
             if(msg.wParam=='K') { SendMessageW(app.window,WM_COMMAND,IdFindChat,0); continue; }
-            if(msg.wParam==VK_TAB && app.ntabs && !app.busy) {
+            if(msg.wParam==VK_TAB && app.ntabs) {
                 int index=TabCtrl_GetCurSel(app.chattabs),step=(GetKeyState(VK_SHIFT)&0x8000)?app.ntabs-1:1;
                 activatechat(app.tabs[(index+step)%app.ntabs]); continue;
             }
