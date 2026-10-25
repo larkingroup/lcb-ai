@@ -3,8 +3,7 @@
 #include <windows.h>
 #include <commctrl.h>
 
-enum { ClassicDocument, ClassicFolder, ClassicRun, ClassicStop,
-    ClassicEngine, ClassicModel, ClassicOutput, ClassicSettings, ClassicIconCount };
+#include "classic_glyphs.h"
 
 /* One small, DPI-scaled image list per application; no files or image codecs. */
 HIMAGELIST classic_icons(int dpi);

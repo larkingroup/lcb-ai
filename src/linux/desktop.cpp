@@ -10,7 +10,7 @@
 #include <FL/Fl_Input.H>
 #include <FL/Fl_Int_Input.H>
 #include <FL/Fl_Menu_Bar.H>
-#include <FL/Fl_Pixmap.H>
+#include <FL/Fl_RGB_Image.H>
 #include <FL/Fl_Return_Button.H>
 #include <FL/Fl_Scrollbar.H>
 #include <FL/Fl_Scroll.H>
@@ -21,6 +21,9 @@
 #include <FL/fl_ask.H>
 #include <FL/fl_draw.H>
 #include <FL/fl_utf8.h>
+#include <fontconfig/fontconfig.h>
+#define LCB_CLASSIC_GLYPH_DATA
+#include "classic_glyphs.h"
 #include <algorithm>
 #include <chrono>
 #include <clocale>
@@ -42,23 +45,29 @@
 using namespace lcb;
 namespace {
 namespace icons {
-#include "../../vendor/kde1-icons/filenew.xpm"
-#include "../../vendor/kde1-icons/fileopen.xpm"
-#include "../../vendor/kde1-icons/forward.xpm"
-#include "../../vendor/kde1-icons/stop.xpm"
-#include "../../vendor/kde1-icons/pencil.xpm"
-#include "../../vendor/kde1-icons/send.xpm"
-#include "../../vendor/kde1-icons/filemail.xpm"
-#include "../../vendor/kde1-icons/page.xpm"
-enum Kind { New, Open, Load, Stop, Settings, Send, Attach, Document };
+// The Windows build's hand-drawn 16px glyphs, rendered with transparency.
+enum Kind { Document = ClassicDocument, Folder = ClassicFolder, Run = ClassicRun,
+            Stop = ClassicStop, Engine = ClassicEngine, Model = ClassicModel,
+            Output = ClassicOutput, Settings = ClassicSettings };
 Fl_Image *get(Kind kind, bool enabled = true) {
-  static Fl_Pixmap images[] = {Fl_Pixmap(filenew), Fl_Pixmap(fileopen),
-      Fl_Pixmap(forward), Fl_Pixmap(stop), Fl_Pixmap(pencil), Fl_Pixmap(send),
-      Fl_Pixmap(filemail), Fl_Pixmap(page)};
-  static std::unique_ptr<Fl_Image> disabled[8];
-  if (enabled) return &images[kind];
+  static std::unique_ptr<Fl_RGB_Image> images[ClassicIconCount], disabled[ClassicIconCount];
+  static unsigned char pixels[ClassicIconCount][16 * 16 * 4];
+  if (!images[kind]) {
+    auto *p = pixels[kind];
+    for (int y = 0; y < 16; ++y)
+      for (int x = 0; x < 16; ++x, p += 4) {
+        char c = classic_glyphs[kind][y][x];
+        unsigned long rgb = classic_glyph_rgb(c);
+        p[0] = static_cast<unsigned char>(rgb >> 16);
+        p[1] = static_cast<unsigned char>(rgb >> 8);
+        p[2] = static_cast<unsigned char>(rgb);
+        p[3] = c == '.' ? 0 : 255;
+      }
+    images[kind] = std::make_unique<Fl_RGB_Image>(pixels[kind], 16, 16, 4);
+  }
+  if (enabled) return images[kind].get();
   if (!disabled[kind]) {
-    disabled[kind].reset(images[kind].copy());
+    disabled[kind].reset(static_cast<Fl_RGB_Image *>(images[kind]->copy()));
     disabled[kind]->inactive();
   }
   return disabled[kind].get();
@@ -66,69 +75,162 @@ Fl_Image *get(Kind kind, bool enabled = true) {
 }
 volatile std::sig_atomic_t exit_requested = 0;
 void exit_signal(int) { exit_requested = 1; }
-const Fl_Color Face = fl_rgb_color(222, 222, 218),
-               Light = fl_rgb_color(250, 250, 248),
-               Shadow = fl_rgb_color(142, 144, 140),
-               Ink = fl_rgb_color(32, 34, 32),
-               Muted = fl_rgb_color(94, 98, 94),
+// The Windows build's palette (src/winmain.c), so both look like one app.
+const Fl_Color Face = fl_rgb_color(236, 233, 216),
+               Light = fl_rgb_color(250, 249, 241),
+               Shadow = fl_rgb_color(153, 154, 145),
+               Ink = fl_rgb_color(47, 55, 58),
+               Muted = fl_rgb_color(103, 113, 115),
                ThinkingInk = fl_rgb_color(128, 133, 137),
                Blue = fl_rgb_color(192, 211, 224),
                BlueInk = fl_rgb_color(49, 76, 96),
-               Title = fl_rgb_color(49, 91, 134),
-               CodePaper = fl_rgb_color(236, 234, 224);
+               Title = fl_rgb_color(76, 112, 157),
+               TitleLine = fl_rgb_color(145, 175, 205),
+               Header = fl_rgb_color(218, 216, 201),
+               CodePaper = fl_rgb_color(243, 241, 230),
+               // Classic 3D edge colours, as Windows draws EDGE_RAISED.
+               EdgeLight = fl_rgb_color(227, 227, 227),
+               EdgeShadow = fl_rgb_color(166, 166, 166),
+               EdgeDark = fl_rgb_color(106, 106, 106);
 const Fl_Boxtype TranscriptFrame = FL_FREE_BOXTYPE;
 const char *const EngineReleases =
     "https://github.com/ggml-org/llama.cpp/releases/tag/b10566";
-void edge(int x, int y, int w, int h, Fl_Color color) {
+void bevel(int x, int y, int w, int h, Fl_Color top_left, Fl_Color bottom_right) {
+  fl_color(top_left);
+  fl_xyline(x, y, x + w - 1);
+  fl_yxline(x, y, y + h - 1);
+  fl_color(bottom_right);
+  fl_xyline(x, y + h - 1, x + w - 1);
+  fl_yxline(x + w - 1, y, y + h - 1);
+}
+// Two-pixel classic edges: raised for buttons and panes, sunken for wells.
+void raised(int x, int y, int w, int h, Fl_Color color) {
   fl_color(color);
   fl_rectf(x, y, w, h);
-  fl_color(Light);
-  fl_line(x, y, x + w - 1, y);
-  fl_line(x, y, x, y + h - 1);
-  fl_color(Shadow);
-  fl_line(x, y + h - 1, x + w - 1, y + h - 1);
-  fl_line(x + w - 1, y, x + w - 1, y + h - 1);
-}
-void raised(int x, int y, int w, int h, Fl_Color color) {
-  edge(x, y, w, h, color);
+  bevel(x, y, w, h, EdgeLight, EdgeDark);
+  bevel(x + 1, y + 1, w - 2, h - 2, FL_WHITE, EdgeShadow);
 }
 void sunken(int x, int y, int w, int h, Fl_Color color) {
-  edge(x, y, w, h, color);
-  fl_color(Shadow);
-  fl_line(x, y, x + w - 1, y);
-  fl_line(x, y, x, y + h - 1);
-  fl_color(Light);
-  fl_line(x, y + h - 1, x + w - 1, y + h - 1);
-  fl_line(x + w - 1, y, x + w - 1, y + h - 1);
+  fl_color(color);
+  fl_rectf(x, y, w, h);
+  bevel(x, y, w, h, EdgeShadow, FL_WHITE);
+  bevel(x + 1, y + 1, w - 2, h - 2, EdgeDark, EdgeLight);
+}
+void thin_raised(int x, int y, int w, int h, Fl_Color color) {
+  fl_color(color);
+  fl_rectf(x, y, w, h);
+  bevel(x, y, w, h, FL_WHITE, EdgeShadow);
+}
+void thin_sunken(int x, int y, int w, int h, Fl_Color color) {
+  fl_color(color);
+  fl_rectf(x, y, w, h);
+  bevel(x, y, w, h, EdgeShadow, FL_WHITE);
+}
+// Single-pixel strip edge used by headers and status cells.
+void edge(int x, int y, int w, int h, Fl_Color color) {
+  thin_raised(x, y, w, h, color);
+}
+void frame_raised(int x, int y, int w, int h, Fl_Color) {
+  bevel(x, y, w, h, EdgeLight, EdgeDark);
+  bevel(x + 1, y + 1, w - 2, h - 2, FL_WHITE, EdgeShadow);
+}
+void frame_sunken(int x, int y, int w, int h, Fl_Color) {
+  bevel(x, y, w, h, EdgeShadow, FL_WHITE);
+  bevel(x + 1, y + 1, w - 2, h - 2, EdgeDark, EdgeLight);
+}
+// A white field with a one-pixel border, as Windows draws edits and combos.
+void field_box(int x, int y, int w, int h, Fl_Color color) {
+  fl_color(color);
+  fl_rectf(x, y, w, h);
+  fl_color(fl_rgb_color(171, 173, 179));
+  fl_rect(x, y, w, h);
+}
+const Fl_Boxtype FieldBox = static_cast<Fl_Boxtype>(FL_FREE_BOXTYPE + 1);
+// Tahoma ships beside the executable; it is registered for this process only.
+// Returns whether it is available, bundled or installed.
+bool load_interface_font() {
+  // As Wine's own fontconfig rule: the embedded bitmap strikes have metrics
+  // that disagree with the outlines, which spaces letters unevenly.
+  FcConfigParseAndLoadFromMemory(FcConfigGetCurrent(), reinterpret_cast<const FcChar8 *>(
+      "<?xml version=\"1.0\"?><!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">"
+      "<fontconfig><match target=\"font\"><test name=\"family\">"
+      "<string>Tahoma</string></test><edit name=\"embeddedbitmap\" mode=\"assign\">"
+      "<bool>false</bool></edit></match></fontconfig>"), FcFalse);
+  char self[4096];
+
+  ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+  if (n > 0) {
+    self[n] = 0;
+    auto dir = fs::path(self).parent_path();
+    for (const auto &folder : {dir / "fonts", dir.parent_path() / "share/lcb-ai/fonts"})
+      for (const char *file : {"tahoma.ttf", "tahomabd.ttf"}) {
+        std::error_code error;
+        if (fs::is_regular_file(folder / file, error))
+          FcConfigAppFontAddFile(nullptr,
+              reinterpret_cast<const FcChar8 *>((folder / file).c_str()));
+      }
+  }
+  FcPattern *pattern = FcNameParse(reinterpret_cast<const FcChar8 *>("Tahoma"));
+  FcConfigSubstitute(nullptr, pattern, FcMatchPattern);
+  FcDefaultSubstitute(pattern);
+  FcResult result;
+  FcPattern *match = FcFontMatch(nullptr, pattern, &result);
+  FcChar8 *family = nullptr;
+  bool found = match && FcPatternGetString(match, FC_FAMILY, 0, &family) == FcResultMatch &&
+               std::strcmp(reinterpret_cast<const char *>(family), "Tahoma") == 0;
+  if (match) FcPatternDestroy(match);
+  FcPatternDestroy(pattern);
+  return found;
 }
 void theme() {
+  bool tahoma = load_interface_font();
   Fl::scheme("none");
-  Fl::background(222, 222, 218);
+  Fl::background(236, 233, 216);
   Fl::background2(255, 255, 255);
-  Fl::foreground(32, 34, 32);
-  Fl::set_color(FL_SELECTION_COLOR, 192, 211, 224);
+  Fl::foreground(47, 55, 58);
+  Fl::set_color(FL_SELECTION_COLOR, 76, 112, 157);
   Fl::set_boxtype(FL_UP_BOX, raised, 2, 2, 4, 4);
   Fl::set_boxtype(FL_DOWN_BOX, sunken, 2, 2, 4, 4);
-  Fl::set_boxtype(FL_THIN_UP_BOX, raised, 1, 1, 2, 2);
-  Fl::set_boxtype(FL_THIN_DOWN_BOX, sunken, 1, 1, 2, 2);
-  Fl::set_boxtype(TranscriptFrame, sunken, 12, 8, 24, 16);
+  Fl::set_boxtype(FL_UP_FRAME, frame_raised, 2, 2, 4, 4);
+  Fl::set_boxtype(FL_DOWN_FRAME, frame_sunken, 2, 2, 4, 4);
+  Fl::set_boxtype(FL_THIN_UP_BOX, thin_raised, 1, 1, 2, 2);
+  Fl::set_boxtype(FL_THIN_DOWN_BOX, thin_sunken, 1, 1, 2, 2);
+  Fl::set_boxtype(TranscriptFrame, field_box, 10, 6, 20, 12);
+  Fl::set_boxtype(FieldBox, field_box, 1, 1, 2, 2);
   // FLTK's Xft and Pango backends use different face-name conventions.
   const bool xft_names = Fl::get_font(FL_HELVETICA_BOLD)[0] == 'B';
-  Fl::set_font(FL_HELVETICA, "Helvetica");
-  Fl::set_font(FL_HELVETICA_BOLD, xft_names ? "BHelvetica" : "Helvetica Bold");
-  Fl::set_font(FL_HELVETICA_ITALIC, xft_names ? "IHelvetica" : "Helvetica Italic");
-  Fl::set_font(FL_HELVETICA_BOLD_ITALIC,
-               xft_names ? "PHelvetica" : "Helvetica Bold Italic");
-  Fl::scrollbar_size(15);
+  const char *face = tahoma ? "Tahoma" : "Helvetica";
+  std::string plain = face, bold = face, italic = face, both = face;
+  if (xft_names) {
+    bold = "B" + bold;
+    italic = "I" + italic;
+    both = "P" + both;
+  } else {
+    bold += " Bold";
+    italic += " Italic";
+    both += " Bold Italic";
+  }
+  // FLTK keeps the pointers, so the names live for the whole run.
+  static std::string names[4];
+  names[0] = plain; names[1] = bold; names[2] = italic; names[3] = both;
+  Fl::set_font(FL_HELVETICA, names[0].c_str());
+  Fl::set_font(FL_HELVETICA_BOLD, names[1].c_str());
+  Fl::set_font(FL_HELVETICA_ITALIC, names[2].c_str());
+  Fl::set_font(FL_HELVETICA_BOLD_ITALIC, names[3].c_str());
+  Fl::scrollbar_size(16);
   fl_message_font(FL_HELVETICA, 12);
 }
+// Draws like the Windows build's owner-drawn buttons: always raised, light
+// when hot, sunken blue when pressed, with underlined Alt-key letters.
 class IconButton : public Fl_Button {
   icons::Kind icon_;
-  bool toolbar_, hovered_ = false;
+  bool with_icon_, hovered_ = false;
 public:
-  IconButton(const char *text, icons::Kind icon, bool toolbar)
-      : Fl_Button(0, 0, 10, 10, text), icon_(icon), toolbar_(toolbar) {
+  bool accent = false;
+  IconButton(const char *text, icons::Kind icon, bool with_icon = true)
+      : Fl_Button(0, 0, 10, 10, text), icon_(icon), with_icon_(with_icon) {
     labelsize(12);
+    labelcolor(Ink);
   }
   void show_as(const char *text, icons::Kind icon) {
     if (icon_ == icon && label() && std::strcmp(label(), text) == 0) return;
@@ -137,16 +239,23 @@ public:
     redraw();
   }
   void draw() override {
-    if (value()) sunken(x(), y(), w(), h(), Face);
-    else if (!toolbar_ || (hovered_ && active_r())) raised(x(), y(), w(), h(), Face);
-    else { fl_color(Face); fl_rectf(x(), y(), w(), h()); }
-    int shift = value() ? 1 : 0;
-    icons::get(icon_, active_r())->draw(x() + 3 + shift, y() + (h() - 22) / 2 + shift);
-    fl_color(active_r() ? Ink : Shadow);
-    fl_font(labelfont(), labelsize());
-    fl_draw(label(), x() + 28 + shift, y() + shift, w() - 31, h(),
-            FL_ALIGN_LEFT | FL_ALIGN_INSIDE | FL_ALIGN_CLIP);
-    if (Fl::focus() == this) draw_focus(FL_FLAT_BOX, x() + 2, y() + 2, w() - 4, h() - 4);
+    bool pressed = value(), enabled = active_r();
+    Fl_Color fill = !enabled ? Face : pressed ? Blue : hovered_ ? Light : accent ? Blue : Face;
+    if (pressed) sunken(x(), y(), w(), h(), fill);
+    else raised(x(), y(), w(), h(), fill);
+    int shift = pressed ? 1 : 0, left = x() + 4, width = w() - 8;
+    if (with_icon_) {
+      icons::get(icon_, enabled)->draw(x() + 5 + shift, y() + (h() - 16) / 2 + shift);
+      left = x() + 23;
+      width = w() - 27;
+    }
+    draw_label(left + shift, y() + shift, width, h(), FL_ALIGN_CENTER | FL_ALIGN_CLIP);
+    if (Fl::focus() == this) {
+      fl_color(Ink);
+      fl_line_style(FL_DOT);
+      fl_rect(x() + 4, y() + 4, w() - 8, h() - 8);
+      fl_line_style(0);
+    }
   }
   int handle(int event) override {
     if (event == FL_ENTER || event == FL_LEAVE) {
@@ -476,8 +585,8 @@ public:
   std::function<void(const Row &, Action)> action;
   int hovered = 0;
   ChatSidebar() : Fl_Hold_Browser(0, 0, 10, 10) {
-    box(FL_THIN_DOWN_BOX);
-    color(FL_WHITE);
+    box(FieldBox);
+    color(Light);
     selection_color(Title);
     has_scrollbar(VERTICAL);
     textsize(12);
@@ -515,54 +624,60 @@ public:
   }
   int item_height(void *item) const override {
     auto row = row_of(item);
-    if (!row) return textsize() + 10;
-    if (row->kind == Section) return 24;
-    return row->snippet.empty() ? 24 : 38;
+    if (!row) return 26;
+    return row->snippet.empty() ? 26 : 40;
   }
   int item_width(void *) const override { return 0; }
+  // Hovered chats show a "..." menu button at the right edge, as on Windows.
+  bool over_dots() const {
+    int right = x() + w() - Fl::box_dx(box()) -
+                (scrollbar.visible() ? Fl::scrollbar_size() : 0);
+    return Fl::event_x() >= right - 28;
+  }
   std::pair<int, int> context_position() const {
     if (Fl::event() != FL_KEYDOWN && Fl::event() != FL_SHORTCUT)
       return {Fl::event_x(), Fl::event_y()};
-    int row_y = line_y(value()) + 20;
+    int row_y = line_y(value()) + 22;
     return {x() + 30, std::clamp(row_y, y() + 2, y() + h() - 2)};
   }
   void item_draw(void *item, int X, int Y, int W, int H) const override {
     auto row = row_of(item);
     if (!row) return;
     bool selected = row->kind == Chat && row->id == active;
-    bool hover = !selected && row->kind == Chat && hovered == lineno(item);
+    bool hover = row->kind == Chat && hovered == lineno(item);
     fl_push_clip(X, Y, W, H);
-    fl_color(selected ? Title : hover ? fl_rgb_color(236, 241, 245) : FL_WHITE);
+    fl_color(selected ? Title : hover ? Face : Light);
     fl_rectf(X, Y, W, H);
-    if (row->kind == Section) {
-      fl_font(FL_HELVETICA_BOLD, 11);
+    if (selected) {
+      fl_color(TitleLine);
+      fl_xyline(X, Y, X + W - 1);
+    }
+    if (row->kind != Chat) {
+      fl_font(row->kind == Section ? FL_HELVETICA_BOLD : FL_HELVETICA, 12);
       fl_color(Muted);
-      ClassicTable::cell_text(row->title, X + 8, Y + 6, W - 16, H - 6);
-      fl_color(fl_rgb_color(219, 218, 206));
-      fl_line(X + 8, Y + H - 2, X + W - 8, Y + H - 2);
+      ClassicTable::cell_text(row->title, X + 9, Y, W - 17, H);
       fl_pop_clip();
       return;
     }
-    if (row->kind == Empty) {
-      fl_font(FL_HELVETICA_ITALIC, 12);
-      fl_color(Muted);
-      ClassicTable::cell_text(row->title, X + 12, Y, W - 20, 24);
-      fl_pop_clip();
-      return;
-    }
-    int right = X + W - 6;
-    if (!row->when.empty()) {
+    Fl_Color soft = selected ? fl_rgb_color(214, 226, 240) : Muted;
+    int right = X + W - 8;
+    if (hover) {
+      fl_font(FL_HELVETICA, 12);
+      fl_color(selected ? FL_WHITE : Muted);
+      fl_draw("...", X + W - 28, Y, 26, 26, FL_ALIGN_CENTER);
+      right = X + W - 30;
+    } else if (!row->when.empty()) {
       fl_font(FL_HELVETICA, 11);
-      fl_color(selected ? fl_rgb_color(206, 222, 238) : Muted);
+      fl_color(soft);
       int width = static_cast<int>(fl_width(row->when.c_str()));
-      fl_draw(row->when.c_str(), right - width, Y, width, 24,
+      fl_draw(row->when.c_str(), right - width, Y, width, 26,
               FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
       right -= width + 8;
     }
-    int left = X + 12;
+    int left = X + 9;
     if (row->pinned) {
-      fl_color(selected ? FL_WHITE : fl_rgb_color(150, 111, 53));
-      int cx = left + 3, cy = Y + 12;
+      fl_color(selected ? FL_WHITE : fl_rgb_color(195, 146, 58));
+      int cx = left + 3, cy = Y + 13;
       fl_polygon(cx - 4, cy - 1, cx + 4, cy - 1, cx, cy + 4);
       fl_rectf(cx - 2, cy - 6, 5, 6);
       fl_line(cx, cy + 4, cx, cy + 7);
@@ -570,16 +685,16 @@ public:
     }
     fl_font(FL_HELVETICA, 12);
     fl_color(selected ? FL_WHITE : Ink);
-    ClassicTable::cell_text(row->title, left, Y, right - left, 24);
+    ClassicTable::cell_text(row->title, left, Y, right - left, 26);
     if (!row->snippet.empty()) {
       fl_font(FL_HELVETICA, 11);
-      fl_color(selected ? fl_rgb_color(206, 222, 238) : Muted);
-      ClassicTable::cell_text(row->snippet, X + 12, Y + 19, W - 18, 16);
+      fl_color(soft);
+      ClassicTable::cell_text(row->snippet, X + 9, Y + 21, W - 17, 16);
     }
     if (item_selected(item) && Fl::focus() == this) {
-      fl_color(selected ? FL_WHITE : Shadow);
+      fl_color(selected ? FL_WHITE : Ink);
       fl_line_style(FL_DOT);
-      fl_rect(X + 2, Y + 1, W - 4, H - 2);
+      fl_rect(X + 2, Y + 2, W - 4, H - 4);
       fl_line_style(0);
     }
     fl_pop_clip();
@@ -618,7 +733,7 @@ public:
         value(line);
         take_focus();
         auto row = entries[line - 1];
-        action(row, Fl::event_button() == FL_RIGHT_MOUSE ? Menu
+        action(row, Fl::event_button() == FL_RIGHT_MOUSE || over_dots() ? Menu
                     : Fl::event_clicks() ? Rename : Open);
       }
       return 1;
@@ -655,7 +770,7 @@ public:
   void draw() override {
     Fl_Input::draw();
     if (!size() && Fl::focus() != this) {
-      fl_font(FL_HELVETICA_ITALIC, 12);
+      fl_font(FL_HELVETICA, 12);
       fl_color(Muted);
       fl_draw("Search chats  (Ctrl+K)", x() + 6, y(), w() - 12, h(),
               FL_ALIGN_LEFT | FL_ALIGN_INSIDE | FL_ALIGN_CLIP);
@@ -674,7 +789,8 @@ public:
   std::function<void(bool)> done;
   RenameField() : Fl_Input(0, 0, 10, 10) {
     textsize(12);
-    box(FL_THIN_DOWN_BOX);
+    box(FieldBox);
+
     hide();
   }
   void finish(bool save) {
@@ -942,19 +1058,25 @@ public:
       bool selected = entry.first == active;
       edge(left, y() + (selected ? 2 : 4), width, h() - (selected ? 3 : 5),
            selected ? Light : Face);
-      fl_color(Ink);
-      icons::get(icons::Document)->draw(left + 2, y() + 4);
+      if (selected) {
+        fl_color(Title);
+        fl_rectf(left, y() + 2, width, 2);
+      }
+      icons::get(icons::Document)->draw(left + 5, y() + (h() - 16) / 2 + 1);
+      fl_font(selected ? FL_HELVETICA_BOLD : FL_HELVETICA, 12);
+      fl_color(selected ? BlueInk : Ink);
       ClassicTable::cell_text(entry.second, left + 25, y() + 3, width - 48, h() - 4);
       if (selected) {
         fl_color(Light);
         fl_line(left + 1, y() + h() - 2, left + width - 2, y() + h() - 2);
         if (Fl::focus() == this) {
-          fl_color(Shadow);
+          fl_color(Ink);
           fl_line_style(FL_DOT);
-          fl_rect(left + 3, y() + 5, width - 26, h() - 10);
+          fl_rect(left + 3, y() + 6, width - 26, h() - 10);
           fl_line_style(0);
         }
       }
+
       if (fully_visible(left, width)) {
         fl_color(Ink);
         fl_line(left + width - 15, y() + 10, left + width - 9, y() + 16);
@@ -1007,14 +1129,10 @@ class Divider : public Fl_Widget {
 public:
   std::function<void(int)> moved;
   Divider(bool vertical) : Fl_Widget(0, 0, 10, 10), vertical_(vertical) {}
+  // The gap between panes is the splitter, plain as on Windows.
   void draw() override {
     fl_color(Face);
     fl_rectf(x(), y(), w(), h());
-    fl_color(Shadow);
-    if (vertical_)
-      fl_line(x() + w() / 2, y(), x() + w() / 2, y() + h());
-    else
-      fl_line(x(), y() + h() / 2, x() + w(), y() + h() / 2);
   }
   int handle(int event) override {
     if (event == FL_ENTER || event == FL_LEAVE) {
@@ -1079,7 +1197,7 @@ class Window : public Fl_Double_Window {
   Fl_Menu_Bar *menu = nullptr;
   Fl_Button *new_button, *load_button, *unload_button, *engine_button,
       *model_button, *send_button, *stop_button, *attach_button, *remove_button,
-      *retry_button, *edit_button, *left_toggle,
+      *retry_button, *edit_button, *left_toggle, *chats_new,
       *chats_toggle, *latest_button;
   Fl_Input *model_name;
   Fl_Int_Input *port_input;
@@ -1112,10 +1230,10 @@ class Window : public Fl_Double_Window {
   Composer *prompt;
   Fl_Text_Buffer text_buffer, style_buffer, prompt_buffer, activity_buffer,
       log_buffer, master_buffer;
-  static constexpr int StyleCount = 16;
+  static constexpr int StyleCount = 17;
   Fl_Text_Display::Style_Table_Entry styles[StyleCount] = {
       {Ink, FL_HELVETICA, 13, 0, FL_WHITE},
-      {FL_WHITE, FL_HELVETICA_BOLD, 13, Fl_Text_Display::ATTR_BGCOLOR_EXT, Title},
+      {BlueInk, FL_HELVETICA, 12, 0, FL_WHITE},
       {Ink, FL_HELVETICA_BOLD, 13, 0, FL_WHITE},
       {Ink, FL_HELVETICA_ITALIC, 13, 0, FL_WHITE},
       {Ink, FL_COURIER, 13, Fl_Text_Display::ATTR_BGCOLOR, CodePaper},
@@ -1126,10 +1244,11 @@ class Window : public Fl_Double_Window {
       {ThinkingInk, FL_HELVETICA_ITALIC, 13, 0, FL_WHITE},
       {ThinkingInk, FL_COURIER, 12, Fl_Text_Display::ATTR_BGCOLOR, CodePaper},
       {ThinkingInk, FL_HELVETICA_BOLD, 13, 0, FL_WHITE},
-      {Ink, FL_HELVETICA_BOLD, 13, Fl_Text_Display::ATTR_BGCOLOR_EXT, Face},
+      {Muted, FL_HELVETICA, 12, 0, FL_WHITE},
       {Ink, FL_COURIER, 13, Fl_Text_Display::ATTR_BGCOLOR_EXT, CodePaper},
       {ThinkingInk, FL_COURIER, 12, Fl_Text_Display::ATTR_BGCOLOR_EXT, CodePaper},
-      {Ink, FL_COURIER_BOLD, 13, Fl_Text_Display::ATTR_BGCOLOR_EXT, CodePaper}};
+      {Ink, FL_COURIER_BOLD, 13, Fl_Text_Display::ATTR_BGCOLOR_EXT, CodePaper},
+      {ThinkingInk, FL_HELVETICA, 11, 0, FL_WHITE}};
   Fl_Hold_Browser *attachment_list;
   ClassicTable *model_list, *details;
   bool descending = false;
@@ -1227,7 +1346,9 @@ public:
 
     layout();
     controls();
+    prompt->take_focus();
     note("FLTK workbench ready. Storage: " + store.root.string());
+
     if (store.skipped)
       note(std::to_string(store.skipped) +
            " invalid saved files were left untouched.");
@@ -1272,6 +1393,14 @@ public:
       guard([&] { step_chat(Fl::event_key() == FL_Page_Up ? -1 : 1); });
       return 1;
     }
+    if (event == FL_PUSH || event == FL_KEYBOARD || event == FL_RELEASE) {
+      int result = handle_events(event);
+      track_focus();
+      return result;
+    }
+    return handle_events(event);
+  }
+  int handle_events(int event) {
     if (event == FL_MOUSEWHEEL) {
       for (auto page : {models_page, generation_page, library_page})
         if (page->visible_r() && Fl::event_inside(page) &&
@@ -1366,6 +1495,7 @@ private:
     auto i = new Fl_Input(0, 0, 10, 10);
     i->textsize(12);
     i->color(FL_WHITE);
+    i->box(FieldBox);
     return i;
   }
   Fl_Text_Display *display(Fl_Text_Buffer &buffer) {
@@ -1374,6 +1504,7 @@ private:
     d->textfont(FL_COURIER);
     d->textsize(12);
     d->color(FL_WHITE);
+    d->box(FieldBox);
     d->selection_color(Blue);
     d->wrap_mode(Fl_Text_Display::WRAP_AT_BOUNDS, 0);
     return d;
@@ -1408,7 +1539,7 @@ private:
     menu = new Fl_Menu_Bar(0, 0, w(), 22);
     menu->textsize(12);
     menu->box(FL_FLAT_BOX);
-    menu->color(Face);
+    menu->color(FL_WHITE);
     auto add = [&](const char *name, int key, std::function<void()> fn) {
       menu_action(name, key, [this, fn] { guard(fn); });
     };
@@ -1471,7 +1602,7 @@ private:
       fl_message("LCB-AI " LCB_VERSION
                  "\nLarkin Computing Bureau\n\nNative Linux workbench: "
                  "C++ / FLTK 1.4\nShared C request, model and streaming core.\n\n"
-                 "Toolbar icons: KDE 1, Mark Donohoe and contributors (LGPL 2).");
+                 "Interface font: Tahoma from the Wine project (LGPL 2.1).");
     });
     for (const char *path : {"&File/New workspace...", "&File/Delete chat...",
                              "&Edit/Copy", "&View/Output", "&View/Next chat",
@@ -1479,23 +1610,24 @@ private:
       int index = menu->find_index(path);
       menu->mode(index, menu->mode(index) | FL_MENU_DIVIDER);
     }
-    new_button = icon_button("New chat", icons::New, [&] { new_chat(); });
+    new_button = icon_button("Ne&w chat", icons::Document, [&] { new_chat(); });
     new_button->tooltip("New chat (Ctrl+N)");
-    load_button = icon_button("Load", icons::Load, [&] {
+    load_button = icon_button("&Load", icons::Run, [&] {
       if (engine.owned()) unload();
       else load_model();
     });
     lamp = new StatusLamp();
     unload_button = icon_button("Unload", icons::Stop, [&] { unload(); });
     engine_button = icon_button("Settings...", icons::Settings, [&] { settings_dialog(); });
-    model_button = icon_button("Open model...", icons::Open, [&] { choose_model(); });
+    model_button = icon_button("Open model...", icons::Folder, [&] { choose_model(); });
     model_picker_label = label("Model:");
     model_picker = new Fl_Choice(0, 0, 10, 10);
     model_picker->textsize(12);
     model_picker->color(FL_WHITE);
+    model_picker->box(FieldBox);
     model_picker->tooltip("Choosing a model loads it");
     bind(model_picker, [&] { pick_model(); });
-    properties_button = icon_button("Properties", icons::Settings,
+    properties_button = icon_button("&Properties", icons::Settings,
                                     [&] { show_properties(0); });
     properties_button->tooltip("Model, generation, library and engine (F10)");
     for (auto &separator : toolbar_separators) {
@@ -1528,15 +1660,24 @@ private:
       show_left = !show_left;
       layout();
     });
+    chats_new = button("+", [&] { new_chat(); });
+    chats_new->tooltip("New chat (Ctrl+N)");
+    for (auto b : {left_toggle, chats_new}) {
+      b->labelsize(13);
+
+      b->visible_focus(0);
+    }
     workspace_picker = new Fl_Choice(0, 0, 10, 10);
     workspace_picker->textsize(12);
     workspace_picker->color(FL_WHITE);
+    workspace_picker->box(FieldBox);
     workspace_picker->tooltip("Workspace: its chats and master prompt");
     bind(workspace_picker, [&] { pick_workspace(); });
     search_label = label("Search:");
     chat_search = new SearchField();
     chat_search->textsize(12);
     chat_search->color(FL_WHITE);
+    chat_search->box(FieldBox);
     chat_search->tooltip("Search titles and messages in every workspace.\n"
                          "Enter opens the first result, Down moves to the list, "
                          "Escape clears.");
@@ -1608,9 +1749,11 @@ private:
     exchange->textsize(12);
     exchange->tooltip("Select a message to retry or edit");
     exchange->color(FL_WHITE);
+    exchange->box(FieldBox);
     bind(exchange, [&] { select_exchange(); });
-    retry_button = icon_button("Retry", icons::Load, [&] { retry(false); });
-    edit_button = icon_button("Edit...", icons::Settings, [&] { retry(true); });
+    retry_button = icon_button("&Retry", icons::Run, [&] { retry(false); }, false);
+    edit_button = icon_button("E&dit and resend...", icons::Settings,
+                              [&] { retry(true); }, false);
     phase_box = label(phase.c_str());
     phase_box->copy_label(phase.c_str());
     phase_box->box(FL_THIN_DOWN_BOX);
@@ -1671,6 +1814,7 @@ private:
     attachment_list = new Fl_Hold_Browser(0, 0, 10, 10);
     attachment_list->textsize(12);
     attachment_list->color(FL_WHITE);
+    attachment_list->box(FieldBox);
     bind(attachment_list, [this] {
       int index = attachment_list->value() - 1;
       if (!Fl::event_clicks() || index < 0)
@@ -1695,7 +1839,7 @@ private:
       }
       open_url(url);
     });
-    attach_button = icon_button("Attach...", icons::Attach, [&] { attach(); }, false);
+    attach_button = icon_button("&Attach...", icons::Folder, [&] { attach(); }, false);
     remove_button = button("Remove", [&] { remove_attachment(); });
     media_status = label("Text / image / audio / video");
     media_status->labelcolor(Muted);
@@ -1705,20 +1849,24 @@ private:
     prompt->textfont(FL_HELVETICA);
     prompt->textsize(13);
     prompt->color(FL_WHITE);
+    prompt->box(FieldBox);
     prompt->selection_color(Blue);
     prompt->wrap_mode(Fl_Text_Display::WRAP_AT_BOUNDS, 0);
     thinking_label = label("Thinking:");
+    thinking_label->align(FL_ALIGN_RIGHT | FL_ALIGN_INSIDE);
     quick_thinking = new Fl_Choice(0, 0, 10, 10);
     quick_thinking->add("Auto|Off|On");
     quick_thinking->textsize(12);
     quick_thinking->color(FL_WHITE);
+    quick_thinking->box(FieldBox);
     quick_thinking->tooltip("Auto follows the model's own default");
     bind(quick_thinking,
          [&] { edit_generation(GenThinking, quick_thinking->value()); });
-    send_button = icon_button("Send", icons::Send, [&] {
+    send_button = icon_button("&Send", icons::Run, [&] {
       if (streaming_here()) stop();
       else send();
-    }, false);
+    });
+    static_cast<IconButton *>(send_button)->accent = true;
     send_button->tooltip("Send (Ctrl+Enter). While replying: Stop (Esc)");
     stop_button = icon_button("Stop", icons::Stop, [&] { stop(); }, false);
     // Model details and settings live in one classic property sheet.
@@ -1729,7 +1877,7 @@ private:
     right_header = label("Runtime", true);
     right_tabs = new Fl_Tabs(0, 0, 10, 10);
     right_tabs->labelsize(12);
-    right_tabs->selection_color(Blue);
+    right_tabs->selection_color(Light);
     right_tabs->begin();
     models_page = new Fl_Scroll(0, 0, 10, 10, "Model");
     static_cast<Fl_Scroll *>(models_page)->type(Fl_Scroll::VERTICAL);
@@ -1843,7 +1991,7 @@ private:
     begin();
     output_header = label("Output", true);
     output_tabs = new Fl_Tabs(0, 0, 10, 10);
-    output_tabs->selection_color(Blue);
+    output_tabs->selection_color(Light);
     output_tabs->begin();
     activity_page = new Fl_Group(0, 0, 10, 10, "Session activity");
     activity_page->labelsize(12);
@@ -1889,92 +2037,173 @@ private:
       w->hide();
   }
   void layout_status() {
-    place(status, 5, h() - 24, w() - 446, 21);
-    place(phase_box, w() - 437, h() - 24, 278, 21);
-    place(speed_box, w() - 155, h() - 24, 150, 21);
+    // Three sunken cells, as the Windows status bar.
+    int y = h() - 22;
+    place(status, 4, y, 300, 20);
+    place(phase_box, 307, y, std::max(120, w() - 307 - 161), 20);
+    place(speed_box, w() - 158, y, 154, 20);
     visible(speed_box, !model_loading);
-    place(loading_meter, w() - 152, h() - 21, 144, 15);
+    place(loading_meter, w() - 154, y + 3, 146, 14);
   }
+  // Pane rectangles, kept for painting the chrome in draw().
+  struct Pane {
+    int x = 0, y = 0, w = 0, h = 0;
+    bool shown = false;
+  } panes[3];
+  int active_pane = 1, composer_strip = 0;
   void layout() {
     menu_checked("&View/Chats sidebar", show_left);
     menu_checked("&View/Chat tabs", show_chats);
     menu_checked("&View/Output", show_output);
     place(menu, 0, 0, w(), 22);
-    const int top = 25, pane_top = 59;
-    place(new_button, 5, top, 94, 28);
-    place(toolbar_separators[0], 104, top + 2, 2, 24);
-    place(model_picker_label, 112, top, 46, 28);
-    place(lamp, 154, top, 16, 28);
+    // Toolbar strip.
+    const int top = 26, pane_top = 58;
+    place(new_button, 6, top, 92, 26);
+    place(toolbar_separators[0], 103, top + 1, 2, 24);
+    place(model_picker_label, 110, top, 44, 26);
+    place(lamp, 152, top, 16, 26);
     int picker = std::clamp(w() - 520, 220, 380);
-    place(model_picker, 172, top + 2, picker, 24);
-    int tx = 172 + picker + 6;
-    place(load_button, tx, top, 84, 28);
+    place(model_picker, 170, top + 1, picker, 24);
+    int tx = 170 + picker + 6;
+    place(load_button, tx, top, 84, 26);
     unload_button->hide();
-    place(toolbar_separators[1], tx + 90, top + 2, 2, 24);
-    place(properties_button, tx + 98, top, 104, 28);
+    place(toolbar_separators[1], tx + 90, top + 1, 2, 24);
+    place(properties_button, tx + 98, top, 104, 26);
     toolbar_separators[2]->hide();
-    place(brand, w() - 94, top, 86, 28);
+    place(brand, w() - 94, top, 86, 26);
     for (Fl_Widget *widget : std::initializer_list<Fl_Widget *>{model_button,
-             engine_button, center_header, chats_toggle, exchange,
-             message_header, right_divider, media_status})
+             engine_button, center_header, chats_toggle, message_header,
+             right_divider, media_status, left_header, search_label, output_header,
+             stop_button})
       widget->hide();
     output_height = std::clamp(output_height, 100, std::max(100, h() - 540));
-    int bottom = h() - 27 - (show_output ? output_height + 30 : 0);
-    int left = show_left
-                   ? std::clamp(left_width, 160, std::max(160, w() - 350)) : 28;
-    int cx = left + 12, cw = w() - cx - 5;
-    left_header->hide();
-    search_label->hide();
+    int status_top = h() - 25;
+    int output_top = status_top - output_height;
+    int pane_bottom = show_output ? output_top - 5 : status_top;
+    int left = show_left ? std::clamp(left_width, 160, std::max(160, w() - 350)) : 30;
+    // Chats pane.
+    auto &lp = panes[0];
+    lp = {4, pane_top, left, pane_bottom - pane_top, true};
+    int lx = lp.x + 5, lw = lp.w - 10, ly = lp.y + 26;
     visible(workspace_picker, show_left);
     visible(chat_search, show_left);
     visible(sidebar, show_left);
+    visible(chats_new, show_left);
     visible(left_divider, show_left);
     if (!show_left) rename_field->finish(true);
-    place(workspace_picker, 7, pane_top, left - 32, 24);
-    place(left_toggle, show_left ? left - 21 : 5, pane_top, 26, 24);
+    place(left_toggle, lp.x + lp.w - 26, lp.y + 2, 22, 19);
+    place(chats_new, lp.x + lp.w - 49, lp.y + 2, 22, 19);
     left_toggle->copy_label(show_left ? "<" : ">");
     left_toggle->tooltip(show_left ? "Collapse Chats (F9)" : "Expand Chats (F9)");
-    place(chat_search, 7, pane_top + 28, left - 4, 24);
-    place(sidebar, 7, pane_top + 56, left - 4, bottom - pane_top - 56);
+    place(workspace_picker, lx, ly, lw, 24);
+    place(chat_search, lx, ly + 29, lw, 24);
+    place(sidebar, lx, ly + 58, lw, lp.y + lp.h - 6 - (ly + 58));
     if (rename_field->visible()) place_rename();
-    place(left_divider, left + 5, pane_top, 6, bottom - pane_top);
+    place(left_divider, lp.x + lp.w, pane_top, 5, pane_bottom - pane_top);
+    // Conversations pane.
+    auto &cp = panes[1];
+    cp = {lp.x + lp.w + 5, pane_top, w() - (lp.x + lp.w + 5) - 4, pane_bottom - pane_top, true};
+    int cx = cp.x + 4, cw = cp.w - 8, cy = cp.y + 24;
     visible(tabs, show_chats);
-    place(tabs, cx, pane_top, cw, 28);
-    int chat_top = show_chats ? pane_top + 31 : pane_top;
+    place(tabs, cx, cy, cw, 26);
+    if (show_chats) cy += 28;
+    // Exchange row: choose a message to retry or edit, as on Windows.
+    exchange->show();
+    int buttons = 96 + 4 + 132;
+    place(exchange, cx + 1, cy + 2, cw - buttons - 6, 23);
+    place(retry_button, cx + cw - buttons, cy + 1, 96, 25);
+    place(edit_button, cx + cw - 132, cy + 1, 132, 25);
+    cy += 30;
     bool has_attachments = cJSON_GetArraySize(attachments.p) > 0;
-    int extra = has_attachments ? 44 : 0;
-    int composer = bottom - 108 - extra;
-    place(transcript, cx, chat_top, cw, composer - chat_top - 4);
-    place(latest_button, cx + cw - 100, composer - 32, 80, 22);
+    int extra = has_attachments ? 46 : 0;
+    int bottom = cp.y + cp.h - 5;
+    int prompt_top = bottom - 70;
+    composer_strip = prompt_top - extra - 23;
+    place(transcript, cx, cy, cw, composer_strip - cy - 3);
+    place(latest_button, cx + cw - 100, composer_strip - 33, 80, 22);
+    place(thinking_label, cx + cw - 146, composer_strip + 1, 62, 20);
+    place(quick_thinking, cx + cw - 82, composer_strip + 1, 80, 20);
     visible(attachment_list, has_attachments);
-    place(attachment_list, cx, composer, cw - 107, 40);
+    place(attachment_list, cx + 1, composer_strip + 23, cw - 86, 42);
     visible(remove_button, has_attachments);
-    place(remove_button, cx + cw - 101, composer + 4, 101, 26);
-    int ay = composer + extra;
-    int row = bottom - 26;
-    place(prompt, cx, ay, cw - 107, row - ay - 4);
-    place(send_button, cx + cw - 101, ay, 101, row - ay - 4);
-    stop_button->hide();
-
-    place(attach_button, cx, row, 92, 26);
-    place(retry_button, cx + 96, row, 76, 26);
-    place(edit_button, cx + 176, row, 78, 26);
-    place(thinking_label, cx + cw - 107 - 140, row, 62, 26);
-    place(quick_thinking, cx + cw - 107 - 76, row + 1, 72, 24);
-    visible(output_header, show_output);
+    place(remove_button, cx + cw - 80, composer_strip + 23, 80, 25);
+    place(prompt, cx + 1, prompt_top, cw - 86, bottom - prompt_top);
+    place(send_button, cx + cw - 80, prompt_top, 80, 32);
+    place(attach_button, cx + cw - 80, prompt_top + 36, 80, 26);
+    // Output pane.
+    auto &op = panes[2];
+    op = {4, output_top, w() - 8, status_top - output_top - 3, show_output};
     visible(output_tabs, show_output);
     visible(output_divider, show_output);
-    place(output_divider, 5, bottom + 1, w() - 10, 7);
-    place(output_header, 5, bottom + 8, w() - 10, 22);
-    place(output_tabs, 5, bottom + 32, w() - 10, output_height - 6);
+    place(output_divider, 4, output_top - 5, w() - 8, 5);
+    place(output_tabs, op.x + 4, op.y + 23, op.w - 8, op.h - 27);
     for (auto page : {activity_page, log_page})
-      place(page, 7, bottom + 58, w() - 14, output_height - 34);
+      place(page, op.x + 4, op.y + 47, op.w - 8, op.h - 51);
     for (auto display : {activity, live_log})
-      place(display, 9, bottom + 60, w() - 18, output_height - 38);
+      place(display, op.x + 5, op.y + 48, op.w - 10, op.h - 53);
     layout_status();
     if (transcript->following)
       transcript->latest();
     redraw();
+  }
+  // Which pane holds keyboard focus; its title strip is drawn active.
+  int focused_pane() const {
+    Fl_Widget *f = Fl::focus();
+    if (!f || f->window() != this) return active_pane;
+    int fx = f->x() + f->w() / 2, fy = f->y() + f->h() / 2;
+    for (int i = 0; i < 3; ++i) {
+      const auto &p = panes[i];
+      if (p.shown && fx >= p.x && fx < p.x + p.w && fy >= p.y && fy < p.y + p.h) return i;
+    }
+    return active_pane;
+  }
+  void track_focus() {
+    int pane = focused_pane();
+    if (pane == active_pane) return;
+    for (int i : {active_pane, pane})
+      damage(FL_DAMAGE_ALL, panes[i].x, panes[i].y, panes[i].w, 22);
+    active_pane = pane;
+  }
+  void draw_pane(int index, icons::Kind icon, const std::string &title) {
+    const auto &p = panes[index];
+    if (!p.shown) return;
+    bool selected = index == active_pane;
+    raised(p.x, p.y, p.w, p.h, Face);
+    fl_color(selected ? Title : Header);
+    fl_rectf(p.x + 2, p.y + 2, p.w - 4, 18);
+    fl_color(selected ? TitleLine : Light);
+    fl_xyline(p.x + 2, p.y + 2, p.x + p.w - 3);
+    fl_color(Shadow);
+    fl_xyline(p.x + 2, p.y + 20, p.x + p.w - 3);
+    icons::get(icon)->draw(p.x + 5, p.y + 3);
+    fl_font(FL_HELVETICA_BOLD, 12);
+    fl_color(selected ? FL_WHITE : Ink);
+    int room = p.w - 30 - (index == 0 ? 50 : 0);
+    ClassicTable::cell_text(title, p.x + 25, p.y + 2, room, 18);
+  }
+  void draw() override {
+    if (damage() & ~FL_DAMAGE_CHILD) {
+      fl_color(Face);
+      fl_rectf(0, 0, w(), h());
+      fl_color(FL_WHITE);
+      fl_rectf(0, 0, w(), 22);
+      raised(2, 23, w() - 4, 32, Face);
+      draw_pane(0, icons::Folder, show_left ? "Chats" : "");
+      std::string title = "Conversations";
+      if (!show_chats && !active.empty() && store.chats.count(active))
+        title += " \xc2\xb7 " + clean_label(store.chats.at(active).str("title"));
+      draw_pane(1, icons::Document, title);
+      draw_pane(2, icons::Output, "Output");
+      // The composer's caption strip.
+      const auto &cp = panes[1];
+      fl_color(Shadow);
+      fl_xyline(cp.x + 4, composer_strip, cp.x + cp.w - 5);
+      fl_font(FL_HELVETICA, 12);
+      fl_color(Ink);
+      fl_draw("Message \xc2\xb7 Ctrl+Enter to send", cp.x + 9, composer_strip + 1,
+              cp.w - 170, 21, FL_ALIGN_LEFT | FL_ALIGN_INSIDE | FL_ALIGN_CLIP);
+    }
+    draw_children();
   }
   template <class Fn> void launch(Fn fn) {
     auto done = std::make_shared<std::atomic<bool>>(false);
@@ -2159,10 +2388,10 @@ private:
     layout_status();
     auto send_icon = static_cast<IconButton *>(send_button);
     if (here) {
-      send_icon->show_as("Stop", icons::Stop);
+      send_icon->show_as("St&op", icons::Stop);
       send_button->activate();
     } else {
-      send_icon->show_as(pending_send ? "Queued" : "Send", icons::Send);
+      send_icon->show_as(pending_send ? "Queued" : "&Send", icons::Run);
       if (idle && !pending_send && !model_path.empty() && !active.empty() &&
           (ready || engine.owned() || !engine_path.empty()))
         send_button->activate();
@@ -2175,10 +2404,11 @@ private:
       stop_button->deactivate();
     auto load_icon = static_cast<IconButton *>(load_button);
     if (engine.owned()) {
-      load_icon->show_as(model_loading || !ready ? "Cancel" : "Unload", icons::Stop);
+      load_icon->show_as(model_loading || !ready ? "Ca&ncel" : "&Unload", icons::Stop);
       load_button->tooltip("Unload the model and stop the engine");
     } else {
-      load_icon->show_as("Load", icons::Load);
+      load_icon->show_as("&Load", icons::Run);
+
       load_button->tooltip("Load the selected model (F5)");
     }
     if (idle) load_button->activate();
@@ -2401,17 +2631,17 @@ private:
       std::sort(pinned.begin(), pinned.end(), by_time);
       std::sort(items.begin(), items.end(), by_time);
       if (!pinned.empty()) {
-        rows.push_back(label_row(ChatSidebar::Section, "PINNED"));
+        rows.push_back(label_row(ChatSidebar::Section, "Pinned"));
         for (const auto &item : pinned) chat_row(item);
       }
       std::tm day = *std::localtime(&now);
       day.tm_hour = day.tm_min = day.tm_sec = 0;
       std::time_t today = std::mktime(&day);
       const std::pair<std::time_t, const char *> groups[] = {
-          {today, "TODAY"}, {today - 86400, "YESTERDAY"},
-          {today - 6 * 86400, "PREVIOUS 7 DAYS"},
-          {today - 29 * 86400, "PREVIOUS 30 DAYS"},
-          {std::numeric_limits<std::time_t>::min(), "OLDER"}};
+          {today, "Today"}, {today - 86400, "Yesterday"},
+          {today - 6 * 86400, "Previous 7 days"},
+          {today - 29 * 86400, "Previous 30 days"},
+          {std::numeric_limits<std::time_t>::min(), "Older"}};
       size_t group = std::size(groups);
       for (const auto &item : items) {
         size_t g = 0;
@@ -2438,11 +2668,11 @@ private:
       std::sort(titles.begin(), titles.end(), by_time);
       std::sort(contents.begin(), contents.end(), by_time);
       if (!titles.empty()) {
-        rows.push_back(label_row(ChatSidebar::Section, "TITLES"));
+        rows.push_back(label_row(ChatSidebar::Section, "Titles"));
         for (const auto &item : titles) chat_row(item);
       }
       if (!contents.empty()) {
-        rows.push_back(label_row(ChatSidebar::Section, "MESSAGES"));
+        rows.push_back(label_row(ChatSidebar::Section, "Messages"));
         size_t shown = 0;
         for (const auto &item : contents) {
           if (++shown > 200) break;
@@ -2869,13 +3099,15 @@ private:
     text += s;
     style.append(s.size(), code);
   }
+  // Quiet speaker lines, as the Windows transcript writes them.
   void speaker(std::string &text, std::string &style, bool assistant,
                const std::string &model = "") {
-    auto label = assistant ? " Assistant" : " You";
-    append(text, style, model.empty() ? label : label + std::string(" \xc2\xb7 ") + model,
-           assistant ? 'B' : 'M');
+    append(text, style, assistant ? "Assistant says:" : "You say:", assistant ? 'B' : 'M');
+    if (assistant && !model.empty())
+      append(text, style, "  " + model, 'Q');
     append(text, style, "\n", assistant ? 'B' : 'M');
   }
+
   void message_text(std::string &text, std::string &style, const std::string &s,
                     char code) {
     for (char c : s) {
