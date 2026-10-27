@@ -25,6 +25,7 @@
 #include <fontconfig/fontconfig.h>
 #define LCB_CLASSIC_GLYPH_DATA
 #include "classic_glyphs.h"
+#include "shortcuts.h"
 #include <algorithm>
 #include <chrono>
 #include <clocale>
@@ -592,6 +593,57 @@ public:
       copy_tooltip(text.c_str());
     }
     return result;
+  }
+};
+// Help > Keyboard shortcuts: the shared table, drawn like the model list.
+class ShortcutTable : public Fl_Table_Row {
+public:
+  ShortcutTable(int X, int Y, int W, int H) : Fl_Table_Row(X, Y, W, H) {
+    end();
+    box(FL_THIN_DOWN_FRAME);
+    color(FL_WHITE);
+    type(SELECT_SINGLE);
+    rows(LcbShortcutCount);
+    cols(3);
+    col_header(1);
+    col_header_height(23);
+    row_header(0);
+    row_height_all(21);
+    // Every row fits, so no room is kept for a scrollbar.
+    int available = W - 4;
+    col_width(0, 80);
+    col_width(1, available - 270);
+    col_width(2, 190);
+  }
+  void draw_cell(TableContext context, int R, int C, int X, int Y, int W,
+                 int H) override {
+    static const char *headings[] = {"Group", "Action", "Keys"};
+    if (context == CONTEXT_COL_HEADER) {
+      edge(X, Y, W, H, Face);
+      fl_font(FL_HELVETICA, 12);
+      fl_color(Ink);
+      ClassicTable::cell_text(headings[C], X + 5, Y, W - 10, H);
+      return;
+    }
+    if (context != CONTEXT_CELL || R < 0 || R >= rows())
+      return;
+    const auto &shortcut = lcb_shortcuts[R];
+    bool active = row_selected(R);
+    // The group shows once, on the first row of each run.
+    bool repeat = R && !std::strcmp(shortcut.group, lcb_shortcuts[R - 1].group);
+    fl_push_clip(X, Y, W, H);
+    fl_color(active ? Title : FL_WHITE);
+    fl_rectf(X, Y, W, H);
+    fl_color(fl_rgb_color(219, 218, 206));
+    fl_line(X + W - 1, Y, X + W - 1, Y + H - 1);
+    fl_line(X, Y + H - 1, X + W - 1, Y + H - 1);
+    fl_color(active ? FL_WHITE : Ink);
+    fl_font(FL_HELVETICA, 12);
+    ClassicTable::cell_text(C == 0   ? (repeat ? "" : shortcut.group)
+                            : C == 1 ? shortcut.action
+                                     : shortcut.keys,
+                            X + 5, Y, W - 10, H);
+    fl_pop_clip();
   }
 };
 // Rows are stored by index in the browser text, so geometry and drawing look
@@ -1351,8 +1403,11 @@ private:
     g = config.generation(model_path);
     build();
     end();
+    // FLTK closes windows on Escape; here Escape only stops a reply.
     callback(
         +[](Fl_Widget *, void *v) {
+          if (Fl::event() == FL_SHORTCUT && Fl::event_key() == FL_Escape)
+            return;
           static_cast<Window *>(v)->request_close();
         },
         this);
@@ -1434,6 +1489,11 @@ public:
 
         (Fl::event_key() == FL_Page_Up || Fl::event_key() == FL_Page_Down)) {
       guard([&] { step_chat(Fl::event_key() == FL_Page_Up ? -1 : 1); });
+      return 1;
+    }
+    if ((event == FL_SHORTCUT || event == FL_KEYBOARD) &&
+        Fl::event_state(FL_CTRL) && Fl::event_key() == FL_Tab) {
+      guard([&] { step_chat(Fl::event_state(FL_SHIFT) ? -1 : 1); });
       return 1;
     }
     if (event == FL_PUSH || event == FL_KEYBOARD || event == FL_RELEASE) {
@@ -1641,6 +1701,7 @@ private:
     add("&Model/Engine log", 0, [&] { engine_details(); });
     add("&Tools/Engine options...", FL_CTRL + ',', [&] { settings_dialog(); });
     add("&Tools/Setup...", 0, [&] { setup(); });
+    add("&Help/Keyboard shortcuts", FL_F + 1, [&] { show_shortcuts(); });
     add("&Help/About", 0, [&] {
       fl_message("LCB-AI " LCB_VERSION
                  "\nLarkin Computing Bureau\n\nNative Linux workbench: "
@@ -1649,7 +1710,8 @@ private:
     });
     for (const char *path : {"&File/New workspace...", "&File/Delete chat...",
                              "&Edit/Copy", "&View/Output", "&View/Next chat",
-                             "&Chat/Stop response", "&Model/Open model file..."}) {
+                             "&Chat/Stop response", "&Model/Open model file...",
+                             "&Help/Keyboard shortcuts"}) {
       int index = menu->find_index(path);
       menu->mode(index, menu->mode(index) | FL_MENU_DIVIDER);
     }
@@ -3766,6 +3828,21 @@ private:
       config.save();
     }
   }
+  void show_shortcuts() {
+    Fl_Double_Window dialog(x() + (w() - 520) / 2, y() + (h() - 559) / 2, 520, 559,
+                            "Keyboard shortcuts");
+    dialog.color(Face);
+    dialog.begin();
+    ShortcutTable table(12, 12, 496, 500);
+    Fl_Return_Button close(422, 522, 86, 25, "Close");
+    close.labelsize(12);
+    close.callback(+[](Fl_Widget *w, void *) { w->window()->hide(); });
+    dialog.end();
+    dialog.set_modal();
+    dialog.show();
+    while (dialog.shown())
+      Fl::wait();
+  }
   void setup() {
     int choice = fl_choice(
         "LCB-AI runs a local Linux llama-server with your existing "
@@ -4238,12 +4315,13 @@ int main(int argc, char **argv) {
     std::signal(SIGTERM, exit_signal);
     std::signal(SIGINT, exit_signal);
     Fl::lock();
-    // Text editors consume page keys before their parent receives them.
-    // Dispatch document-switching shortcuts first, but leave modal input alone.
+    // Text editors consume page and tab keys before their parent receives them.
+    // Dispatch chat-switching shortcuts first, but leave modal input alone.
     Fl::event_dispatch(+[](int event, Fl_Window *window) {
+      int modifiers = Fl::event_state() & (FL_CTRL | FL_ALT | FL_SHIFT), key = Fl::event_key();
       if (event == FL_KEYBOARD && !Fl::modal() && !Fl::grab() &&
-          (Fl::event_state() & (FL_CTRL | FL_ALT | FL_SHIFT)) == FL_CTRL &&
-          (Fl::event_key() == FL_Page_Up || Fl::event_key() == FL_Page_Down) &&
+          ((modifiers == FL_CTRL && (key == FL_Page_Up || key == FL_Page_Down)) ||
+           ((modifiers & ~FL_SHIFT) == FL_CTRL && key == FL_Tab)) &&
           dynamic_cast<Window *>(window))
         return window->handle(event);
       return Fl::handle_(event, window);

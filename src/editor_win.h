@@ -9,4 +9,6 @@ int edit_workspace(HWND owner, HFONT font, const wchar_t *title,
     wchar_t *name, size_t namecap, wchar_t *prompt, size_t promptcap);
 int edit_engine_arguments(HWND owner, HFONT font, wchar_t *arguments, size_t capacity);
 int edit_message(HWND owner, HFONT font, wchar_t *prompt, size_t promptcap);
+/* Help > Keyboard shortcuts: the shared table in a read-only list. */
+void show_shortcuts(HWND owner, HFONT font);
 #endif

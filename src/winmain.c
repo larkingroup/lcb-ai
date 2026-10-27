@@ -34,7 +34,7 @@ enum { IdModules = 100, IdPrompt, IdSend, IdNew, IdPort, IdExit, IdAbout,
 	IdRecursive, IdModels, IdChatTabs, IdLibraryTabs, IdDetails,
 	IdStop, IdCloseTab, IdGeneration, IdValue, IdViewLeft, IdViewRight, IdViewOutput, IdResetLayout, IdSetup,
 	IdExchange, IdRetry, IdResend, IdDeleteChat, IdOpenChat, IdEngineArguments, IdOutputTabs,
-    IdLatest, IdViewChats, IdChatSearch, IdSidebarMenu, IdRename, IdPin, IdFindChat, IdInsertText,
+    IdLatest, IdViewChats, IdChatSearch, IdSidebarMenu, IdRename, IdPin, IdFindChat, IdInsertText, IdShortcuts,
     IdMoveFirst = 3000,
 	ReplyReady = WM_APP + 1, HealthReady, LibraryReady, StreamReady, BudgetReady, SettingsReady, TelemetryReady,
     TitleReady };
@@ -2768,6 +2768,7 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 			if(HIWORD(wp)==EN_CHANGE && app.send) { app.epoch++; app.health=EngineOffline; refreshcontrols(); }
 			break;
 		case IdExit: SendMessageW(window,WM_CLOSE,0,0); break;
+		case IdShortcuts: show_shortcuts(window,app.normal); break;
 		case IdAbout:
 			MessageBoxW(window,L"lcb-ai\nVersion 0.18.0\n\nLocal AI processor and interface.\n\n"
 			    L"Larkin Computing Bureau",L"About lcb-ai",MB_OK);
@@ -2819,6 +2820,16 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
         KillTimer(window,1); KillTimer(window,2); PostQuitMessage(0); return 0;
 	}
 	return DefWindowProcW(window,message,wp,lp);
+}
+
+/* Runs a menu command from its keyboard shortcut unless the menu shows it
+ * unavailable; the keys are listed in shortcuts.h. */
+static void
+shortcut(int id)
+{
+    UINT state=GetMenuState(GetMenu(app.window),(UINT)id,MF_BYCOMMAND);
+    if(state!=(UINT)-1 && (state&(MF_GRAYED|MF_DISABLED))) return;
+    SendMessageW(app.window,WM_COMMAND,(WPARAM)id,0);
 }
 
 int WINAPI
@@ -2877,33 +2888,35 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	AppendMenuW(file,MF_SEPARATOR,0,NULL);
 	AppendMenuW(file,MF_STRING,IdNewWorkspace,L"New &workspace...");
 	AppendMenuW(file,MF_STRING,IdEditWorkspace,L"Workspace &settings...");
-	AppendMenuW(file,MF_SEPARATOR,0,NULL); AppendMenuW(file,MF_STRING,IdExit,L"E&xit");
-    AppendMenuW(view,MF_STRING,IdViewLeft,L"Show / hide &Chats sidebar");
+	AppendMenuW(file,MF_SEPARATOR,0,NULL); AppendMenuW(file,MF_STRING,IdExit,L"E&xit\tCtrl+Q");
+    AppendMenuW(view,MF_STRING,IdViewLeft,L"Show / hide &Chats sidebar\tF9");
     AppendMenuW(view,MF_STRING,IdViewChats,L"Show / hide chat &tabs");
     AppendMenuW(view,MF_STRING,IdViewRight,L"Show / hide &Properties");
-    AppendMenuW(view,MF_STRING,IdViewOutput,L"Show / hide &Output");
+    AppendMenuW(view,MF_STRING,IdViewOutput,L"Show / hide &Output\tF12");
     AppendMenuW(view,MF_SEPARATOR,0,NULL);
     AppendMenuW(view,MF_STRING,IdResetLayout,L"&Reset layout");
     AppendMenuW(engine,MF_STRING,IdStop,L"&Stop generation\tEsc");
-    AppendMenuW(settings,MF_STRING,IdGeneration,L"&Generation properties");
+    AppendMenuW(settings,MF_STRING,IdGeneration,L"&Generation properties\tAlt+Enter");
     AppendMenuW(settings,MF_STRING,IdSetup,L"&Setup...");
-    AppendMenuW(settings,MF_STRING,IdEngineArguments,L"Engine &arguments...");
+    AppendMenuW(settings,MF_STRING,IdEngineArguments,L"Engine &arguments...\tCtrl+,");
     AppendMenuW(edit,MF_STRING,IdCopy,L"&Copy\tCtrl+C");
 	AppendMenuW(edit,MF_SEPARATOR,0,NULL);
-	AppendMenuW(edit,MF_STRING,IdRetry,L"&Retry selected exchange");
-	AppendMenuW(edit,MF_STRING,IdResend,L"&Edit and resend...");
+	AppendMenuW(edit,MF_STRING,IdRetry,L"&Retry selected exchange\tCtrl+R");
+	AppendMenuW(edit,MF_STRING,IdResend,L"&Edit and resend...\tCtrl+E");
 	AppendMenuW(edit,MF_SEPARATOR,0,NULL);
 	AppendMenuW(edit,MF_STRING,IdInsertText,L"Insert text &file...");
-	AppendMenuW(edit,MF_STRING,IdFindChat,L"&Find chat\tCtrl+K");
+	AppendMenuW(edit,MF_STRING,IdFindChat,L"&Find chat\tCtrl+F");
 	AppendMenuW(file,MF_STRING,IdRename,L"&Rename conversation\tF2");
 	AppendMenuW(file,MF_STRING,IdPin,L"&Pin or unpin conversation");
-	AppendMenuW(engine,MF_STRING,IdBrowse,L"Select &model...");
+	AppendMenuW(engine,MF_STRING,IdBrowse,L"Select &model...\tCtrl+O");
 	AppendMenuW(engine,MF_STRING,IdEngine,L"Select &engine...");
 	AppendMenuW(engine,MF_SEPARATOR,0,NULL);
-	AppendMenuW(engine,MF_STRING,IdLoad,L"&Load model");
+	AppendMenuW(engine,MF_STRING,IdLoad,L"&Load model\tF5");
 	AppendMenuW(engine,MF_STRING,IdUnload,L"&Unload model");
 	AppendMenuW(settings,MF_STRING,IdLibrary,L"Model &library...");
 	AppendMenuW(settings,MF_STRING,IdEditWorkspace,L"&Workspace...");
+	AppendMenuW(help,MF_STRING,IdShortcuts,L"&Keyboard shortcuts\tF1");
+	AppendMenuW(help,MF_SEPARATOR,0,NULL);
 	AppendMenuW(help,MF_STRING,IdAbout,L"&About lcb-ai");
 	AppendMenuW(menu,MF_POPUP,(UINT_PTR)file,L"&File");
 	AppendMenuW(menu,MF_POPUP,(UINT_PTR)edit,L"&Edit");
@@ -3036,6 +3049,11 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
             if(msg.wParam==VK_ESCAPE) { app.property=-1; ShowWindow(app.value,SW_HIDE); SetFocus(app.generation); continue; }
         }
         if(msg.message==WM_KEYDOWN && msg.wParam==VK_ESCAPE && app.busy) { stopreply(); continue; }
+        if(msg.message==WM_KEYDOWN && !(GetKeyState(VK_CONTROL)&0x8000)) {
+            int id=msg.wParam==VK_F1?IdShortcuts:msg.wParam==VK_F5?IdLoad:msg.wParam==VK_F9?IdViewLeft:msg.wParam==VK_F12?IdViewOutput:0;
+            if(id) { shortcut(id); continue; }
+        }
+        if(msg.message==WM_SYSKEYDOWN && msg.wParam==VK_RETURN) { shortcut(IdGeneration); continue; }
         if(msg.message==WM_KEYDOWN && GetFocus()==app.generation && msg.wParam==VK_RETURN) { editproperty(); continue; }
         if(msg.message==WM_KEYDOWN && (GetKeyState(VK_CONTROL)&0x8000)) {
             if(msg.wParam=='A') {
@@ -3045,13 +3063,19 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
             }
             if(msg.wParam=='W') { closetab(); continue; }
             if(msg.wParam=='K') { SendMessageW(app.window,WM_COMMAND,IdFindChat,0); continue; }
-            if(msg.wParam==VK_TAB && app.ntabs) {
-                int index=TabCtrl_GetCurSel(app.chattabs),step=(GetKeyState(VK_SHIFT)&0x8000)?app.ntabs-1:1;
+            if((msg.wParam==VK_TAB || msg.wParam==VK_PRIOR || msg.wParam==VK_NEXT) && app.ntabs) {
+                int back=msg.wParam==VK_TAB?(GetKeyState(VK_SHIFT)&0x8000)!=0:msg.wParam==VK_PRIOR;
+                int index=TabCtrl_GetCurSel(app.chattabs),step=back?app.ntabs-1:1;
                 activatechat(app.tabs[(index+step)%app.ntabs]); continue;
             }
 			if(msg.wParam=='C' && GetFocus()==app.details) { copyselection(); continue; }
 			if(msg.wParam==VK_RETURN) { submit(); continue; }
 			if(msg.wParam=='N') { SendMessageW(app.window,WM_COMMAND,IdNew,0); continue; }
+			{
+				int id=msg.wParam=='F'?IdFindChat:msg.wParam=='Q'?IdExit:msg.wParam=='R'?IdRetry:msg.wParam=='E'?IdResend:
+				    msg.wParam=='O'?IdBrowse:msg.wParam==VK_OEM_COMMA?IdEngineArguments:0;
+				if(id) { shortcut(id); continue; }
+			}
 		}
 		if(!IsDialogMessageW(app.window,&msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
 	}

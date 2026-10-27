@@ -2,6 +2,9 @@
 #include <uxtheme.h>
 #include <dwmapi.h>
 #include <wchar.h>
+#include <string.h>
+#include <commctrl.h>
+#include "shortcuts.h"
 
 typedef struct Editor Editor;
 struct Editor {
@@ -113,4 +116,70 @@ int edit_message(HWND owner, HFONT font, wchar_t *prompt, size_t promptcap)
 int edit_engine_arguments(HWND owner, HFONT font, wchar_t *arguments, size_t capacity)
 {
     return edit_text(owner,font,L"Engine arguments",NULL,0,arguments,capacity,1);
+}
+
+static LRESULT CALLBACK
+shortcutsproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
+{
+	int *done=(int *)GetWindowLongPtrW(window,GWLP_USERDATA);
+	if(message==WM_NCCREATE) SetWindowLongPtrW(window,GWLP_USERDATA,(LONG_PTR)((CREATESTRUCTW *)lp)->lpCreateParams);
+	else if(done && (message==WM_CLOSE || (message==WM_COMMAND && (LOWORD(wp)==IDOK || LOWORD(wp)==IDCANCEL)))) { *done=1; return 0; }
+	return DefWindowProcW(window,message,wp,lp);
+}
+
+void show_shortcuts(HWND owner, HFONT font)
+{
+	WNDCLASSW wc={0};
+	HWND window, list;
+	RECT r, bounds={0,0,520,559};
+	MSG msg;
+	HDC dc=GetDC(owner);
+	int dpi=GetDeviceCaps(dc,LOGPIXELSY), done=0, i, row;
+	HBRUSH brush=CreateSolidBrush(RGB(223,220,207));
+	DWORD corner=1, caption=RGB(223,220,207);
+	LVCOLUMNW column={0};
+	static const wchar_t *headings[]={L"Group",L"Action",L"Keys"};
+	static const int widths[]={80,226,186};
+	ReleaseDC(owner,dc);
+	wc.lpfnWndProc=shortcutsproc; wc.hInstance=GetModuleHandleW(NULL);
+	wc.hCursor=LoadCursorW(NULL,IDC_ARROW); wc.hbrBackground=brush; wc.lpszClassName=L"LCBShortcuts";
+	if(!RegisterClassW(&wc)) { DeleteObject(brush); return; }
+	bounds.right=MulDiv(bounds.right,dpi,96); bounds.bottom=MulDiv(bounds.bottom,dpi,96);
+	AdjustWindowRect(&bounds,WS_CAPTION|WS_SYSMENU|WS_DLGFRAME,FALSE);
+	GetWindowRect(owner,&r);
+	window=CreateWindowExW(WS_EX_DLGMODALFRAME,wc.lpszClassName,L"Keyboard shortcuts",WS_CAPTION|WS_SYSMENU|WS_DLGFRAME,
+	    r.left+(r.right-r.left-(bounds.right-bounds.left))/2,r.top+(r.bottom-r.top-(bounds.bottom-bounds.top))/2,
+	    bounds.right-bounds.left,bounds.bottom-bounds.top,owner,NULL,wc.hInstance,&done);
+	if(!window) { UnregisterClassW(wc.lpszClassName,wc.hInstance); DeleteObject(brush); return; }
+	DwmSetWindowAttribute(window,33,&corner,sizeof(corner));
+	DwmSetWindowAttribute(window,35,&caption,sizeof(caption));
+	list=child(window,font,WC_LISTVIEWW,L"",WS_BORDER|WS_TABSTOP|LVS_REPORT|LVS_SINGLESEL|LVS_NOSORTHEADER,0,12,12,496,500,dpi);
+	SendMessageW(list,LVM_SETEXTENDEDLISTVIEWSTYLE,0,LVS_EX_FULLROWSELECT|LVS_EX_GRIDLINES);
+	column.mask=LVCF_TEXT|LVCF_WIDTH;
+	for(i=0;i<3;i++) {
+		column.pszText=(wchar_t *)headings[i]; column.cx=MulDiv(widths[i],dpi,96);
+		SendMessageW(list,LVM_INSERTCOLUMNW,i,(LPARAM)&column);
+	}
+	/* The group shows once, on the first row of each run. */
+	for(i=0;i<LcbShortcutCount;i++) {
+		const char *texts[3]={lcb_shortcuts[i].group,lcb_shortcuts[i].action,lcb_shortcuts[i].keys};
+		wchar_t text[96];
+		LVITEMW item={0};
+		int k;
+		if(i && !strcmp(texts[0],lcb_shortcuts[i-1].group)) texts[0]="";
+		for(k=0;k<3;k++) {
+			MultiByteToWideChar(CP_UTF8,0,texts[k],-1,text,96);
+			item.mask=LVIF_TEXT; item.iItem=i; item.iSubItem=k; item.pszText=text;
+			if(!k) row=(int)SendMessageW(list,LVM_INSERTITEMW,0,(LPARAM)&item);
+			else { item.iItem=row; SendMessageW(list,LVM_SETITEMW,0,(LPARAM)&item); }
+		}
+	}
+	child(window,font,L"BUTTON",L"Close",WS_TABSTOP|BS_DEFPUSHBUTTON,IDOK,422,522,86,25,dpi);
+	EnableWindow(owner,FALSE); ShowWindow(window,SW_SHOW); SetFocus(list);
+	while(!done && GetMessageW(&msg,NULL,0,0)>0) {
+		if(msg.message==WM_KEYDOWN && (msg.wParam==VK_ESCAPE || msg.wParam==VK_F1)) { done=1; continue; }
+		if(!IsDialogMessageW(window,&msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+	}
+	EnableWindow(owner,TRUE); DestroyWindow(window); SetActiveWindow(owner);
+	UnregisterClassW(wc.lpszClassName,wc.hInstance); DeleteObject(brush);
 }
