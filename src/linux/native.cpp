@@ -166,37 +166,51 @@ void Json::add(const Json &value) {
   if (!cJSON_AddItemToArray(p, cJSON_Duplicate(value.p, 1)))
     throw std::bad_alloc();
 }
+namespace {
+// Decodes the code point at s[i] and advances i; throws on invalid UTF-8.
+unsigned decode(const std::string &s, size_t &i) {
+  auto first = static_cast<unsigned char>(s[i++]);
+  unsigned cp = first, remaining = 0, minimum = 0;
+  if (first >= 0xc2 && first <= 0xdf) {
+    cp = first & 31;
+    remaining = 1;
+    minimum = 0x80;
+  } else if (first >= 0xe0 && first <= 0xef) {
+    cp = first & 15;
+    remaining = 2;
+    minimum = 0x800;
+  } else if (first >= 0xf0 && first <= 0xf4) {
+    cp = first & 7;
+    remaining = 3;
+    minimum = 0x10000;
+  } else if (first >= 0x80)
+    throw std::runtime_error("Invalid UTF-8 text.");
+  if (remaining > s.size() - i)
+    throw std::runtime_error("Incomplete UTF-8 text.");
+  while (remaining--) {
+    auto next = static_cast<unsigned char>(s[i++]);
+    if ((next & 0xc0) != 0x80)
+      throw std::runtime_error("Invalid UTF-8 text.");
+    cp = (cp << 6) | (next & 63);
+  }
+  if (cp < minimum || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff))
+    throw std::runtime_error("Invalid Unicode code point.");
+  return cp;
+}
+// Checks UTF-8 without building a copy; ASCII runs skip the decoder.
+void check_utf8(const std::string &s) {
+  for (size_t i = 0; i < s.size();)
+    if (static_cast<unsigned char>(s[i]) < 0x80)
+      ++i;
+    else
+      decode(s, i);
+}
+} // namespace
 std::wstring wide(const std::string &s) {
   std::wstring out;
-  for (size_t i = 0; i < s.size();) {
-    auto first = static_cast<unsigned char>(s[i++]);
-    unsigned cp = first, remaining = 0, minimum = 0;
-    if (first >= 0xc2 && first <= 0xdf) {
-      cp = first & 31;
-      remaining = 1;
-      minimum = 0x80;
-    } else if (first >= 0xe0 && first <= 0xef) {
-      cp = first & 15;
-      remaining = 2;
-      minimum = 0x800;
-    } else if (first >= 0xf0 && first <= 0xf4) {
-      cp = first & 7;
-      remaining = 3;
-      minimum = 0x10000;
-    } else if (first >= 0x80)
-      throw std::runtime_error("Invalid UTF-8 text.");
-    if (remaining > s.size() - i)
-      throw std::runtime_error("Incomplete UTF-8 text.");
-    while (remaining--) {
-      auto next = static_cast<unsigned char>(s[i++]);
-      if ((next & 0xc0) != 0x80)
-        throw std::runtime_error("Invalid UTF-8 text.");
-      cp = (cp << 6) | (next & 63);
-    }
-    if (cp < minimum || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff))
-      throw std::runtime_error("Invalid Unicode code point.");
-    out.push_back(static_cast<wchar_t>(cp));
-  }
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size();)
+    out.push_back(static_cast<wchar_t>(decode(s, i)));
   return out;
 }
 std::string utf8(const std::wstring &s) {
@@ -240,7 +254,7 @@ void validate_text(const std::string &s, size_t limit, bool empty) {
                              std::to_string(limit / 1024) + " KiB).");
   if (s.find('\0') != s.npos)
     throw std::runtime_error("Text contains NUL characters.");
-  wide(s);
+  check_utf8(s);
 }
 std::string read_file(const fs::path &path, size_t limit) {
   if (fs::is_symlink(path) || !fs::is_regular_file(path))
@@ -420,7 +434,8 @@ Store::Store(fs::path path)
           validate(folder, obj);
           if (obj.str("id") != entry.path().stem().string())
             throw std::runtime_error("Identifier mismatch.");
-          index.emplace(obj.str("id"), obj);
+          auto id = obj.str("id");
+          index.emplace(std::move(id), std::move(obj));
         } catch (const std::exception &) {
           ++skipped;
         }
@@ -464,10 +479,15 @@ void Store::validate(const std::string &folder, const Json &obj) const {
   auto messages = obj.get("messages");
   if (!cJSON_IsArray(messages) || cJSON_GetArraySize(messages) % 2)
     throw std::runtime_error("Incomplete saved conversation.");
+  // Reads each message in place; copying them doubled the cost of loading.
+  struct Borrowed : Json {
+    explicit Borrowed(cJSON *v) : Json(v) {}
+    ~Borrowed() { p = nullptr; }
+  };
   size_t i = 0;
   cJSON *p;
   cJSON_ArrayForEach(p, messages) {
-    Json m(cJSON_Duplicate(p, 1));
+    Borrowed m(p);
     if (m.str("role") != (i % 2 ? "assistant" : "user"))
       throw std::runtime_error("Invalid message order.");
     if (!cJSON_IsString(m.get("content")))
@@ -492,8 +512,8 @@ void Store::save(const std::string &folder, const Json &obj) {
   validate(folder, obj);
   auto &index = folder == "workspaces" ? workspaces : chats;
   auto id = obj.str("id");
-  if (!index.count(id) && index.size() >= (folder == "workspaces" ? 64 : 1024))
-    throw std::runtime_error("Saved workspace/conversation limit reached.");
+  if (folder == "workspaces" && !index.count(id) && index.size() >= 64)
+    throw std::runtime_error("Workspace limit reached (64).");
   atomic_write(root / folder / (id + ".json"), obj.dump());
   index.insert_or_assign(id, obj);
 }

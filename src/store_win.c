@@ -14,6 +14,20 @@ fail(Store *s, const wchar_t *message)
 	return 0;
 }
 
+/* Makes room for one more indexed chat; the index grows without a cap. */
+static int
+roomforchat(Store *s)
+{
+	ChatInfo *grown;
+	size_t capacity;
+	if(s->nchats < s->capchats) return 1;
+	capacity = s->capchats ? s->capchats*2 : 256;
+	grown = realloc(s->chats, capacity*sizeof(*s->chats));
+	if(!grown) return 0;
+	memset(grown+s->capchats, 0, (capacity-s->capchats)*sizeof(*grown));
+	s->chats = grown; s->capchats = capacity; return 1;
+}
+
 static int
 validid(const char *id)
 {
@@ -271,7 +285,7 @@ store_save(Store *s, Chat *chat)
 	if(!validid(chat->info.id) || !store_find_workspace(s,chat->info.workspace) ||
 	    !validtext(chat->info.title,StoreName-1,0) || !validtext(chat->draft,LcbMaxPrompt,1)) return fail(s,L"Invalid chat");
 	for(index=0;index<s->nchats;index++) if(strcmp(s->chats[index].id,chat->info.id)==0) break;
-	if(index==s->nchats && s->nchats==StoreChats) return fail(s,L"Chat limit reached (1024)");
+	if(index==s->nchats && !roomforchat(s)) return fail(s,L"Out of memory");
 	if(chat->conversation.count%2) return fail(s,L"Incomplete conversation");
 	json=cJSON_CreateObject();
 	messages=json?cJSON_AddArrayToObject(json,"messages"):NULL;
@@ -384,7 +398,7 @@ scan(Store *s, int chats)
 			ok=json && chat_parse(json,chat) && strcmp(chat->info.id,id)==0 && store_find_workspace(s,chat->info.workspace);
 			/* Older chats have no stamp; their file time stands in. */
 			if(ok && !chat->info.updated) chat->info.updated=unixtime(data.ftLastWriteTime);
-			if(ok && s->nchats<StoreChats) s->chats[s->nchats++]=chat->info;
+			if(ok && roomforchat(s)) s->chats[s->nchats++]=chat->info;
 
 			else s->skipped++;
 			chat_clear(chat);
@@ -409,8 +423,8 @@ store_open(Store *s, const wchar_t *root)
 	swprintf(name,MAX_PATH,L"%ls\\session.lock",root);
 	s->lock=CreateFileW(name,GENERIC_READ|GENERIC_WRITE,0,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
 	if(s->lock==INVALID_HANDLE_VALUE) { s->lock=NULL; return fail(s,L"Storage is in use or unavailable; close the other lcb-ai window"); }
-	s->workspaces=calloc(StoreWorkspaces,sizeof(*s->workspaces)); s->chats=calloc(StoreChats,sizeof(*s->chats));
-	if(!s->workspaces || !s->chats) goto failed;
+	s->workspaces=calloc(StoreWorkspaces,sizeof(*s->workspaces));
+	if(!s->workspaces) goto failed;
 	swprintf(name,MAX_PATH,L"%ls\\workspaces",root); if(!directory(name)) goto failed;
 	swprintf(name,MAX_PATH,L"%ls\\chats",root); if(!directory(name)) goto failed;
 	if(scan(s,0) && scan(s,1)) return 1;
@@ -424,5 +438,5 @@ store_close(Store *s)
 {
 	if(s->lock) CloseHandle(s->lock);
 	free(s->workspaces); free(s->chats);
-	s->lock=NULL; s->workspaces=NULL; s->chats=NULL; s->nworkspaces=0; s->nchats=0;
+	s->lock=NULL; s->workspaces=NULL; s->chats=NULL; s->nworkspaces=0; s->nchats=0; s->capchats=0;
 }

@@ -87,8 +87,8 @@ static struct {
 	HWND window, modules, transcript, prompt, send, fresh;
 	HWND status, port, load, unload, browse, engine, model, activity, outputtabs, progress;
     HWND latest, explorertoggle, chatstoggle, speed, chatsearch, sidebarmenu;
-    SidebarRow sidebar[StoreChats*2+StoreWorkspaces*2+4];
-    int nsidebar, sidebarhover;
+    SidebarRow *sidebar;
+    int nsidebar, capsidebar, sidebarhover;
     wchar_t sidebartip[StoreName];
 	HWND workspace, newworkspace, editworkspace;
 	HWND chattabs, librarytabs, models, folder, recursive, scan, details, master, folderlabel;
@@ -1650,7 +1650,7 @@ static void sidebarrow(int kind,int index,int indented,int expanded,const wchar_
     LRESULT item;
     SidebarRow *row;
     wchar_t title[StoreName]; size_t i=0,j=0;
-    if(app.nsidebar>=(int)(sizeof(app.sidebar)/sizeof(app.sidebar[0]))) return;
+    if(app.nsidebar>=app.capsidebar) return;
     row=&app.sidebar[app.nsidebar++];
     row->kind=kind; row->index=index; row->indented=indented; row->expanded=expanded;
     while(text[i] && j<StoreName-1) {
@@ -1670,19 +1670,31 @@ static int sidebarmatches(const char *text,const wchar_t *query)
     free(value); return !query[0] || result;
 }
 
-/* Message text per chat for search; rebuilt only when a chat gains turns. */
-static struct { char id[33]; size_t turns; wchar_t *text; } searchcache[StoreChats];
+/* Upper-cased message text per chat for search; rebuilt only when a chat gains turns.
+ * Entries follow the chat index, so lookups stay constant time; when a delete
+ * shifts the index, an entry is found by id once and swapped into place. */
+typedef struct SearchText { char id[33]; size_t turns; wchar_t *text; } SearchText;
+static SearchText *searchcache;
+static size_t nsearchcache;
 
 static const wchar_t *chattext(size_t index)
 {
     const ChatInfo *info=&app.store.chats[index];
-    int slot=-1,i;
+    size_t slot=index,i;
     Chat *chat;
-    for(i=0;i<StoreChats;i++) {
-        if(!strcmp(searchcache[i].id,info->id)) { slot=i; break; }
-        if(slot<0 && !searchcache[i].id[0]) slot=i;
+    if(index>=nsearchcache) {
+        size_t n=app.store.capchats>index?app.store.capchats:index+1;
+        SearchText *grown=realloc(searchcache,n*sizeof(*grown));
+        if(!grown) return L"";
+        memset(grown+nsearchcache,0,(n-nsearchcache)*sizeof(*grown));
+        searchcache=grown; nsearchcache=n;
     }
-    if(slot<0) slot=(int)(index%StoreChats);
+    if(strcmp(searchcache[slot].id,info->id))
+        for(i=0;i<nsearchcache;i++)
+            if(!strcmp(searchcache[i].id,info->id)) {
+                SearchText moved=searchcache[i]; searchcache[i]=searchcache[slot]; searchcache[slot]=moved;
+                break;
+            }
     if(!strcmp(searchcache[slot].id,info->id) && searchcache[slot].turns==info->turns && searchcache[slot].text)
         return searchcache[slot].text;
     free(searchcache[slot].text); searchcache[slot].text=NULL;
@@ -1694,9 +1706,15 @@ static const wchar_t *chattext(size_t index)
         for(k=0;k<chat->conversation.count;k++) n+=strlen(chat->conversation.messages[k].text)+1;
         all=malloc(n+1);
         if(all) {
-            all[0]=0;
-            for(k=0;k<chat->conversation.count;k++) { strcat(all,chat->conversation.messages[k].text); strcat(all,"\n"); }
+            size_t at=0,len;
+            for(k=0;k<chat->conversation.count;k++) {
+                len=strlen(chat->conversation.messages[k].text);
+                memcpy(all+at,chat->conversation.messages[k].text,len); at+=len; all[at++]='\n';
+            }
+            all[at]=0;
             searchcache[slot].text=wide(all); free(all);
+            /* Folded once here so each keystroke is a plain substring scan. */
+            if(searchcache[slot].text) CharUpperBuffW(searchcache[slot].text,(DWORD)wcslen(searchcache[slot].text));
         }
     }
     if(chat) { chat_clear(chat); free(chat); }
@@ -1750,14 +1768,21 @@ listchats(void)
     size_t i;
     int selected=-1,top=(int)SendMessageW(app.modules,LB_GETTOPINDEX,0,0),count=0;
     wchar_t query[StoreName];
-    RecentChat recent[StoreChats];
+    RecentChat *recent=malloc((app.store.nchats+1)*sizeof(*recent));
     long long now=store_now();
+    if(!recent) return;
     GetWindowTextW(app.chatsearch,query,StoreName);
     for(i=0;i<app.store.nchats;i++) { recent[i].index=i; recent[i].modified=(ULONGLONG)app.store.chats[i].updated; }
     qsort(recent,app.store.nchats,sizeof(*recent),recentcompare);
     app.sidebarbusy=1; app.sidebarhover=-1;
     SendMessageW(app.modules,WM_SETREDRAW,FALSE,0);
     SendMessageW(app.modules,LB_RESETCONTENT,0,0); app.nsidebar=0;
+    /* Rows point into this array, so it grows only while the list is empty:
+     * one row per chat plus section headings. */
+    if(app.capsidebar<(int)app.store.nchats+8) {
+        SidebarRow *grown=realloc(app.sidebar,(app.store.nchats+64)*sizeof(*grown));
+        if(grown) { app.sidebar=grown; app.capsidebar=(int)app.store.nchats+64; }
+    }
     if(!query[0]) {
         /* One workspace at a time: pinned first, then by day. */
         const char *ws=app.store.workspaces[app.selected].id;
@@ -1783,12 +1808,14 @@ listchats(void)
     } else {
         /* Titles first, then chats whose messages match, across workspaces. */
         int pass,shown;
+        wchar_t folded[StoreName];
+        wcscpy(folded,query); CharUpperBuffW(folded,(DWORD)wcslen(folded));
         for(pass=0;pass<2;pass++) {
             shown=0;
             for(i=0;i<app.store.nchats;i++) {
                 size_t chat=recent[i].index;
                 int title=sidebarmatches(app.store.chats[chat].title,query);
-                if(pass==0 ? !title : title || FindStringOrdinal(FIND_FROMSTART,chattext(chat),-1,query,-1,TRUE)<0) continue;
+                if(pass==0 ? !title : title || !wcsstr(chattext(chat),folded)) continue;
                 if(!shown++) sidebarrow(SidebarSection,0,0,0,pass?L"Messages":L"Titles");
                 chatrow(chat,&selected); count++;
             }
@@ -1798,7 +1825,7 @@ listchats(void)
     SendMessageW(app.modules,LB_SETCURSEL,selected,0);
     SendMessageW(app.modules,LB_SETTOPINDEX,top,0);
     SendMessageW(app.modules,WM_SETREDRAW,TRUE,0); InvalidateRect(app.modules,NULL,TRUE);
-    app.sidebarbusy=0;
+    app.sidebarbusy=0; free(recent);
 }
 
 static void
@@ -3030,7 +3057,7 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	}
 	engine_stop(&app.process);
 	chat_clear(&app.chat); store_close(&app.store);
-	free(app.library);
+	free(app.library); free(app.sidebar);
 	if(app.icons) ImageList_Destroy(app.icons);
 	DeleteObject(app.normal); DeleteObject(app.fixed); DeleteObject(app.heading);
 	DeleteObject(app.face); DeleteObject(app.paper); FreeLibrary(app.rich);

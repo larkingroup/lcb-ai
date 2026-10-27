@@ -1251,8 +1251,8 @@ class Window : public Fl_Double_Window {
   std::chrono::steady_clock::time_point load_started;
   ChatTabs *tabs;
   Fl_Choice *exchange;
-  Transcript *transcript;
-  Composer *prompt;
+  Transcript *transcript = nullptr;
+  Composer *prompt = nullptr;
   Fl_Text_Buffer text_buffer, style_buffer, prompt_buffer, activity_buffer,
       log_buffer, master_buffer;
   static constexpr int StyleCount = 17;
@@ -1283,7 +1283,7 @@ class Window : public Fl_Double_Window {
       *log_page;
   Fl_Box *properties_label, *projector_label, *generation_help, *folder_label,
       *master_label;
-  Fl_Text_Display *master, *activity, *live_log;
+  Fl_Text_Display *master = nullptr, *activity = nullptr, *live_log = nullptr;
   Fl_Input *projector_text, *folder;
   Fl_Button *use_model_button, *projector_button, *projector_clear,
       *folder_button, *scan_button;
@@ -1304,6 +1304,42 @@ class Window : public Fl_Double_Window {
 public:
   explicit Window(const fs::path &root)
       : Fl_Double_Window(1240, 820, "lcb-ai"), store(root), config(store.root) {
+    // The buffers are members and die before the widgets that show them, so a
+    // failed start detaches them before rethrowing.
+    try {
+      start();
+    } catch (...) {
+      detach_buffers();
+      throw;
+    }
+  }
+  ~Window() override {
+    scan_cancel = true;
+    if (transport)
+      transport->cancel();
+    for (auto &worker : workers)
+      if (worker.thread.joinable())
+        worker.thread.join();
+    Fl::remove_timeout(tick_cb, this);
+    detach_buffers();
+  }
+  void resize(int x, int y, int width, int height) override {
+    Fl_Double_Window::resize(x, y, width, height);
+    if (menu)
+      layout();
+  }
+
+private:
+  void detach_buffers() {
+    if (transcript) {
+      transcript->buffer(nullptr);
+      transcript->highlight_data(nullptr, nullptr, 0, 'A', nullptr, nullptr);
+    }
+    for (Fl_Text_Display *display :
+         std::initializer_list<Fl_Text_Display *>{prompt, master, activity, live_log})
+      if (display) display->buffer(nullptr);
+  }
+  void start() {
     xclass("lcb-ai");
     color(Face);
     size_range(800, 600);
@@ -1390,26 +1426,8 @@ public:
     else if (*folder->value())
       scan();
   }
-  ~Window() override {
-    scan_cancel = true;
-    if (transport)
-      transport->cancel();
-    for (auto &worker : workers)
-      if (worker.thread.joinable())
-        worker.thread.join();
-    Fl::remove_timeout(tick_cb, this);
-    transcript->buffer(nullptr);
-    transcript->highlight_data(nullptr, nullptr, 0, 'A', nullptr, nullptr);
-    prompt->buffer(nullptr);
-    master->buffer(nullptr);
-    activity->buffer(nullptr);
-    live_log->buffer(nullptr);
-  }
-  void resize(int x, int y, int width, int height) override {
-    Fl_Double_Window::resize(x, y, width, height);
-    if (menu)
-      layout();
-  }
+
+public:
   int handle(int event) override {
     if ((event == FL_SHORTCUT || event == FL_KEYBOARD) &&
         Fl::event_state(FL_CTRL) &&
@@ -4235,6 +4253,7 @@ int main(int argc, char **argv) {
     result = Fl::run();
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
+    fl_alert("lcb-ai could not start:\n%s", e.what());
     result = 1;
   }
   return result;

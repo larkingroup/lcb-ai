@@ -7,7 +7,7 @@
 #include <windows.h>
 #include "lcb.h"
 
-enum { StoreName = 241, StoreWorkspaces = 64, StoreChats = 1024 };
+enum { StoreName = 241, StoreWorkspaces = 64 };
 typedef struct Workspace Workspace;
 typedef struct Chat Chat;
 typedef struct ChatInfo ChatInfo;
@@ -23,7 +23,7 @@ struct Store {
 	HANDLE lock;
 	Workspace *workspaces;
 	ChatInfo *chats;
-	size_t nworkspaces, nchats, skipped;
+	size_t nworkspaces, nchats, capchats, skipped;
 };
 
 int store_open(Store *s, const wchar_t *root);
