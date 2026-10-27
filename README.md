@@ -28,6 +28,16 @@ cmake --build build --config Release
 
 Run `lcb-ai.exe` from `build/Release` or `build`.
 
+For Windows on ARM64, build with an ARM64 compiler, for example from Linux with
+[llvm-mingw](https://github.com/mstorsjo/llvm-mingw):
+
+```console
+cmake -S . -B build-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_NAME=Windows \
+  -DCMAKE_SYSTEM_PROCESSOR=ARM64 -DCMAKE_C_COMPILER=aarch64-w64-mingw32-clang \
+  -DCMAKE_RC_COMPILER=aarch64-w64-mingw32-windres -DCMAKE_C_FLAGS=-static
+cmake --build build-arm64
+```
+
 ### Linux
 
 On Fedora, install the build dependencies:
@@ -45,6 +55,8 @@ cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build-linux
 ./build-linux/lcb-ai
 ```
+
+The same steps build on ARM64 (aarch64) Linux.
 
 To package the Linux build:
 

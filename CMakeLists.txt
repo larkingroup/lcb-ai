@@ -7,6 +7,10 @@ set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+if(WIN32)
+    # Windows 10 APIs such as BCryptHash; also the floor for Windows on ARM64.
+    add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)
+endif()
 
 add_library(lcb_core STATIC src/conversation.c src/context.c src/markdown.c src/compatibility.c vendor/cjson/cJSON.c)
 target_include_directories(lcb_core PUBLIC src vendor/cjson)
