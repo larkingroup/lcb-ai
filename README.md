@@ -46,4 +46,12 @@ cmake --build build-linux
 ./build-linux/lcb-ai
 ```
 
-To package the Linux build, run `python3 src/linux/package.py`.
+To package the Linux build:
+
+```console
+cd build-linux && cpack
+```
+
+This writes a relocatable `.tar.gz` (run `bin/lcb-ai` from the extracted folder),
+an `.rpm` when `rpmbuild` is installed, and a `.deb` when `dpkg-deb` is installed,
+each with a SHA-256 checksum. Install the RPM with `sudo dnf install ./lcb-ai-*.rpm`.

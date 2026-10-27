@@ -17,7 +17,6 @@ __pycache__/
 *.cmd
 *.sh
 
-!/src/linux/*.py
 
 # Local tests and validation artifacts
 /tests/
