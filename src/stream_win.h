@@ -8,6 +8,8 @@ int local_stream_observe(unsigned short port, const char *body, HANDLE cancel,
     StreamUpdate update, StreamObserver observer, void *context, char **answer,
     ReplyReport *report, char *error, size_t capacity);
 enum { LocalJsonFailed, LocalJsonOk, LocalJsonTooLarge };
+/* Chat requests may carry base64 media, so they get a larger body limit. */
+enum { LocalMaxChatBody = 64 * 1048576 };
 /* Cancellable, bounded local JSON requests. Only LocalJsonOk supplies an answer. */
 int local_json(unsigned short port, const wchar_t *path, const char *body,
     HANDLE cancel, char **answer, char *error, size_t capacity);

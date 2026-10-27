@@ -23,6 +23,7 @@
 #include "setup_win.h"
 #include "model_settings_win.h"
 #include "context_win.h"
+#include "attachments_win.h"
 #include "markdown.h"
 #include "cJSON.h"
 #include <windowsx.h>
@@ -34,8 +35,8 @@ enum { IdModules = 100, IdPrompt, IdSend, IdNew, IdPort, IdExit, IdAbout,
 	IdRecursive, IdModels, IdChatTabs, IdLibraryTabs, IdDetails,
 	IdStop, IdCloseTab, IdGeneration, IdValue, IdViewLeft, IdViewRight, IdViewOutput, IdResetLayout, IdSetup,
 	IdExchange, IdRetry, IdResend, IdDeleteChat, IdOpenChat, IdEngineArguments, IdOutputTabs,
-    IdLatest, IdViewChats, IdChatSearch, IdSidebarMenu, IdRename, IdPin, IdFindChat, IdInsertText, IdShortcuts,
-    IdMoveFirst = 3000,
+    IdLatest, IdViewChats, IdChatSearch, IdSidebarMenu, IdRename, IdPin, IdFindChat, IdInsertText, IdShortcuts, IdAttach, IdProjector, IdTextOnly,
+    IdMoveFirst = 3000, IdAttachFirst = 3200, IdAttachClear = 3300,
 	ReplyReady = WM_APP + 1, HealthReady, LibraryReady, StreamReady, BudgetReady, SettingsReady, TelemetryReady,
     TitleReady };
 
@@ -71,13 +72,14 @@ struct Work {
 	Generation settings;
 	ContextBudget budget;
 	ReplyReport report;
-	wchar_t modelpath[MAX_PATH];
+	wchar_t modelpath[MAX_PATH], root[MAX_PATH];
+	char *attachments; /* The new message's saved files. */
 };
 
 typedef struct SettingsWork {
     HWND window;
     unsigned epoch;
-    wchar_t model[MAX_PATH], config[MAX_PATH];
+    wchar_t model[MAX_PATH], config[MAX_PATH], projector[MAX_PATH];
     Generation settings;
     ModelInfo info;
     int model_ok;
@@ -138,6 +140,9 @@ static struct {
 	ULONGLONG started, loadstarted;
 	double lastseconds;
     int pendingsend;
+    HWND attach;
+    wchar_t projector[MAX_PATH]; /* The model's media projector; empty is text only. */
+    int mediaengine; /* The running engine has the projector loaded. */
     HWND renamer;
     char renaming[33];
     HANDLE titlecancel;
@@ -172,6 +177,7 @@ static void beginrename(const char *id);
 static void quicktitle(const char *text,char out[StoreName]);
 static void suggesttitle(const char *id,const char *question,const char *answer,unsigned short port);
 static void inserttext(void);
+static void attachmenu(void);
 static int runsetup(void);
 static const wchar_t *basenamew(const wchar_t *path);
 static LRESULT CALLBACK classiccontrol(HWND,UINT,WPARAM,LPARAM,UINT_PTR,DWORD_PTR);
@@ -380,7 +386,7 @@ static int compatibility_dialog(int failure)
 }
 
 static void
-loadmodel(void)
+loadmodel(int media)
 {
 	wchar_t error[256];
 	unsigned short port = getport();
@@ -398,7 +404,10 @@ loadmodel(void)
     if(app.model_info.runtime_requirement && !compatibility_dialog(0)) {
         note(L"Load deferred. Select an engine with the required model support."); return;
     }
-    if(!engine_start_arguments(&app.process, app.enginepath, app.modelpath, port, app.settings.context_tokens, app.extra_arguments, error, 256)) { note(error); return; }
+    /* The projector costs memory and context, so it loads only for media chats. */
+    if(!engine_start_arguments(&app.process, app.enginepath, app.modelpath, port, app.settings.context_tokens, app.extra_arguments,
+        media ? app.projector : NULL, error, 256)) { note(error); return; }
+    app.mediaengine=media && app.projector[0];
 	app.epoch++; app.health = EngineLoading; app.loadstarted = GetTickCount64();
 	note(L"Loading model..."); refreshcontrols();
 }
@@ -654,6 +663,95 @@ runsetup(void)
 }
 
 static void
+setprojector(const wchar_t *path)
+{
+	wchar_t line[MAX_PATH+96];
+	if(!app.modelpath[0]) { note(L"Select a model first."); return; }
+	wcscpy(app.projector,path);
+	model_projector_save(app.config,app.modelpath,path);
+	if(path[0]) swprintf(line,MAX_PATH+96,L"Media projector: %ls. It loads when a chat has images, audio or video.",basenamew(path));
+	else wcscpy(line,L"Text only: no media projector loads for this model.");
+	note(line);
+}
+
+static void
+chooseprojector(void)
+{
+	OPENFILENAMEW of={0};
+	wchar_t path[MAX_PATH];
+	ModelInfo *info;
+	int ok;
+	if(!app.modelpath[0]) { note(L"Select a model first."); return; }
+	wcscpy(path,app.projector);
+	of.lStructSize=sizeof(of); of.hwndOwner=app.window; of.lpstrFile=path; of.nMaxFile=MAX_PATH;
+	of.lpstrTitle=L"Select the model's media projector (mmproj)";
+	of.lpstrFilter=L"Media projector (*.gguf)\0*.gguf\0\0";
+	of.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR|OFN_DONTADDTORECENT;
+	if(!GetOpenFileNameW(&of)) return;
+	info=calloc(1,sizeof(*info));
+	ok=info && model_read(path,info) && info->projector;
+	free(info);
+	if(!ok) { MessageBoxW(app.window,L"This GGUF is not a media projector. Choose the model's mmproj file.",L"lcb-ai",MB_OK|MB_ICONWARNING); return; }
+	setprojector(path);
+}
+
+/* Attach adds an image, audio or video file; once files are attached it also
+ * offers to remove them. Text files go into the message with Insert text file. */
+static void
+attachmenu(void)
+{
+	int n=attach_count(app.chat.draftattachments), i, command=IdAttach;
+	wchar_t path[MAX_PATH]=L"", error[256];
+	char *next=NULL;
+	if(!app.ntabs) return;
+	if(n) {
+		HMENU menu=CreatePopupMenu();
+		wchar_t name[260], item[300];
+		RECT r;
+		AppendMenuW(menu,MF_STRING|(n<AttachMax?0:MF_GRAYED),IdAttach,L"&Add file...");
+		AppendMenuW(menu,MF_SEPARATOR,0,NULL);
+		for(i=0;i<n;i++) {
+			attach_name(app.chat.draftattachments,i,name,260);
+			swprintf(item,300,L"Remove %ls",name);
+			AppendMenuW(menu,MF_STRING,IdAttachFirst+i,item);
+		}
+		AppendMenuW(menu,MF_STRING,IdAttachClear,L"Remove &all");
+		GetWindowRect(app.attach,&r);
+		command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,r.left,r.bottom,0,app.window,NULL);
+		DestroyMenu(menu);
+	}
+	if(command==IdAttach) {
+		OPENFILENAMEW of={0};
+		of.lStructSize=sizeof(of); of.hwndOwner=app.window; of.lpstrFile=path; of.nMaxFile=MAX_PATH;
+		of.lpstrTitle=L"Attach an image, audio or video file";
+		of.lpstrFilter=attach_filter();
+		of.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR|OFN_DONTADDTORECENT;
+		if(!GetOpenFileNameW(&of)) return;
+		if(attach_is_text(path)) { note(L"Text and code files go into the message: use Edit > Insert text file."); return; }
+		if(!(next=attach_import(app.dataroot,app.chat.draftattachments,path,error,256))) { note(error); return; }
+	} else if(command>=IdAttachFirst && command<IdAttachFirst+n) {
+		next=attach_remove(app.chat.draftattachments,command-IdAttachFirst);
+		if(!next && n>1) { note(L"Cannot remove the attachment: out of memory."); return; }
+	} else if(command!=IdAttachClear) return;
+	free(app.chat.draftattachments); app.chat.draftattachments=next;
+	app.dirty=1; savechat();
+	if(attach_media_count(next) && !app.projector[0])
+		note(L"Choose this model's media projector with Engine > Select media projector before sending.");
+	InvalidateRect(app.window,NULL,FALSE); refreshcontrols();
+}
+
+/* "Attached: a.png, b.wav" under a user message. */
+static void
+appendfiles(const char *list)
+{
+	wchar_t names[1024], line[1040];
+	attach_summary(list,names,1024);
+	if(!names[0]) return;
+	swprintf(line,1040,L"\r\nAttached: %ls",names);
+	appendstyle(line,Muted,0,9);
+}
+
+static void
 selectmodel(int use)
 {
 	int row=ListView_GetNextItem(app.models,-1,LVNI_SELECTED);
@@ -665,7 +763,7 @@ selectmodel(int use)
 	m=&app.library->models[item.lParam];
 	modelproperties(m);
 	if(!use) return;
-	if(m->projector) { note(L"This is a projector companion. Select a language model."); return; }
+	if(m->projector) { setprojector(m->path); return; }
 	if(app.busy || app.process.process || app.health==EngineReady) { note(L"Unload the current model before selecting another."); return; }
 	commitproperty();
 	wcscpy(app.modelpath,m->path); SetWindowTextW(app.model,m->name); loadsettings(); saveconfig(); note(L"Model selected. Choose Load to start it.");
@@ -760,6 +858,7 @@ render(void)
             appendthinking(c->messages[i].reasoning,i/2);
         }
         appendmessage(c->messages[i].text,(int)(i%2),0);
+        if(i%2==0 && c->messages[i].attachments) appendfiles(c->messages[i].attachments);
         if(i%2) {
             const wchar_t *state=c->messages[i].status==AnswerStopped?L"Stopped":
                 c->messages[i].status==AnswerLength?L"Response limit reached":
@@ -826,7 +925,7 @@ refreshcontrols(void)
 	EnableMenuItem(GetMenu(app.window),IdResend,MF_BYCOMMAND|
 	    (app.ntabs && !app.busy && !app.settings_pending && app.chat.conversation.count>0?MF_ENABLED:MF_GRAYED));
     EnableWindow(app.stop,app.busy && app.cancel && WaitForSingleObject(app.cancel,0)!=WAIT_OBJECT_0);
-    EnableWindow(app.chattabs,TRUE); EnableWindow(app.closetab,app.ntabs!=0);
+    EnableWindow(app.chattabs,TRUE); EnableWindow(app.closetab,app.ntabs!=0); EnableWindow(app.attach,app.ntabs!=0);
     EnableWindow(app.generation,!app.busy && !app.settings_pending);
 	/* Chats stay browsable while a reply streams into one of them. */
 	EnableWindow(app.modules, TRUE);
@@ -867,8 +966,17 @@ workfree(Work *w)
 	free(w->answer);
     free(w->reasoning);
 	free(w->instruction);
+	free(w->attachments);
 	conversation_clear(&w->history);
 	free(w);
+}
+
+/* The sent message keeps its files; the draft drops them unless they changed meanwhile. */
+static void
+keepfiles(Message *sent, char **draft, Work *w)
+{
+	if(*draft && w->attachments && !strcmp(*draft,w->attachments)) { free(*draft); *draft=NULL; }
+	sent->attachments=w->attachments; w->attachments=NULL;
 }
 
 struct StreamSnapshot {
@@ -909,6 +1017,7 @@ static void render_pending(void)
     if(!app.chat.conversation.count) SetWindowTextW(app.transcript,L"");
     appendspeaker(0);
     appendmessage(app.work->prompt,0,0);
+    if(app.work->attachments) appendfiles(app.work->attachments);
     appendstyle(L"\r\n\r\n",Ink,0,10);
     appendspeaker(1);
     SendMessageW(app.transcript,EM_EXGETSEL,0,(LPARAM)&caret); app.answerstart=caret.cpMax;
@@ -937,7 +1046,7 @@ complete(void *arg)
 {
     Work *w=arg;
     Module module={"Workspace",w->instruction};
-    if(local_prepare(w->port,w->modelpath,w->conversation,&module,w->prompt,&w->settings,
+    if(local_prepare(w->port,w->modelpath,w->conversation,&module,w->prompt,&w->settings,w->root,w->attachments,
         w->cancel,&w->request,&w->budget,w->error,sizeof(w->error))) {
         PostMessageW(w->target,BudgetReady,0,(LPARAM)w);
         w->ok=local_stream_observe(w->port,w->request,w->cancel,NULL,streamobserve,w,&w->answer,&w->report,w->error,sizeof(w->error));
@@ -962,11 +1071,23 @@ submit(void)
 	HANDLE thread;
 	Work *w;
 	Module module;
+	int media, attached;
 	if(!app.ntabs || app.busy || app.settings_pending) return;
+	attached=attach_count(app.chat.draftattachments);
+	media=attach_media_count(app.chat.draftattachments);
+	if(media && !app.projector[0]) {
+		note(L"Images, audio and video need the model's media projector. Choose it with Engine > Select media projector.");
+		return;
+	}
+	if(media && app.process.process && !app.mediaengine) {
+		if(MessageBoxW(app.window,L"Attachments need the model's media projector, which loads only when needed.\n\n"
+		    L"Reload the model with it now? Your message sends once it is ready.",L"lcb-ai",MB_YESNO|MB_ICONQUESTION)!=IDYES) return;
+		app.epoch++; engine_stop(&app.process); app.health=EngineOffline; app.mediaengine=0;
+	}
 	/* Send loads the model when needed and goes out once it is ready. */
 	if(app.health != EngineReady) {
-		if(GetWindowTextLength(app.prompt)==0) return;
-		if(!app.process.process) loadmodel();
+		if(GetWindowTextLength(app.prompt)==0 && !attached) return;
+		if(!app.process.process) loadmodel(media>0);
 		if(app.process.process) { app.pendingsend=1; note(L"Loading model. Your message sends when it is ready."); refreshcontrols(); }
 		return;
 	}
@@ -983,13 +1104,20 @@ submit(void)
 		return;
 	}
 	n = GetWindowTextLength(app.prompt);
-	if(n == 0) return;
+	if(n == 0 && !attached) return;
 	input = calloc((size_t)n + 1, sizeof(*input));
 	w = calloc(1, sizeof(*w));
 	if(input == NULL || w == NULL) { free(input); free(w); return; }
 	GetWindowText(app.prompt, input, n + 1);
-	w->prompt = utf8(input);
+	/* Files alone still need a message, as on Linux. */
+	w->prompt = utf8(n ? input : media ? L"Describe the attached media." : L"Review the attached file.");
 	free(input);
+	if(attached) {
+		w->attachments=malloc(strlen(app.chat.draftattachments)+1);
+		if(!w->attachments) { workfree(w); note(L"Cannot prepare message: out of memory."); return; }
+		strcpy(w->attachments,app.chat.draftattachments);
+	}
+	wcscpy(w->root,app.dataroot);
 	w->instruction=malloc(strlen(module.instruction)+1);
 	if(w->instruction) strcpy(w->instruction,module.instruction);
 	if(!w->prompt || !w->instruction || strlen(w->prompt)>LcbMaxPrompt) {
@@ -1001,10 +1129,14 @@ submit(void)
 	w->target = app.window;
 	{
 		size_t k;
-		for(k=0;k<app.chat.conversation.count;k++)
-			if(!conversation_add(&w->history,app.chat.conversation.messages[k].role,app.chat.conversation.messages[k].text)) {
+		for(k=0;k<app.chat.conversation.count;k++) {
+			const char *files=app.chat.conversation.messages[k].attachments;
+			if(!conversation_add(&w->history,app.chat.conversation.messages[k].role,app.chat.conversation.messages[k].text) ||
+			    (files && !(w->history.messages[k].attachments=malloc(strlen(files)+1)))) {
 				note(L"Cannot prepare message: out of memory."); workfree(w); return;
 			}
+			if(files) strcpy(w->history.messages[k].attachments,files);
+		}
 	}
 	w->conversation=&w->history; w->settings=app.settings;
 	strcpy(w->chat,app.chat.info.id); strcpy(app.streamchat,app.chat.info.id);
@@ -1063,6 +1195,7 @@ received(Work *w)
 				m->status=answer_status(w->ok,w->report.finish);
 				if(!w->ok) snprintf(m->error,sizeof(m->error),"%s",w->error);
 				if(first) quicktitle(w->prompt,chat->info.title);
+				keepfiles(&b->messages[b->count-2],&chat->draftattachments,w);
 				chat->draft[0]=0; chat->info.updated=store_now();
 				saved=store_save(&app.store,chat);
 			} else if(strlen(w->prompt)<=LcbMaxPrompt) {
@@ -1084,6 +1217,7 @@ received(Work *w)
 	    conversation_add(c, "assistant", w->answer)) {
 		wchar_t summary[128];
 		Message *message=&c->messages[c->count-1];
+		keepfiles(&c->messages[c->count-2],&app.chat.draftattachments,w);
 		message->reasoning=w->reasoning; w->reasoning=NULL;
 		message->status=answer_status(w->ok,w->report.finish);
 		if(!w->ok) snprintf(message->error,sizeof(message->error),"%s",w->error);
@@ -1105,7 +1239,7 @@ received(Work *w)
 		}
 		render();
 	} else {
-		while(c->count > before) { Message *m=&c->messages[--c->count]; free(m->text); free(m->reasoning); }
+		while(c->count > before) { Message *m=&c->messages[--c->count]; free(m->text); free(m->reasoning); free(m->attachments); }
 		c->bytes = bytes;
 		{ wchar_t *draft=wide(w->prompt);
 		  app.restoring=1; SetWindowTextW(app.prompt,draft?draft:L""); app.restoring=0; free(draft); }
@@ -1174,14 +1308,15 @@ static void tooltips(void)
     HWND tips=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,NULL,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,
         CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,app.window,NULL,GetModuleHandleW(NULL),NULL);
     HWND buttons[]={app.fresh,app.load,app.unload,app.engine,app.browse,app.stop,app.closetab,app.newworkspace,app.editworkspace,app.exchange,app.retry,app.resend,
-        app.latest,app.explorertoggle,app.chatstoggle,app.speed};
+        app.latest,app.explorertoggle,app.chatstoggle,app.speed,app.attach};
     const wchar_t *texts[]={L"New conversation (Ctrl+N)",L"Load the selected local model",L"Unload the model from memory",
         L"Choose the local llama.cpp engine",L"Choose an existing GGUF file",L"Stop generation (Escape)",
         L"Close this tab; saved chat is retained (Ctrl+W)",L"Create a workspace",L"Edit workspace name and system instructions",
         L"Select an exchange to view or retry",L"Try this exchange again in a new conversation",
         L"Edit this message and continue in a new conversation",
         L"Resume following the response (End)",L"Collapse or expand Chats",
-        L"Collapse or expand open chat tabs",L"Native llama.cpp generation speed, including thinking and answer tokens"};
+        L"Collapse or expand open chat tabs",L"Native llama.cpp generation speed, including thinking and answer tokens",
+        L"Attach an image, audio or video file; the model's media projector loads when needed"};
     size_t i;
     for(i=0;tips && i<sizeof(buttons)/sizeof(buttons[0]);i++) {
         TOOLINFOW tool={0}; tool.cbSize=sizeof(tool); tool.uFlags=TTF_IDISHWND|TTF_SUBCLASS;
@@ -1273,7 +1408,13 @@ paint(HDC dc)
     }
     fill(dc,rect(x+2,p.composer,cw-4,21),Face);
     line(dc,x+2,p.composer,x+cw-2,p.composer,Shadow);
-    label(dc,rect(x+8,p.composer+1,cw-240,19),L"Message · Ctrl+Enter to send",Ink,app.normal,DT_LEFT);
+    {
+        wchar_t files[512], header[560];
+        attach_summary(app.chat.draftattachments,files,512);
+        if(files[0]) swprintf(header,560,L"Message · Attached: %ls",files);
+        else wcscpy(header,L"Message · Ctrl+Enter to send");
+        label(dc,rect(x+8,p.composer+1,cw-240,19),header,Ink,app.normal,DT_LEFT);
+    }
     if(!app.hideright) {
         panel(dc,p.rightx,36,p.right,p.bottom-41,L"Properties and Models",app.activepane==2,ClassicSettings);
         if(tab==0) {
@@ -1579,8 +1720,9 @@ layout(void)
     if(margin.right>margin.left+px(720)) margin.right=margin.left+px(720);
     SendMessageW(app.transcript,EM_SETRECT,0,(LPARAM)&margin);
     place(app.prompt,x+7,p.composer+25,cw-88,69);
-    place(app.send,x+cw-74,p.composer+25,66,24);
-    place(app.stop,x+cw-74,p.composer+55,66,24);
+    place(app.send,x+cw-74,p.composer+25,66,22);
+    place(app.stop,x+cw-74,p.composer+48,66,22);
+    place(app.attach,x+cw-74,p.composer+71,66,23);
     place(app.librarytabs,p.rightx+2,57,p.right-4,25);
     place(app.models,p.rightx+5,84,p.right-10,p.bottom-294);
     ListView_SetColumnWidth(app.models,0,px(p.right-82)); ListView_SetColumnWidth(app.models,1,px(68));
@@ -2433,6 +2575,7 @@ static DWORD WINAPI readsettings(void *context)
 {
     SettingsWork *work=context;
     model_settings_load(work->config,work->model,&work->settings);
+    model_projector_load(work->config,work->model,work->projector);
     work->model_ok=model_read(work->model,&work->info);
     if(!PostMessageW(work->window,SettingsReady,0,(LPARAM)work)) free(work);
     return 0;
@@ -2547,6 +2690,7 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
         if(work->epoch==app.settings_epoch && !_wcsicmp(work->model,app.modelpath)) {
             app.settings=work->settings; app.settings_pending=0;
             app.model_ok=work->model_ok; app.model_info=work->info;
+            wcscpy(app.projector,work->projector);
             generationrows(); refreshcontrols();
         }
         free(work); return 0;
@@ -2731,7 +2875,10 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 				}
 			}
 			break;
-		case IdLoad: loadmodel(); break;
+		case IdLoad: loadmodel(0); break;
+		case IdAttach: attachmenu(); break;
+		case IdProjector: if(!app.busy) chooseprojector(); break;
+		case IdTextOnly: setprojector(L""); break;
 		case IdUnload:
 			if(!app.busy && app.process.process) { app.epoch++; engine_stop(&app.process); app.health=EngineOffline; note(L"Model unloaded."); refreshcontrols(); }
 			break;
@@ -2904,12 +3051,15 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	AppendMenuW(edit,MF_STRING,IdRetry,L"&Retry selected exchange\tCtrl+R");
 	AppendMenuW(edit,MF_STRING,IdResend,L"&Edit and resend...\tCtrl+E");
 	AppendMenuW(edit,MF_SEPARATOR,0,NULL);
+	AppendMenuW(edit,MF_STRING,IdAttach,L"&Attach image, audio or video...");
 	AppendMenuW(edit,MF_STRING,IdInsertText,L"Insert text &file...");
 	AppendMenuW(edit,MF_STRING,IdFindChat,L"&Find chat\tCtrl+F");
 	AppendMenuW(file,MF_STRING,IdRename,L"&Rename conversation\tF2");
 	AppendMenuW(file,MF_STRING,IdPin,L"&Pin or unpin conversation");
 	AppendMenuW(engine,MF_STRING,IdBrowse,L"Select &model...\tCtrl+O");
 	AppendMenuW(engine,MF_STRING,IdEngine,L"Select &engine...");
+	AppendMenuW(engine,MF_STRING,IdProjector,L"Select media &projector...");
+	AppendMenuW(engine,MF_STRING,IdTextOnly,L"Use &text only (no projector)");
 	AppendMenuW(engine,MF_SEPARATOR,0,NULL);
 	AppendMenuW(engine,MF_STRING,IdLoad,L"&Load model\tF5");
 	AppendMenuW(engine,MF_STRING,IdUnload,L"&Unload model");
@@ -2960,6 +3110,7 @@ WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
 	app.stop=control(L"BUTTON",L"Stop",WS_TABSTOP|BS_OWNERDRAW,IdStop);
     app.closetab=control(L"BUTTON",L"x",WS_TABSTOP|BS_OWNERDRAW,IdCloseTab);
     app.send=control(L"BUTTON",L"&Send",WS_TABSTOP|BS_OWNERDRAW,IdSend);
+    app.attach=control(L"BUTTON",L"Attach...",WS_TABSTOP|BS_OWNERDRAW,IdAttach);
 	app.model=control(L"EDIT",basenamew(app.modelpath),WS_TABSTOP|WS_BORDER|ES_READONLY|ES_AUTOHSCROLL,0);
 	app.browse=control(L"BUTTON",L"&Model...",WS_TABSTOP|BS_OWNERDRAW,IdBrowse);
 	app.port=control(L"EDIT",L"8080",WS_TABSTOP|WS_BORDER|ES_NUMBER,IdPort);

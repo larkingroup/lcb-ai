@@ -67,7 +67,7 @@ int local_stream_observe(unsigned short port,const char *body,HANDLE cancel,
     if(report) memset(report,0,sizeof(*report));
     if(!capacity) { free(reply); return 0; }
     error[0]=0;
-    if(!port || !cancel || !reply || strlen(body)>LcbMaxWire) goto done;
+    if(!port || !cancel || !reply || strlen(body)>LocalMaxChatBody) goto done;
     t.event=CreateEventW(NULL,FALSE,FALSE,NULL); t.closed=CreateEventW(NULL,TRUE,FALSE,NULL);
     if(!t.event || !t.closed) goto done;
     session=WinHttpOpen(L"lcb-ai/0.18.0",WINHTTP_ACCESS_TYPE_NO_PROXY,NULL,NULL,WINHTTP_FLAG_ASYNC);

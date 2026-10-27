@@ -122,7 +122,7 @@ int
 engine_start_context(EngineProcess *p, const wchar_t *exe, const wchar_t *model,
     unsigned short port, int context, wchar_t *error, size_t capacity)
 {
-    return engine_start_arguments(p,exe,model,port,context,L"",error,capacity);
+    return engine_start_arguments(p,exe,model,port,context,L"",NULL,error,capacity);
 }
 
 int engine_arguments_valid(const wchar_t *extra)
@@ -139,9 +139,10 @@ int engine_arguments_valid(const wchar_t *extra)
 
 int
 engine_start_arguments(EngineProcess *p, const wchar_t *exe, const wchar_t *model,
-    unsigned short port, int context, const wchar_t *extra, wchar_t *error, size_t capacity)
+    unsigned short port, int context, const wchar_t *extra, const wchar_t *projector,
+    wchar_t *error, size_t capacity)
 {
-	wchar_t command[4096], directory[MAX_PATH], size[32], *slash;
+	wchar_t command[4096], directory[MAX_PATH], size[32], media[MAX_PATH+12], *slash;
 	STARTUPINFOEXW startup = {0};
     SECURITY_ATTRIBUTES security={sizeof(security),NULL,TRUE};
     HANDLE output=INVALID_HANDLE_VALUE, input=INVALID_HANDLE_VALUE, inherited[2];
@@ -168,6 +169,15 @@ engine_start_arguments(EngineProcess *p, const wchar_t *exe, const wchar_t *mode
 	    wcslen(model) >= MAX_PATH || port == 0) {
 		swprintf(error, capacity, L"Invalid engine or model path."); return 0;
 	}
+	media[0] = 0;
+	if(projector && projector[0]) {
+		attributes = GetFileAttributesW(projector);
+		if(attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) ||
+		    wcschr(projector, L'"') || wcslen(projector) >= MAX_PATH) {
+			swprintf(error, capacity, L"The media projector is unavailable. Choose it again or use text only."); return 0;
+		}
+		swprintf(media, MAX_PATH+12, L" --mmproj \"%ls\"", projector);
+	}
 	if(!portfree(port)) {
 		swprintf(error, capacity, L"Port %u is already in use. The existing process was left alone.", port); return 0;
 	}
@@ -179,8 +189,8 @@ engine_start_arguments(EngineProcess *p, const wchar_t *exe, const wchar_t *mode
 	swprintf(size, 32, context ? L"--ctx-size %d " : L"", context);
 	n = swprintf(command, 4096, L"\"%ls\" %ls --model \"%ls\" --alias local --host 127.0.0.1 --port %u "
 	    L"%ls--parallel 1 --jinja --reasoning-format deepseek --sse-ping-interval 5 "
-	    L"--no-webui --no-agent --no-ui-mcp-proxy --cors-origins localhost --no-cors-credentials",
-	    exe, extra, model, port, size);
+	    L"--no-webui --no-agent --no-ui-mcp-proxy --cors-origins localhost --no-cors-credentials%ls",
+	    exe, extra, model, port, size, media);
 	if(n < 0 || n >= 4096) { swprintf(error, capacity, L"Engine command is too long."); return 0; }
     p->logpath[0]=0; p->exitcode=0;
     temporary_length=GetTempPathW(MAX_PATH,temporary);

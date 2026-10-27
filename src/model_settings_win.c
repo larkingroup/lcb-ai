@@ -5,6 +5,7 @@
 #include <wctype.h>
 #include "model_settings_win.h"
 #include "model_defaults.h"
+#include "library_win.h"
 
 static const wchar_t *keys[GenCount]={L"max_tokens",L"temperature",L"top_p",L"context_tokens",
     L"thinking",L"repeat_penalty",L"dry_multiplier",L"top_k",L"min_p",L"presence_penalty"};
@@ -57,13 +58,17 @@ void model_settings_load(const wchar_t *config, const wchar_t *model, Generation
 
 int model_settings_save(const wchar_t *config, const wchar_t *model, const Generation *g)
 {
-    wchar_t section[80], data[768];
+    wchar_t section[80], data[1100], projector[MAX_PATH];
     int n;
     if(!generation_valid(g) || !section_name(model,section)) return 0;
-    n=swprintf(data,768,L"max_tokens=%d|temperature=%.17g|top_p=%.17g|context_tokens=%d|thinking=%d|repeat_penalty=%.17g|dry_multiplier=%.17g|top_k=%d|min_p=%.17g|presence_penalty=%.17g|",
+    n=swprintf(data,1100,L"max_tokens=%d|temperature=%.17g|top_p=%.17g|context_tokens=%d|thinking=%d|repeat_penalty=%.17g|dry_multiplier=%.17g|top_k=%d|min_p=%.17g|presence_penalty=%.17g|",
         g->max_tokens,g->temperature,g->top_p,g->context_tokens,g->thinking,g->repeat_penalty,g->dry_multiplier,
         g->top_k,g->min_p,g->presence_penalty);
     if(n<0 || n>=767) return 0;
+    /* The section is rewritten whole, so a saved projector choice carries over. */
+    GetPrivateProfileStringW(section,L"projector",L"\x1",projector,MAX_PATH,config);
+    if(wcscmp(projector,L"\x1")) n+=swprintf(data+n,1100-n,L"projector=%ls|",projector);
+    if(n<0 || n>=1099) return 0;
     for(int i=0;i<n;i++) if(data[i]==L'|') data[i]=0;
     return WritePrivateProfileSectionW(section,data,config)!=0;
 }
@@ -74,4 +79,65 @@ int model_settings_save_field(const wchar_t *config, const wchar_t *model, const
     if(field<0 || field>=GenCount || !generation_valid(g) || !section_name(model,section)) return 0;
     swprintf(value,64,L"%.17g",generation_value(g,field));
     return WritePrivateProfileStringW(section,keys[field],value,config)!=0;
+}
+
+/* A model's name without its quantization, so "mmproj-Foo-F16" matches "Foo-Q4_K_M". */
+static void stem(const wchar_t *path, wchar_t out[MAX_PATH])
+{
+    const wchar_t *base=wcsrchr(path,L'\\');
+    wchar_t *dash, *tail;
+    size_t i;
+    base=base?base+1:path;
+    for(i=0;base[i] && i<MAX_PATH-1;i++) out[i]=towlower(base[i]);
+    out[i]=0;
+    if(i>5 && !wcscmp(out+i-5,L".gguf")) out[i-5]=0;
+    if(!wcsncmp(out,L"mmproj-",7)) memmove(out,out+7,(wcslen(out+7)+1)*sizeof(*out));
+    dash=wcsrchr(out,L'-');
+    if(!dash) return;
+    tail=dash+1;
+    if((tail[0]==L'q' && iswdigit(tail[1])) || (tail[0]==L'i' && tail[1]==L'q' && iswdigit(tail[2])) ||
+        !wcscmp(tail,L"bf16") || !wcscmp(tail,L"f16") || !wcscmp(tail,L"f32")) *dash=0;
+}
+
+/* The one mmproj-*.gguf beside the model whose name matches it, as on Linux. */
+static void suggest(const wchar_t *model, wchar_t projector[MAX_PATH])
+{
+    wchar_t pattern[MAX_PATH], want[MAX_PATH], have[MAX_PATH], found[MAX_PATH]=L"", *slash;
+    WIN32_FIND_DATAW data;
+    HANDLE find;
+    ModelInfo info;
+    int matches=0;
+    projector[0]=0;
+    if(wcslen(model)>=MAX_PATH-16) return;
+    wcscpy(pattern,model);
+    slash=wcsrchr(pattern,L'\\');
+    if(!slash) return;
+    wcscpy(slash+1,L"mmproj-*.gguf");
+    stem(model,want);
+    find=FindFirstFileW(pattern,&data);
+    if(find==INVALID_HANDLE_VALUE) return;
+    do {
+        stem(data.cFileName,have);
+        if(wcscmp(have,want) || (size_t)(slash-pattern)+1+wcslen(data.cFileName)>=MAX_PATH) continue;
+        swprintf(found,MAX_PATH,L"%.*ls%ls",(int)(slash-pattern+1),pattern,data.cFileName);
+        matches++;
+    } while(FindNextFileW(find,&data));
+    FindClose(find);
+    if(matches==1 && model_read(found,&info) && info.projector) wcscpy(projector,found);
+}
+
+void model_projector_load(const wchar_t *config, const wchar_t *model, wchar_t *projector)
+{
+    wchar_t section[80];
+    projector[0]=0;
+    if(!section_name(model,section)) return;
+    GetPrivateProfileStringW(section,L"projector",L"\x1",projector,MAX_PATH,config);
+    if(!wcscmp(projector,L"\x1")) suggest(model,projector);
+}
+
+int model_projector_save(const wchar_t *config, const wchar_t *model, const wchar_t *projector)
+{
+    wchar_t section[80];
+    if(!section_name(model,section)) return 0;
+    return WritePrivateProfileStringW(section,L"projector",projector,config)!=0;
 }

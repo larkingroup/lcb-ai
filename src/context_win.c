@@ -1,4 +1,5 @@
 #include "context_win.h"
+#include "attachments_win.h"
 #include "cJSON.h"
 #include <stdlib.h>
 #include <stdio.h>
@@ -59,11 +60,12 @@ static int count_callback(const char *wire,void *context,int *count,char *error,
 }
 
 int local_prepare(unsigned short port,const wchar_t *expected_model,const Conversation *c,
-    const Module *module,const char *prompt,const Generation *settings,HANDLE cancel,
-    char **request,ContextBudget *budget,char *error,size_t capacity)
+    const Module *module,const char *prompt,const Generation *settings,const wchar_t *root,
+    const char *attachments,HANDLE cancel,char **request,ContextBudget *budget,char *error,size_t capacity)
 {
     cJSON *props=NULL,*defaults,*context,*template,*build,*path,*caps;
-    int ok=0;
+    int ok=0,media=attach_media_count(attachments)>0;
+    size_t i;
     FitBudget fitted;
     CounterContext counter={port,cancel};
     wchar_t model[MAX_PATH];
@@ -98,6 +100,14 @@ int local_prepare(unsigned short port,const wchar_t *expected_model,const Conver
     caps=cJSON_GetObjectItemCaseSensitive(props,"chat_template_caps");
     budget->reasoning_effort_supported=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(caps,"supports_reasoning_effort"));
     if(cJSON_IsString(build)) snprintf(budget->build,sizeof(budget->build),"%s",build->valuestring);
+    for(i=0;i<c->count && !media;i++) media=attach_media_count(c->messages[i].attachments)>0;
+    /* As on Linux, media chats go whole: token counting cannot see media. */
+    if(media) {
+        *request=conversation_generate_capable(c,module,prompt,settings,budget->reasoning_effort_supported);
+        if(!*request) { snprintf(error,capacity,"Cannot prepare the conversation."); goto done; }
+        ok=attach_request(root,c,attachments,cJSON_GetObjectItemCaseSensitive(props,"modalities"),cancel,request,error,capacity);
+        goto done;
+    }
     ok=conversation_fit(c,module,prompt,settings,budget->context_tokens,
         budget->reasoning_effort_supported,count_callback,&counter,request,&fitted,error,capacity);
     if(ok) { budget->prompt_tokens=fitted.prompt_tokens; budget->omitted_messages=fitted.omitted_messages; }

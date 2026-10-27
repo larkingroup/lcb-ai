@@ -35,6 +35,7 @@ struct Message {
 	int status;
 	char error[256];
     char *reasoning; /* Saved locally; excluded from request messages. */
+    char *attachments; /* Windows: saved files as a JSON array; the platform adds them to requests. */
 };
 
 struct Conversation {

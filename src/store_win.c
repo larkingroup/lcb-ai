@@ -1,4 +1,5 @@
 #include "store_win.h"
+#include "attachments_win.h"
 #include "cJSON.h"
 #include <bcrypt.h>
 #include <stdio.h>
@@ -143,6 +144,39 @@ workspace_parse(cJSON *json, Workspace *w)
 	    field(json,"master_prompt",w->prompt,sizeof(w->prompt),1);
 }
 
+/* An optional saved attachment list; an empty one is kept as NULL. */
+static int
+attachments(cJSON *json, const char *key, char **out)
+{
+	cJSON *items=cJSON_GetObjectItemCaseSensitive(json,key);
+	if(!items) return 1;
+	if(!attach_valid(items)) return 0;
+	if(!cJSON_GetArraySize(items)) return 1;
+	*out=cJSON_PrintUnformatted(items);
+	return *out!=NULL;
+}
+
+/* Adds a saved list under key; NULL adds nothing. */
+static int
+addattachments(cJSON *json, const char *key, const char *list)
+{
+	cJSON *items;
+	if(!list) return 1;
+	items=cJSON_Parse(list);
+	if(!attach_valid(items) || !cJSON_AddItemToObject(json,key,items)) { cJSON_Delete(items); return 0; }
+	return 1;
+}
+
+static char *
+copylist(const char *list, int *ok)
+{
+	char *copy;
+	if(!list) return NULL;
+	copy=malloc(strlen(list)+1);
+	if(copy) strcpy(copy,list); else *ok=0;
+	return copy;
+}
+
 static int
 chat_parse(cJSON *json, Chat *chat)
 {
@@ -159,7 +193,8 @@ chat_parse(cJSON *json, Chat *chat)
 		role=cJSON_GetObjectItemCaseSensitive(m,"role"); text=cJSON_GetObjectItemCaseSensitive(m,"content");
 		if(!cJSON_IsString(role) || !cJSON_IsString(text) || !validtext(text->valuestring,LcbMaxReply,0) ||
 		    strcmp(role->valuestring,i%2?"assistant":"user")!=0 ||
-		    !conversation_add(&chat->conversation,i%2?"assistant":"user",text->valuestring)) return 0;
+		    !conversation_add(&chat->conversation,i%2?"assistant":"user",text->valuestring) ||
+		    (i%2==0 && !attachments(m,"attachments",&chat->conversation.messages[i].attachments))) return 0;
 		if(i%2) {
 			cJSON *status=cJSON_GetObjectItemCaseSensitive(m,"status");
 			cJSON *error=cJSON_GetObjectItemCaseSensitive(m,"error");
@@ -184,7 +219,7 @@ chat_parse(cJSON *json, Chat *chat)
 		}
 		i++;
 	}
-	if(i%2) return 0;
+	if(i%2 || !attachments(json,"draft_attachments",&chat->draftattachments)) return 0;
 	chat->info.turns=chat->conversation.count/2;
 	/* Optional fields shared with the Linux build. */
 	v=cJSON_GetObjectItemCaseSensitive(json,"updated");
@@ -212,7 +247,7 @@ store_now(void)
 void
 chat_clear(Chat *chat)
 {
-	conversation_clear(&chat->conversation); memset(chat,0,sizeof(*chat));
+	conversation_clear(&chat->conversation); free(chat->draftattachments); memset(chat,0,sizeof(*chat));
 }
 
 int
@@ -294,12 +329,14 @@ store_save(Store *s, Chat *chat)
 	    cJSON_AddStringToObject(json,"draft",chat->draft) &&
 	    cJSON_AddNumberToObject(json,"updated",(double)chat->info.updated) &&
 	    cJSON_AddNumberToObject(json,"pinned",chat->info.pinned?1:0) &&
-	    cJSON_AddNumberToObject(json,"renamed",chat->info.renamed?1:0);
+	    cJSON_AddNumberToObject(json,"renamed",chat->info.renamed?1:0) &&
+	    addattachments(json,"draft_attachments",chat->draftattachments);
 	for(i=0;ok && i<chat->conversation.count;i++) {
 		Message *message=&chat->conversation.messages[i];
 		m=cJSON_CreateObject();
 		ok=validtext(message->text,LcbMaxReply,0) && strcmp(message->role,i%2?"assistant":"user")==0 && m &&
-		    cJSON_AddStringToObject(m,"role",message->role) && cJSON_AddStringToObject(m,"content",message->text);
+		    cJSON_AddStringToObject(m,"role",message->role) && cJSON_AddStringToObject(m,"content",message->text) &&
+		    (i%2 || addattachments(m,"attachments",message->attachments));
 		if(ok && i%2) {
 			const char *status=answer_status_name(message->status);
 			ok=status && validtext(message->error,sizeof(message->error)-1,1) &&
@@ -338,7 +375,7 @@ store_branch(Store *s, const Chat *source, size_t turn, const char *prompt,
 {
 	Chat *next;
 	size_t i, n;
-	int ok=0;
+	int ok=0, copied=1;
 	if(source->conversation.count%2 || turn>=source->conversation.count/2 ||
 	    !validtext(prompt,LcbMaxPrompt,0) || !validtext(action,16,0))
 		return fail(s,L"Invalid exchange or message");
@@ -351,6 +388,9 @@ store_branch(Store *s, const Chat *source, size_t turn, const char *prompt,
 	n=strlen(next->info.title);
 	while(n && !validtext(next->info.title,StoreName-1,0)) next->info.title[--n]=0;
 	strcpy(next->draft,prompt);
+	/* The branched message keeps its files, as on Linux. */
+	next->draftattachments=copylist(source->conversation.messages[turn*2].attachments,&copied);
+	if(!copied) goto done;
 	for(i=0;i<turn*2;i++) {
 		const Message *m=&source->conversation.messages[i];
 		if(!conversation_add(&next->conversation,m->role,m->text)) goto done;
@@ -362,6 +402,8 @@ store_branch(Store *s, const Chat *source, size_t turn, const char *prompt,
         }
 		next->conversation.messages[i].status=m->status;
 		memcpy(next->conversation.messages[i].error,m->error,sizeof(m->error));
+		next->conversation.messages[i].attachments=copylist(m->attachments,&copied);
+		if(!copied) goto done;
 	}
 	ok=store_save(s,next);
 	if(ok) { chat_clear(destination); *destination=*next; memset(next,0,sizeof(*next)); }

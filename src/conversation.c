@@ -119,6 +119,7 @@ conversation_clear(Conversation *c)
 	for(i = 0; i < c->count; i++) {
 		free(c->messages[i].text);
         free(c->messages[i].reasoning);
+        free(c->messages[i].attachments);
     }
 	free(c->messages);
 	memset(c, 0, sizeof(*c));

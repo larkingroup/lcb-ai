@@ -15,8 +15,10 @@ int engine_start(EngineProcess *p, const wchar_t *exe, const wchar_t *model,
     unsigned short port, wchar_t *error, size_t capacity);
 int engine_start_context(EngineProcess *p, const wchar_t *exe, const wchar_t *model,
     unsigned short port, int context, wchar_t *error, size_t capacity);
+/* projector: a media projector GGUF loaded with --mmproj, or NULL/empty for text only. */
 int engine_start_arguments(EngineProcess *p, const wchar_t *exe, const wchar_t *model,
-    unsigned short port, int context, const wchar_t *extra, wchar_t *error, size_t capacity);
+    unsigned short port, int context, const wchar_t *extra, const wchar_t *projector,
+    wchar_t *error, size_t capacity);
 int engine_arguments_valid(const wchar_t *extra);
 void engine_stop(EngineProcess *p);
 int engine_exited(EngineProcess *p);

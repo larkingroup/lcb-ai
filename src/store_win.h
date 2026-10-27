@@ -17,7 +17,8 @@ struct Workspace { char id[33], name[StoreName], prompt[LcbMaxPrompt+1]; };
 struct ChatInfo { char id[33], workspace[33], title[StoreName]; size_t turns;
 	long long updated; int pinned, renamed; };
 
-struct Chat { ChatInfo info; Conversation conversation; char draft[LcbMaxPrompt+1]; };
+/* draftattachments: files attached to the unsent draft, as a JSON array or NULL. */
+struct Chat { ChatInfo info; Conversation conversation; char draft[LcbMaxPrompt+1]; char *draftattachments; };
 struct Store {
 	wchar_t root[MAX_PATH], error[512];
 	HANDLE lock;

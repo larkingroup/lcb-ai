@@ -6,9 +6,11 @@ typedef struct ContextBudget {
     size_t omitted_messages;
     char build[96];
 } ContextBudget;
-/* Builds a request without changing saved history. All network work is cancellable. */
+/* Builds a request without changing saved history. All network work is cancellable.
+ * attachments are the new message's saved files; root holds the attachment store. */
 int local_prepare(unsigned short port, const wchar_t *expected_model,
     const Conversation *conversation, const Module *module, const char *prompt,
-    const Generation *settings, HANDLE cancel, char **request, ContextBudget *budget,
+    const Generation *settings, const wchar_t *root, const char *attachments,
+    HANDLE cancel, char **request, ContextBudget *budget,
     char *error, size_t capacity);
 #endif
