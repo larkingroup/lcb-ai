@@ -70,7 +70,7 @@ int local_stream_observe(unsigned short port,const char *body,HANDLE cancel,
     if(!port || !cancel || !reply || strlen(body)>LocalMaxChatBody) goto done;
     t.event=CreateEventW(NULL,FALSE,FALSE,NULL); t.closed=CreateEventW(NULL,TRUE,FALSE,NULL);
     if(!t.event || !t.closed) goto done;
-    session=WinHttpOpen(L"lcb-ai/0.18.0",WINHTTP_ACCESS_TYPE_NO_PROXY,NULL,NULL,WINHTTP_FLAG_ASYNC);
+    session=WinHttpOpen(L"lcb-ai/0.19.0",WINHTTP_ACCESS_TYPE_NO_PROXY,NULL,NULL,WINHTTP_FLAG_ASYNC);
     if(!session) goto done;
     WinHttpSetTimeouts(session,3000,3000,10000,90000);
     connection=WinHttpConnect(session,L"127.0.0.1",port,0);
@@ -168,7 +168,7 @@ int local_json(unsigned short port, const wchar_t *path, const char *body,
     wire=malloc(LcbMaxWire+1);
     t.event=CreateEventW(NULL,FALSE,FALSE,NULL); t.closed=CreateEventW(NULL,TRUE,FALSE,NULL);
     if(!wire || !t.event || !t.closed) goto done;
-    session=WinHttpOpen(L"lcb-ai/0.18.0",WINHTTP_ACCESS_TYPE_NO_PROXY,NULL,NULL,WINHTTP_FLAG_ASYNC);
+    session=WinHttpOpen(L"lcb-ai/0.19.0",WINHTTP_ACCESS_TYPE_NO_PROXY,NULL,NULL,WINHTTP_FLAG_ASYNC);
     if(!session) goto done;
     WinHttpSetTimeouts(session,3000,3000,10000,30000);
     connection=WinHttpConnect(session,L"127.0.0.1",port,0);

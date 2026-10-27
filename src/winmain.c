@@ -2917,7 +2917,7 @@ windowproc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 		case IdExit: SendMessageW(window,WM_CLOSE,0,0); break;
 		case IdShortcuts: show_shortcuts(window,app.normal); break;
 		case IdAbout:
-			MessageBoxW(window,L"lcb-ai\nVersion 0.18.0\n\nLocal AI processor and interface.\n\n"
+			MessageBoxW(window,L"lcb-ai\nVersion 0.19.0\n\nLocal AI processor and interface.\n\n"
 			    L"Larkin Computing Bureau",L"About lcb-ai",MB_OK);
 			break;
 		}
